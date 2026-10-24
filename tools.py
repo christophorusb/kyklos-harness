@@ -23,6 +23,81 @@ SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".mypy_cach
 IS_WINDOWS = platform.system() == "Windows"
 SHELL_NAME = "PowerShell" if IS_WINDOWS else "bash"
 
+# ---- secrets in the environment and in output (SEC-01, SEC-04) -----------------------------
+# Commands must not inherit Kyklos's own settings (its API key) or anything named like a secret,
+# and secret values must not reach the model or the screen through tool output.
+SECRET_ENV_NAME_RE = re.compile(
+    r"(^|_)(API_?|ACCESS_?|SECRET_?|PRIVATE_?)?KEY($|_)|TOKEN|SECRET|PASSW(OR)?D|CREDENTIAL", re.IGNORECASE)
+HIDDEN_ENV_NAMES: set[str] = set()  # names from Kyklos's .env; filled by hide_env_names() at startup
+MIN_SECRET_VALUE_LEN = 8  # shorter values ("true", "1") would redact ordinary text
+REDACTED = "[REDACTED]"
+SECRET_VALUE_PATTERNS = [
+    re.compile(r"\bsk-(?:proj-|ant-|or-)?[A-Za-z0-9_-]{20,}"),           # OpenAI, Anthropic, OpenRouter
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}"),                          # GitHub tokens
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}"),                        # GitHub fine-grained tokens
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),                         # AWS access key ids
+    re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),                        # Slack tokens
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),                             # Google API keys
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)"),
+]
+
+
+def kill_process_tree(process: subprocess.Popen) -> None:
+    """Stop a command and everything it started (SEC-06). Killing only the shell leaves its children,
+    like a dev server or a Start-Process, running on their own."""
+    try:
+        if IS_WINDOWS:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)], capture_output=True, timeout=15)
+        else:
+            import signal
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if process.poll() is None:
+        process.kill()
+
+
+def hide_env_names(names) -> None:
+    """Keep these variables (Kyklos's own .env settings) out of every command's environment."""
+    HIDDEN_ENV_NAMES.update(n.upper() for n in names)
+
+
+def is_secret_env_name(name: str) -> bool:
+    return bool(SECRET_ENV_NAME_RE.search(name))
+
+
+def child_env(base=None) -> dict:
+    """The environment for commands: everything except Kyklos's .env settings and secret-named variables.
+    KYKLOS_PASS_ENV=GITHUB_TOKEN,NPM_TOKEN lets chosen ones through on purpose."""
+    base = os.environ if base is None else base
+    passthrough = {n.strip().upper() for n in base.get("KYKLOS_PASS_ENV", "").split(",") if n.strip()}
+    env = {k: v for k, v in base.items()
+           if k.upper() in passthrough or (k.upper() not in HIDDEN_ENV_NAMES and not is_secret_env_name(k))}
+    env["GIT_TERMINAL_PROMPT"] = "0"  # git fails instead of asking for credentials
+    return env
+
+
+def known_secret_values(base=None) -> list[str]:
+    """Values of secret-named variables (like Kyklos's API_KEY), longest first, so they can be redacted
+    exactly, whatever their format."""
+    base = os.environ if base is None else base
+    values = {v for k, v in base.items() if is_secret_env_name(k) and len(v) >= MIN_SECRET_VALUE_LEN}
+    return sorted(values, key=len, reverse=True)
+
+
+def scrub_secrets(text: str, values=None) -> tuple[str, int]:
+    """(text with secrets replaced by [REDACTED], how many were replaced): known secret values exactly,
+    plus common token formats."""
+    count = 0
+    for value in known_secret_values() if values is None else values:
+        if value in text:
+            count += text.count(value)
+            text = text.replace(value, REDACTED)
+    for pattern in SECRET_VALUE_PATTERNS:
+        text, n = pattern.subn(REDACTED, text)
+        count += n
+    return text, count
+
 
 PYTHON_CANDIDATES = ["py", "python", "python3"]
 OTHER_CANDIDATES = ["node", "npm", "git", "uv"]
@@ -350,17 +425,23 @@ class Tools:
         # the model can read and react to.
         argv = (["powershell", "-NoProfile", "-NonInteractive", "-Command", command] if IS_WINDOWS
                 else ["bash", "-c", command])
-        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}  # git fails instead of asking for credentials
+        process = subprocess.Popen(
+            argv, cwd=self.workspace, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="replace", env=child_env(),
+            start_new_session=not IS_WINDOWS,  # its own process group, so the whole tree can be stopped
+        )
         try:
-            r = subprocess.run(
-                argv, cwd=self.workspace, capture_output=True, text=True, stdin=subprocess.DEVNULL,
-                encoding="utf-8", errors="replace", timeout=timeout, env=env,
-            )
+            stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
+            kill_process_tree(process)
+            process.communicate()
             raise ToolError(f"Command timed out after {timeout}s. If it waits for input, pass the answer as "
                             "a flag instead (e.g. -Force, --yes); if it's just slow, use a larger timeout.")
-        out = (r.stdout or "") + (r.stderr or "")
-        return self._truncate(f"exit code {r.returncode}\n{out}".rstrip())
+        except KeyboardInterrupt:  # Ctrl+C: stop everything the command started, then let the turn end
+            kill_process_tree(process)
+            raise
+        out = (stdout or "") + (stderr or "")
+        return self._truncate(f"exit code {process.returncode}\n{out}".rstrip())
 
 
 # Tools that run without asking. Everything else goes through the permission prompt.

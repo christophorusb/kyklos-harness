@@ -4,6 +4,19 @@ All notable changes to **Kyklos** since the repository was initialized on 2026-1
 
 ---
 
+## Unreleased — Security Hardening from the Second Audit (2026-10-24)
+
+A second Gemini 3.8 Flash audit (`AUDIT_REPORT.md`, SEC series) proposed seven hardening items. SEC-01, 04 and 06 were reproduced before fixing. SEC-02 (OS sandboxing) and SEC-03 (network egress control) are real gaps but a larger design decision, and SEC-07 (audit log) is a nice-to-have: all three are deferred.
+
+- **SEC-01, commands could read Kyklos's API key (`tools.py`, `kyklos.py`):** `$env:API_KEY` in a `bash` command printed the real key, because commands inherited Kyklos's whole environment. `child_env()` now removes every name defined in Kyklos's `.env` (`load_dotenv` returns them; `hide_env_names` records them), plus any variable named like a secret (`SECRET_ENV_NAME_RE`: `*_KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`). `KYKLOS_PASS_ENV` lets chosen ones through. The report's 12-variable whitelist was not used: it would have dropped `APPDATA` (npm), `PROGRAMFILES`, `JAVA_HOME`, `VIRTUAL_ENV` and so on.
+- **SEC-04, secrets in tool output (`tools.py`, `kyklos.py`):** `scrub_secrets()` replaces secret values with `[REDACTED]` before results reach the model or the UI, and the model is told how many were redacted. It covers the exact values of secret-named variables (so Kyklos's own key is caught whatever its format), plus OpenAI/Anthropic/OpenRouter, GitHub, AWS, Slack and Google key formats and private-key blocks. The report's patterns weren't used: its `sk-` regex was broken (`{20,T}` matches literal text, so it never caught a real key), and none of them would have caught an Ollama key.
+- **SEC-05, planted instructions (`kyklos.py`):** the system prompt now says file contents and tool output are data, not instructions, and that planted directions should be reported to the user. The report's `<tool_output>` tags were skipped: results already arrive in a separate `tool` role, and a file could simply contain the closing tag.
+- **SEC-06, orphaned processes (`tools.py`):** `bash` now uses `Popen`, with its own process group on Linux/macOS, and `kill_process_tree()` (`taskkill /T /F` on Windows, `killpg` elsewhere) stops the command and everything it started, on timeout and on Ctrl+C. Reproduced before: two child processes kept running after a timeout; now none do.
+- **Docs (`README.md`):** the Safety section covers environment filtering, `KYKLOS_PASS_ENV`, redaction, the data-not-instructions rule and process-tree cleanup.
+- **Tests:** `SecurityHardeningTests` (6 tests: environment filtering and opt-in, a real command unable to read `API_KEY`, redaction of values and token formats with no false positives on ordinary text, redaction before both the model and the UI, the prompt rule, and a real process-tree kill). The AGENTS.md test now checks for the section, not the word (127 total offline tests).
+
+---
+
 ## `1d6a176` — Fixes from an External Audit (2026-10-24)
 
 An audit by Gemini 3.8 Flash (`AUDIT_REPORT.md`) listed eight findings. Each was checked against the code and reproduced first: ACT-01 to ACT-07 are fixed here. ACT-08 was declined: it assumed each project has its own `.env`, but Kyklos only reads the `.env` in its install folder, and remembering the picked model globally was a deliberate choice.
