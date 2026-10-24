@@ -4,7 +4,7 @@ All notable changes to **Kyklos** since the repository was initialized on 2026-1
 
 ---
 
-## Unreleased — Fixes from an External Audit (2026-10-24)
+## `1d6a176` — Fixes from an External Audit (2026-10-24)
 
 An audit by Gemini 3.8 Flash (`AUDIT_REPORT.md`) listed eight findings. Each was checked against the code and reproduced first: ACT-01 to ACT-07 are fixed here. ACT-08 was declined: it assumed each project has its own `.env`, but Kyklos only reads the `.env` in its install folder, and remembering the picked model globally was a deliberate choice.
 
