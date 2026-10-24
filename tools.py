@@ -152,8 +152,9 @@ class ToolError(Exception):
 
 
 class Tools:
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, before_write=None):
         self.workspace = workspace.resolve()
+        self.before_write = before_write
 
     # ---- helpers -----------------------------------------------------------
 
@@ -192,6 +193,8 @@ class Tools:
         p = self._resolve(path)
         if is_secret_file(p):
             raise ToolError(f"Refusing to write {path}: it likely contains secrets. Ask the user to change it.")
+        if self.before_write:
+            self.before_write(p)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} chars to {path}"
@@ -208,6 +211,8 @@ class Tools:
 
     def edit_file(self, path: str, old_string: str, new_string: str) -> str:
         p, text, matched_old, adjusted_new = self._prepare_edit(path, old_string, new_string)
+        if self.before_write:
+            self.before_write(p)
         p.write_text(text.replace(matched_old, adjusted_new, 1), encoding="utf-8")
         return f"Edited {path}"
 

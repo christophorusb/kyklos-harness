@@ -557,6 +557,109 @@ class EditAndPermissionTests(unittest.TestCase):
         self.assertIn("+b = 3", out)
 
 
+class PlanModeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        (self.ws / "app.py").write_text("x = 1\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_plan_mode_restricts_tools_and_toggles_cleanly(self):
+        client = FakeClient([
+            reply(tool_calls=[
+                tool_call("1", "read_file", path="app.py"),
+                tool_call("2", "write_file", path="app.py", content="x = 2\n"),
+                tool_call("3", "task", description="edit", prompt="change x", mode="general"),
+            ]),
+            reply(content="Here is the plan."),
+            reply(tool_calls=[tool_call("4", "edit_file", path="app.py", old_string="x = 1", new_string="x = 2")]),
+            reply(content="Applied the plan."),
+        ])
+        agent = Agent(client, "fake", self.ws, permission=allow_all, plan_mode=True)
+        self.assertIn("PLAN MODE", agent.messages[0]["content"])
+        self.assertEqual(agent.send("propose a change"), "Here is the plan.")
+        self.assertEqual(client.offered[0], {"read_file", "grep", "glob", "task"})
+        self.assertEqual((self.ws / "app.py").read_text(), "x = 1\n")
+
+        tool_outputs = [m["content"] for m in client.calls[1] if m["role"] == "tool"]
+        self.assertIn("x = 1", tool_outputs[0])
+        self.assertIn("isn't available here", tool_outputs[1])
+        self.assertIn("mode 'explore'", tool_outputs[2])
+
+        # Switch out of plan mode: conversation stays, write/edit tools return
+        agent.set_plan_mode(False)
+        self.assertNotIn("PLAN MODE", agent.messages[0]["content"])
+        self.assertEqual(agent.send("go ahead"), "Applied the plan.")
+        self.assertIn("edit_file", client.offered[2])
+        self.assertEqual((self.ws / "app.py").read_text(), "x = 2\n")
+
+
+class SessionAndUndoTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        (self.ws / "existing.py").write_text("v = 1\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_undo_reverts_created_and_edited_files_and_conversation(self):
+        client = FakeClient([
+            reply(tool_calls=[
+                tool_call("1", "edit_file", path="existing.py", old_string="v = 1", new_string="v = 2"),
+                tool_call("2", "write_file", path="new.py", content="created = True\n"),
+            ]),
+            reply(content="Changed files."),
+        ])
+        agent = Agent(client, "fake", self.ws, permission=allow_all)
+        self.assertIsNone(agent.undo())
+
+        agent.send("update files")
+        self.assertEqual((self.ws / "existing.py").read_text(), "v = 2\n")
+        self.assertTrue((self.ws / "new.py").exists())
+
+        reverted = agent.undo()
+        self.assertEqual(reverted, ["existing.py", "new.py"])
+        self.assertEqual((self.ws / "existing.py").read_text(), "v = 1\n")
+        self.assertFalse((self.ws / "new.py").exists())
+        self.assertEqual(len(agent.messages), 1)  # back to just the system prompt
+        self.assertEqual(agent.turn_log, [])
+
+    def test_undo_reverts_subagent_writes(self):
+        client = FakeClient([
+            reply(tool_calls=[tool_call("t1", "task", description="sub write", prompt="make sub.txt", mode="general")]),
+            reply(tool_calls=[tool_call("s1", "write_file", path="sub.txt", content="from sub\n")]),
+            reply(content="Subagent done."),
+            reply(content="Parent done."),
+        ])
+        agent = Agent(client, "fake", self.ws, permission=allow_all)
+        agent.send("delegate write")
+        self.assertTrue((self.ws / "sub.txt").exists())
+
+        reverted = agent.undo()
+        self.assertEqual(reverted, ["sub.txt"])
+        self.assertFalse((self.ws / "sub.txt").exists())
+
+    def test_save_and_load_session_roundtrip(self):
+        client = FakeClient([
+            reply(tool_calls=[tool_call("1", "read_file", path="existing.py")], prompt_tokens=321),
+            reply(content="existing.py has v = 1."),
+        ])
+        agent = Agent(client, "fake", self.ws, permission=allow_all, plan_mode=True)
+        agent.send("what is in existing.py?")
+        session_file = self.ws / "chat.jsonl"
+        agent.save_session(session_file)
+
+        restored = Agent(FakeClient([]), "fake", self.ws)
+        count = restored.load_session(session_file)
+        self.assertEqual(count, 4)  # user, assistant(tool_call), tool, assistant
+        self.assertTrue(restored.plan_mode)
+        self.assertEqual(restored.turn_log, [("what is in existing.py?", "existing.py has v = 1.")])
+        self.assertEqual(restored.usage_mark, (321, 2))
+
+
 class HelperTests(unittest.TestCase):
     def test_permission_prompt_denies_when_no_input(self):
         import builtins

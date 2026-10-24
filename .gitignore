@@ -15,6 +15,7 @@ id_ecdsa*
 # Local environment and caches
 .venv/
 __pycache__/
+.sessions/
 
 # The agent's scratch workspace
 sandbox/

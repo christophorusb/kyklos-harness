@@ -101,6 +101,12 @@ You are a subagent. Another agent delegated this task to you; your final answer 
 You can't see that agent's conversation, only the task below. Work on your own, without asking questions.
 Make your final answer self-contained: specific findings, exact file paths and line numbers, and anything you could not determine."""
 
+PLAN_TOOLS = SAFE_TOOLS | {"task"}
+PLAN_PROMPT = """
+
+You are in PLAN MODE (read-only). You may explore the codebase with read_file, grep, glob, and explore subagents, but you cannot create, edit, or run anything.
+Inspect the relevant files, clarify any ambiguities, and write a clear step-by-step plan (naming exact files and functions to change) so the user can review it before switching back to normal mode."""
+
 
 def load_dotenv(path: Path) -> None:
     """Tiny .env reader so we don't need python-dotenv. Real env vars win."""
@@ -301,10 +307,13 @@ def ask_permission(name: str, args: dict, always_allowed: set) -> tuple[bool, st
 class Agent:
     def __init__(self, client, model: str, workspace: Path, permission=ask_permission,
                  context_window: int = DEFAULT_CONTEXT_WINDOW, tool_names: set = None,
-                 depth: int = 0, always_allowed: set = None):
+                 depth: int = 0, always_allowed: set = None, plan_mode: bool = False,
+                 before_write=None):
         self.client = client
         self.model = model
-        self.tools = Tools(workspace)
+        self.active_snapshots: dict[Path, bytes | None] | None = None
+        self._before_write = before_write or self._record_file_snapshot
+        self.tools = Tools(workspace, before_write=self._before_write)
         self.permission = permission
         self.context_window = context_window
         self.depth = depth  # 0 for the main agent, 1 for a subagent
@@ -312,14 +321,22 @@ class Agent:
         all_schemas = SCHEMAS + [TASK_SCHEMA]
         if tool_names is None:
             tool_names = {s["function"]["name"] for s in all_schemas}
-        self.schemas = [s for s in all_schemas if s["function"]["name"] in tool_names]
-        self.tool_names = {s["function"]["name"] for s in self.schemas}
+        self.base_tool_names = set(tool_names)
+        self.plan_mode = plan_mode
         # Shared with subagents, so "always allow" carries over in both directions.
         self.always_allowed: set[str] = always_allowed if always_allowed is not None else set()
         self.last_steps = 0
         self.reset()
 
-    def reset(self) -> None:
+    def _record_file_snapshot(self, p: Path) -> None:
+        if self.active_snapshots is not None and p not in self.active_snapshots:
+            self.active_snapshots[p] = p.read_bytes() if p.is_file() else None
+
+    def _update_mode(self) -> None:
+        all_schemas = SCHEMAS + [TASK_SCHEMA]
+        allowed = (self.base_tool_names & PLAN_TOOLS) if self.plan_mode else self.base_tool_names
+        self.schemas = [s for s in all_schemas if s["function"]["name"] in allowed]
+        self.tool_names = {s["function"]["name"] for s in self.schemas}
         prompt = SYSTEM_PROMPT.format(
             workspace=self.tools.workspace, os=platform.system(), shell=SHELL_NAME,
             commands=describe_commands(),
@@ -327,13 +344,70 @@ class Agent:
         if "task" in self.tool_names:
             prompt += ("\n- For broad searches or investigations that would take many steps, "
                        "delegate them to a subagent with the task tool.")
+        if self.plan_mode:
+            prompt += PLAN_PROMPT
         if self.depth > 0:
             prompt += SUBAGENT_PROMPT + f"\nYour tools: {', '.join(sorted(self.tool_names))}."
         prompt += project_instructions(self.tools.workspace)
-        self.messages = [{"role": "system", "content": prompt}]
+        if getattr(self, "messages", None):
+            self.messages[0] = {"role": "system", "content": prompt}
+        else:
+            self.messages = [{"role": "system", "content": prompt}]
+
+    def set_plan_mode(self, enabled: bool) -> None:
+        """Switch between read-only plan mode and full execution mode without losing the conversation."""
+        self.plan_mode = enabled
+        self._update_mode()
+
+    def reset(self) -> None:
+        self.messages = []
+        self._update_mode()
         self.usage_mark = None  # (prompt_tokens the API reported, message count at that call)
         self.current_request = None  # the user message this turn is answering; never summarized away
         self.turn_log: list[tuple[str, str]] = []  # (request, final answer) of finished turns
+        self.undo_stack: list[tuple[list, tuple | None, list, dict[Path, bytes | None]]] = []
+
+    def undo(self) -> list[str] | None:
+        """Revert the last turn's conversation and any file changes it made via write_file/edit_file.
+        Returns sorted workspace-relative paths reverted, or None if there is nothing to undo."""
+        if not self.undo_stack:
+            return None
+        self.messages, self.usage_mark, self.turn_log, snapshots = self.undo_stack.pop()
+        reverted = []
+        for p, old_bytes in snapshots.items():
+            if old_bytes is None:
+                p.unlink(missing_ok=True)
+            else:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(old_bytes)
+            reverted.append(self.tools._rel(p))
+        return sorted(reverted)
+
+    def save_session(self, path: Path) -> None:
+        """Write the conversation (excluding the system prompt, which is rebuilt on load) to JSONL."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [json.dumps(m, ensure_ascii=False) for m in self.messages[1:]]
+        meta = {"_meta": "state", "turn_log": self.turn_log, "usage_mark": self.usage_mark, "plan_mode": self.plan_mode}
+        lines.append(json.dumps(meta, ensure_ascii=False))
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def load_session(self, path: Path) -> int:
+        """Restore a conversation from a JSONL file. Returns the number of restored messages."""
+        if not path.is_file():
+            raise FileNotFoundError(f"No session file at {path}")
+        self.reset()
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            obj = json.loads(line)
+            if obj.get("_meta") == "state":
+                self.turn_log = [tuple(t) for t in obj.get("turn_log", [])]
+                self.usage_mark = tuple(obj["usage_mark"]) if obj.get("usage_mark") else None
+                self.set_plan_mode(bool(obj.get("plan_mode", False)))
+            elif "role" in obj and obj["role"] != "system":
+                self.messages.append(obj)
+        self.repair_after_interrupt()
+        return len(self.messages) - 1
 
     def context_tokens(self) -> int:
         """Current conversation size: the API's last count plus an estimate for what was added since."""
@@ -455,9 +529,12 @@ class Agent:
         """Run `prompt` in a fresh Agent and return only its final answer."""
         if mode not in SUBAGENT_TOOLS:
             return f"Error: mode must be one of {', '.join(SUBAGENT_TOOLS)}"
+        if self.plan_mode and mode != "explore":
+            return "Error: in plan mode, subagents must use mode 'explore'."
         sub = Agent(self.client, self.model, self.tools.workspace, permission=self.permission,
                     context_window=self.context_window, tool_names=SUBAGENT_TOOLS[mode],
-                    depth=self.depth + 1, always_allowed=self.always_allowed)
+                    depth=self.depth + 1, always_allowed=self.always_allowed,
+                    before_write=self._before_write)
         print(f"{sub.indent}\033[35m[subagent: {description} ({mode})]\033[0m")
         answer = sub.send(prompt)
         print(f"{sub.indent}\033[35m[subagent done in {sub.last_steps} steps]\033[0m")
@@ -465,6 +542,22 @@ class Agent:
 
     def send(self, user_text: str) -> str:
         """Run one user turn through the agent loop and return the final answer."""
+        if self.depth == 0:
+            snapshots: dict[Path, bytes | None] = {}
+            self.undo_stack.append((
+                json.loads(json.dumps(self.messages)),
+                self.usage_mark,
+                list(self.turn_log),
+                snapshots,
+            ))
+            self.active_snapshots = snapshots
+        try:
+            return self._send_turn(user_text)
+        finally:
+            if self.depth == 0:
+                self.active_snapshots = None
+
+    def _send_turn(self, user_text: str) -> str:
         self.messages.append({"role": "user", "content": user_text})
         self.current_request = user_text
         compactions = 0
@@ -523,18 +616,43 @@ def main() -> None:
     workspace = Path(os.environ.get("WORKSPACE") or Path.cwd())
     client = OpenAI(base_url=os.environ["BASE_URL"], api_key=os.environ["API_KEY"])
     window = int(os.environ.get("CONTEXT_WINDOW") or DEFAULT_CONTEXT_WINDOW)
-    agent = Agent(client, os.environ["MODEL"], workspace, context_window=window)
+    default_session = here / ".sessions" / "last.jsonl"
 
-    if len(sys.argv) > 1:
-        print(agent.send(" ".join(sys.argv[1:])))
+    args = list(sys.argv[1:])
+    plan_mode = False
+    resume_path = None
+    if "--plan" in args:
+        args.remove("--plan")
+        plan_mode = True
+    if "--resume" in args:
+        idx = args.index("--resume")
+        args.pop(idx)
+        if idx < len(args) and args[idx].endswith(".jsonl"):
+            resume_path = Path(args.pop(idx))
+        else:
+            resume_path = default_session
+
+    agent = Agent(client, os.environ["MODEL"], workspace, context_window=window, plan_mode=plan_mode)
+    if resume_path:
+        try:
+            count = agent.load_session(resume_path)
+            print(f"Resumed session from {resume_path} ({count} messages).")
+        except FileNotFoundError as e:
+            print(f"({e}; starting fresh.)")
+
+    if args:
+        print(agent.send(" ".join(args)))
+        agent.save_session(resume_path or default_session)
         return
 
     agents_md = " (AGENTS.md loaded)" if (agent.tools.workspace / "AGENTS.md").is_file() else ""
     print(f"Kyklos ready. model={agent.model}  workspace={agent.tools.workspace}{agents_md}")
-    print("Commands: /reset clears the conversation, /compact summarizes it, /exit quits.\n")
+    print("Commands: /plan toggles plan mode, /undo reverts last turn, /save & /resume manage sessions, "
+          "/compact summarizes, /reset clears, /exit quits.\n")
     while True:
         try:
-            text = input("\033[1m> \033[0m").strip()
+            prompt_label = "\033[1;36m(plan) > \033[0m" if agent.plan_mode else "\033[1m> \033[0m"
+            text = input(prompt_label).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -546,16 +664,51 @@ def main() -> None:
             agent.reset()
             print("Conversation cleared.")
             continue
+        if text == "/plan" or text.startswith("/plan "):
+            rest = text[5:].strip()
+            if rest:
+                agent.set_plan_mode(True)
+                print("Plan mode ON (read-only).")
+                text = rest
+            else:
+                agent.set_plan_mode(not agent.plan_mode)
+                state = "ON (read-only: explore and propose a plan)" if agent.plan_mode else "OFF (full tools enabled)"
+                print(f"Plan mode {state}.")
+                continue
+        if text == "/undo":
+            reverted = agent.undo()
+            if reverted is None:
+                print("Nothing to undo.")
+            else:
+                files_note = f" (reverted files: {', '.join(reverted)})" if reverted else " (no files were changed)"
+                print(f"Undid last turn{files_note}.")
+                agent.save_session(default_session)
+            continue
+        if text == "/save" or text.startswith("/save "):
+            target = Path(text[5:].strip()) if text[5:].strip() else default_session
+            agent.save_session(target)
+            print(f"Session saved to {target}.")
+            continue
+        if text == "/resume" or text.startswith("/resume "):
+            target = Path(text[7:].strip()) if text[7:].strip() else default_session
+            try:
+                count = agent.load_session(target)
+                print(f"Resumed {count} messages from {target}.")
+            except FileNotFoundError as e:
+                print(f"{e}.")
+            continue
         try:
             if text == "/compact":
                 if not agent.compact():
                     print("Nothing to compact yet.")
                 continue
             print(f"\n{agent.send(text)}")
+            agent.save_session(default_session)
             used = agent.context_tokens()
             print(f"\033[2m(context: ~{used:,} / {agent.context_window:,} tokens, {used / agent.context_window:.0%})\033[0m\n")
         except KeyboardInterrupt:
             agent.repair_after_interrupt()
+            agent.save_session(default_session)
             print("\n(Interrupted.)")
         except Exception as e:  # API errors: bad key, rate limit, network...
             print(f"\n\033[31mAPI error: {e}\033[0m\n")

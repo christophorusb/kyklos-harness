@@ -16,6 +16,8 @@ Copy-Item .env.example .env   # then fill in BASE_URL, API_KEY, MODEL
 
 ```powershell
 .\kyklos                                   # interactive
+.\kyklos --plan                            # start in read-only plan mode
+.\kyklos --resume                          # resume the last saved session
 .\kyklos "create fizzbuzz.py and run it"   # one task, then exit
 ```
 
@@ -23,7 +25,7 @@ Copy-Item .env.example .env   # then fill in BASE_URL, API_KEY, MODEL
 
 The agent works in the directory you launch from, or in `WORKSPACE` if you set it in `.env`. A throwaway `sandbox` folder is a good place to start.
 
-REPL commands: `/reset` clears the conversation, `/compact` summarizes it now, `/exit` quits, Ctrl+C interrupts a running turn. After each answer, a dimmed line shows how much of the context window is used.
+REPL commands: `/plan` toggles read-only plan mode (or `/plan <task>` plans a task), `/undo` reverts the last turn's conversation and file edits, `/save [file]` and `/resume [file]` save or load JSONL sessions (the latest session is auto-saved to `.sessions/last.jsonl`), `/compact` summarizes older context now, `/reset` clears the conversation, `/exit` quits, and Ctrl+C interrupts a running turn. After each answer, a dimmed line shows how much of the context window is used.
 
 ## How it works
 
@@ -75,9 +77,7 @@ Errors such as a bad path, an ambiguous edit, a timeout, or invalid JSON go back
 Roughly in order of how much each one helps:
 
 1. **Streaming output**, so you can watch the answer being written (`stream=True`).
-2. **Plan mode:** a read-only tool set for exploring and proposing before changing anything.
-3. **Skills:** list `skills/*/SKILL.md` names and descriptions in the prompt, and load a full file only when the model asks for it.
-4. **Parallel explore subagents** (they're read-only, so they can safely run at the same time), and a cheaper model for subagents.
-5. **Session save and resume:** write conversations to JSONL.
-6. **MCP client, hooks, web fetch.**
-7. **A sandbox:** run `bash` inside Docker or a git worktree.
+2. **Skills:** list `skills/*/SKILL.md` names and descriptions in the prompt, and load a full file only when the model asks for it.
+3. **Parallel explore subagents** (they're read-only, so they can safely run at the same time), and a cheaper model for subagents.
+4. **MCP client, hooks, web fetch.**
+5. **A sandbox:** run `bash` inside Docker or a git worktree.
