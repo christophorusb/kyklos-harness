@@ -4,7 +4,7 @@ All notable changes to **Kyklos** since the repository was initialized on 2026-1
 
 ---
 
-## Unreleased — Security Hardening from the Second Audit (2026-10-24)
+## `b9c9a71` — Security Hardening from the Second Audit (2026-10-24)
 
 A second Gemini 3.8 Flash audit (`AUDIT_REPORT.md`, SEC series) proposed seven hardening items. SEC-01, 04 and 06 were reproduced before fixing. SEC-02 (OS sandboxing) and SEC-03 (network egress control) are real gaps but a larger design decision, and SEC-07 (audit log) is a nice-to-have: all three are deferred.
 
