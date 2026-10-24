@@ -147,6 +147,45 @@ def _match_edit(text: str, old_string: str, new_string: str) -> tuple[str, str]:
     raise ToolError("old_string not found. Re-read the file and copy the text exactly.")
 
 
+MAX_BRACE_EXPANSIONS = 64
+
+
+def expand_braces(pattern: str) -> list[str]:
+    """Shell-style {a,b} alternatives, which Python's glob doesn't support: '*.{py,md}' -> ['*.py', '*.md'].
+    Handles several and nested groups; a group without a comma (like '{x}') stays literal."""
+    depth, start = 0, None
+    for i, ch in enumerate(pattern):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0:
+                inner, alternatives, level, piece = pattern[start + 1:i], [], 0, ""
+                for c in inner:  # split on commas that aren't inside a nested group
+                    level += c == "{"
+                    level -= c == "}"
+                    if c == "," and level == 0:
+                        alternatives.append(piece)
+                        piece = ""
+                    else:
+                        piece += c
+                if not alternatives:
+                    continue  # no comma: a literal brace group, keep scanning
+                alternatives.append(piece)
+                prefix, suffix = pattern[:start], pattern[i + 1:]
+                out = []
+                for alt in alternatives:
+                    for expanded in expand_braces(prefix + alt + suffix):
+                        if expanded not in out:
+                            out.append(expanded)
+                        if len(out) >= MAX_BRACE_EXPANSIONS:
+                            return out
+                return out
+    return [pattern]
+
+
 class ToolError(Exception):
     """An error message meant for the model, not a crash."""
 
@@ -247,8 +286,9 @@ class Tools:
         if not root.exists():
             raise ToolError(f"Path not found: {path}")
         hits = []
+        globs = expand_braces(glob) if glob else []
         for f in self._walk_files(root):
-            if (glob and not f.match(glob)) or is_secret_file(f):
+            if (globs and not any(f.match(g) for g in globs)) or is_secret_file(f):
                 continue
             try:
                 if f.stat().st_size > MAX_SEARCH_FILE_BYTES:
@@ -267,10 +307,12 @@ class Tools:
         return self._truncate("\n".join(hits) or "No matches.")
 
     def glob(self, pattern: str) -> str:
-        if Path(pattern).is_absolute() or ".." in Path(pattern).parts:
+        patterns = expand_braces(pattern)
+        if any(Path(p).is_absolute() or ".." in Path(p).parts for p in patterns):
             raise ToolError("Pattern must be relative to the workspace, without '..'")
         files = []
-        for p in sorted(self.workspace.glob(pattern)):
+        matches = {m for p in patterns for m in self.workspace.glob(p)}
+        for p in sorted(matches):
             if not p.is_file() or SKIP_DIRS.intersection(p.relative_to(self.workspace).parts):
                 continue
             files.append(self._rel(p))

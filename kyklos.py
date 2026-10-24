@@ -262,8 +262,40 @@ def is_auto_allowed(name: str, args: dict, always_allowed: set[str]) -> bool:
     return name in always_allowed
 
 
+def permission_options(name: str, args: dict) -> tuple[bool, str]:
+    """What a permission prompt may offer for this call: (touches_secret, suggested_bash_prefix).
+    Shared by the plain prompt and the UI so both apply the same rules."""
+    cmd = str(args.get("command", "")) if name == "bash" else ""
+    touches_secret = name == "bash" and command_touches_secret(cmd)
+    prefix = suggest_prefix(cmd) if name == "bash" and not touches_secret else ""
+    return touches_secret, prefix
+
+
+def apply_permission_answer(name: str, answer: str, always_allowed: set, touches_secret: bool,
+                            prefix: str) -> bool:
+    """Apply the user's answer ('y', 'n', 'a', 'p' or 'p <custom prefix>'). Returns True if allowed.
+    'a' and 'p' save a rule in always_allowed; neither is offered for commands touching secrets."""
+    low = answer.strip().lower()
+    if not touches_secret and low in ("a", "always"):
+        always_allowed.add(name)
+        return True
+    if prefix and (low in ("p", "prefix") or low.startswith("p ")):
+        custom = answer.strip()[2:].strip() if low.startswith("p ") else ""
+        always_allowed.add(f"bash:{custom or prefix}")
+        return True
+    return low in ("y", "yes")
+
+
+def denial_note(name: str, reason: str = "") -> str:
+    return f"The user denied this {name} call." + (f" Reason: {reason}" if reason else "")
+
+
+NO_APPROVER_NOTE = ("The {name} call was denied: nobody is available to approve it. "
+                    "Use read-only tools instead.")
+
+
 def ask_permission(name: str, args: dict, always_allowed: set) -> tuple[bool, str]:
-    """Ask the user before a risky tool runs. Returns (allowed, note_for_model)."""
+    """Plain terminal prompt before a risky tool runs. Returns (allowed, note_for_model)."""
     print(f"\n\033[33m? {name}\033[0m")
     if name == "edit_file" and "old_string" in args and "new_string" in args:
         print(f"  path: {args.get('path', '')}")
@@ -278,9 +310,7 @@ def ask_permission(name: str, args: dict, always_allowed: set) -> tuple[bool, st
                 shown = shown[:600] + f"... ({len(shown)} chars)"
             print(f"  {key}: {shown}")
 
-    cmd = str(args.get("command", "")) if name == "bash" else ""
-    touches_secret = name == "bash" and command_touches_secret(cmd)
-    prefix = suggest_prefix(cmd) if name == "bash" and not touches_secret else ""
+    touches_secret, prefix = permission_options(name, args)
     if touches_secret:
         print("  \033[31m! This command references a secret file.\033[0m")
         prompt = "  Allow once? [y]es / [n]o: "
@@ -293,19 +323,11 @@ def ask_permission(name: str, args: dict, always_allowed: set) -> tuple[bool, st
         answer = input(prompt).strip()
     except EOFError:  # no keyboard, e.g. piped or scripted run
         print("  (no input available: denied)")
-        return False, f"The {name} call was denied: nobody is available to approve it. Use read-only tools instead."
-    low = answer.lower()
-    if not touches_secret and low in ("a", "always"):
-        always_allowed.add(name)
-        return True, ""
-    if prefix and (low in ("p", "prefix") or low.startswith("p ")):
-        chosen = answer[2:].strip() if low.startswith("p ") and answer[2:].strip() else prefix
-        always_allowed.add(f"bash:{chosen}")
-        return True, ""
-    if low in ("y", "yes"):
+        return False, NO_APPROVER_NOTE.format(name=name)
+    if apply_permission_answer(name, answer, always_allowed, touches_secret, prefix):
         return True, ""
     reason = input("  Reason to tell the model (optional): ").strip()
-    return False, f"The user denied this {name} call." + (f" Reason: {reason}" if reason else "")
+    return False, denial_note(name, reason)
 
 
 def is_retryable_error(e: Exception) -> bool:
@@ -367,17 +389,22 @@ class Agent:
         if self.on_event:
             self.on_event(event, depth=self.depth, **data)
 
-    def _complete(self, **kwargs):
-        """Call chat.completions.create, retrying transient rate-limit, 5xx, and connection errors."""
-        for attempt in range(1, MAX_API_RETRIES + 1):
-            try:
-                return self.client.chat.completions.create(**kwargs)
-            except Exception as e:
-                if attempt >= MAX_API_RETRIES or not is_retryable_error(e):
-                    raise
-                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                self._emit("retry", attempt=attempt, max_attempts=MAX_API_RETRIES, delay=delay, error=str(e))
-                self.sleep(delay)
+    def _complete(self, purpose: str = "turn", **kwargs):
+        """Call chat.completions.create, retrying transient rate-limit, 5xx, and connection errors.
+        Emits model_start / model_end around the wait (purpose: "turn" or "summary"), so a UI can show a spinner."""
+        self._emit("model_start", purpose=purpose)
+        try:
+            for attempt in range(1, MAX_API_RETRIES + 1):
+                try:
+                    return self.client.chat.completions.create(**kwargs)
+                except Exception as e:
+                    if attempt >= MAX_API_RETRIES or not is_retryable_error(e):
+                        raise
+                    delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    self._emit("retry", attempt=attempt, max_attempts=MAX_API_RETRIES, delay=delay, error=str(e))
+                    self.sleep(delay)
+        finally:
+            self._emit("model_end", purpose=purpose)
 
     def _record_file_snapshot(self, p: Path) -> None:
         if self.active_snapshots is not None and p not in self.active_snapshots:
@@ -506,6 +533,7 @@ class Agent:
         # Stage 2: summarize the old part (from the original messages, so nothing is lost to stage 1).
         transcript = render_transcript(body[:cut], max_chars=int(self.context_window * 0.5) * 4)
         response = self._complete(
+            purpose="summary",
             model=self.model,
             messages=[{"role": "system", "content": SUMMARY_PROMPT}, {"role": "user", "content": transcript}],
         )
@@ -656,6 +684,137 @@ class Agent:
         return f"(Stopped after {MAX_STEPS} steps without a final answer.)"
 
 
+# Slash commands: one registry shared by the plain REPL and the Aero UI, which also generates /help.
+# A handler takes (ctx, arg) and returns None, EXIT, or text to send to the agent as a request.
+EXIT = object()
+COMMANDS: dict[str, tuple] = {}  # name -> (handler, usage, summary)
+
+
+class CommandContext:
+    def __init__(self, agent: "Agent", say, default_session: Path):
+        self.agent = agent
+        self.say = say  # say(kind, text) with kind in info / ok / warn / error
+        self.default_session = default_session
+
+
+def command(name: str, usage: str, summary: str):
+    def register(fn):
+        COMMANDS[name] = (fn, usage, summary)
+        return fn
+    return register
+
+
+@command("help", "/help", "Show these commands")
+def _cmd_help(ctx, arg):
+    width = max(len(usage) for _, usage, _ in COMMANDS.values()) + 2
+    ctx.say("info", "\n".join(f"{usage:<{width}}{summary}" for _, usage, summary in COMMANDS.values()))
+
+
+@command("plan", "/plan [request]", "Toggle read-only plan mode, or run one request in it")
+def _cmd_plan(ctx, arg):
+    if arg:
+        ctx.agent.set_plan_mode(True)
+        ctx.say("info", "Plan mode on (read-only).")
+        return arg
+    ctx.agent.set_plan_mode(not ctx.agent.plan_mode)
+    ctx.say("info", "Plan mode on (read-only: explore and propose a plan)." if ctx.agent.plan_mode
+            else "Plan mode off (full tools enabled).")
+
+
+@command("undo", "/undo", "Revert the last turn, including its file changes")
+def _cmd_undo(ctx, arg):
+    reverted = ctx.agent.undo()
+    if reverted is None:
+        ctx.say("warn", "Nothing to undo.")
+        return
+    ctx.agent.save_session(ctx.default_session)
+    ctx.say("ok", f"Undid the last turn ({'reverted files: ' + ', '.join(reverted) if reverted else 'no files were changed'}).")
+
+
+@command("save", "/save [file]", "Save the session (default .sessions/last.jsonl)")
+def _cmd_save(ctx, arg):
+    target = Path(arg) if arg else ctx.default_session
+    ctx.agent.save_session(target)
+    ctx.say("ok", f"Session saved to {target}.")
+
+
+@command("resume", "/resume [file]", "Resume a saved session")
+def _cmd_resume(ctx, arg):
+    target = Path(arg) if arg else ctx.default_session
+    try:
+        count = ctx.agent.load_session(target)
+        ctx.say("ok", f"Resumed {count} messages from {target}.")
+    except FileNotFoundError as e:
+        ctx.say("error", f"{e}.")
+
+
+@command("compact", "/compact", "Shrink the conversation now")
+def _cmd_compact(ctx, arg):
+    if not ctx.agent.compact():
+        ctx.say("info", "Nothing to compact yet.")
+
+
+@command("reset", "/reset", "Clear the conversation")
+def _cmd_reset(ctx, arg):
+    ctx.agent.reset()
+    ctx.say("ok", "Conversation cleared.")
+
+
+@command("exit", "/exit", "Quit")
+def _cmd_exit(ctx, arg):
+    return EXIT
+
+
+def run_command(ctx: CommandContext, text: str):
+    """Run a /command line. Returns None, EXIT, or text to send to the agent."""
+    name, _, arg = text[1:].partition(" ")
+    entry = COMMANDS.get(name.lower()) or (COMMANDS["exit"] if name.lower() == "quit" else None)
+    if entry is None:
+        ctx.say("error", f"Unknown command /{name}. Type /help for the list.")
+        return None
+    return entry[0](ctx, arg.strip())
+
+
+def wants_aero_ui(stdin_tty: bool, stdout_tty: bool, env: dict) -> bool:
+    """The Aero UI needs a real terminal on both ends; KYKLOS_UI=plain forces the plain REPL."""
+    return stdin_tty and stdout_tty and env.get("KYKLOS_UI", "").lower() != "plain"
+
+
+def plain_repl(agent: "Agent", default_session: Path) -> None:
+    """The dependency-free REPL, used when output isn't a terminal or KYKLOS_UI=plain."""
+    ctx = CommandContext(agent, lambda kind, text: print(text), default_session)
+    agents_md = " (AGENTS.md loaded)" if (agent.tools.workspace / "AGENTS.md").is_file() else ""
+    print(f"Kyklos ready. model={agent.model}  workspace={agent.tools.workspace}{agents_md}")
+    print("Type /help for commands.\n")
+    while True:
+        try:
+            prompt_label = "\033[1;36m(plan) > \033[0m" if agent.plan_mode else "\033[1m> \033[0m"
+            text = input(prompt_label).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not text:
+            continue
+        try:
+            if text.startswith("/"):
+                result = run_command(ctx, text)
+                if result is EXIT:
+                    break
+                if result is None:
+                    continue
+                text = result
+            print(f"\n{agent.send(text)}")
+            agent.save_session(default_session)
+            used = agent.context_tokens()
+            print(f"\033[2m(context: ~{used:,} / {agent.context_window:,} tokens, {used / agent.context_window:.0%})\033[0m\n")
+        except KeyboardInterrupt:
+            agent.repair_after_interrupt()
+            agent.save_session(default_session)
+            print("\n(Interrupted.)")
+        except Exception as e:  # API errors: bad key, rate limit, network...
+            print(f"\n\033[31mAPI error: {e}\033[0m\n")
+
+
 def main() -> None:
     here = Path(__file__).parent
     load_dotenv(here / ".env")
@@ -682,86 +841,35 @@ def main() -> None:
         else:
             resume_path = default_session
 
-    agent = Agent(client, os.environ["MODEL"], workspace, context_window=window, plan_mode=plan_mode)
+    ui = None
+    if wants_aero_ui(sys.stdin.isatty(), sys.stdout.isatty(), os.environ):
+        # ui.py imports `kyklos`; point that name at this running script instead of loading a second copy.
+        sys.modules.setdefault("kyklos", sys.modules[__name__])
+        try:
+            from ui import AeroUI
+            ui = AeroUI(workspace)
+        except ImportError:  # rich / prompt_toolkit not installed: fall back to the plain REPL
+            ui = None
+    agent = Agent(client, os.environ["MODEL"], workspace, context_window=window, plan_mode=plan_mode,
+                  **({"permission": ui.permission, "on_event": ui.observer} if ui else {}))
+    resume_note = None
     if resume_path:
         try:
             count = agent.load_session(resume_path)
-            print(f"Resumed session from {resume_path} ({count} messages).")
+            resume_note = ("ok", f"Resumed session from {resume_path} ({count} messages).")
         except FileNotFoundError as e:
-            print(f"({e}; starting fresh.)")
+            resume_note = ("warn", f"{e}; starting fresh.")
 
+    if ui:
+        ui.run(agent, default_session, one_shot=" ".join(args) or None, notice=resume_note)
+        return
+    if resume_note:
+        print(resume_note[1])
     if args:
         print(agent.send(" ".join(args)))
         agent.save_session(resume_path or default_session)
         return
-
-    agents_md = " (AGENTS.md loaded)" if (agent.tools.workspace / "AGENTS.md").is_file() else ""
-    print(f"Kyklos ready. model={agent.model}  workspace={agent.tools.workspace}{agents_md}")
-    print("Commands: /plan toggles plan mode, /undo reverts last turn, /save & /resume manage sessions, "
-          "/compact summarizes, /reset clears, /exit quits.\n")
-    while True:
-        try:
-            prompt_label = "\033[1;36m(plan) > \033[0m" if agent.plan_mode else "\033[1m> \033[0m"
-            text = input(prompt_label).strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-        if not text:
-            continue
-        if text == "/exit":
-            break
-        if text == "/reset":
-            agent.reset()
-            print("Conversation cleared.")
-            continue
-        if text == "/plan" or text.startswith("/plan "):
-            rest = text[5:].strip()
-            if rest:
-                agent.set_plan_mode(True)
-                print("Plan mode ON (read-only).")
-                text = rest
-            else:
-                agent.set_plan_mode(not agent.plan_mode)
-                state = "ON (read-only: explore and propose a plan)" if agent.plan_mode else "OFF (full tools enabled)"
-                print(f"Plan mode {state}.")
-                continue
-        if text == "/undo":
-            reverted = agent.undo()
-            if reverted is None:
-                print("Nothing to undo.")
-            else:
-                files_note = f" (reverted files: {', '.join(reverted)})" if reverted else " (no files were changed)"
-                print(f"Undid last turn{files_note}.")
-                agent.save_session(default_session)
-            continue
-        if text == "/save" or text.startswith("/save "):
-            target = Path(text[5:].strip()) if text[5:].strip() else default_session
-            agent.save_session(target)
-            print(f"Session saved to {target}.")
-            continue
-        if text == "/resume" or text.startswith("/resume "):
-            target = Path(text[7:].strip()) if text[7:].strip() else default_session
-            try:
-                count = agent.load_session(target)
-                print(f"Resumed {count} messages from {target}.")
-            except FileNotFoundError as e:
-                print(f"{e}.")
-            continue
-        try:
-            if text == "/compact":
-                if not agent.compact():
-                    print("Nothing to compact yet.")
-                continue
-            print(f"\n{agent.send(text)}")
-            agent.save_session(default_session)
-            used = agent.context_tokens()
-            print(f"\033[2m(context: ~{used:,} / {agent.context_window:,} tokens, {used / agent.context_window:.0%})\033[0m\n")
-        except KeyboardInterrupt:
-            agent.repair_after_interrupt()
-            agent.save_session(default_session)
-            print("\n(Interrupted.)")
-        except Exception as e:  # API errors: bad key, rate limit, network...
-            print(f"\n\033[31mAPI error: {e}\033[0m\n")
+    plain_repl(agent, default_session)
 
 
 if __name__ == "__main__":

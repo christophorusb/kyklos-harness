@@ -160,6 +160,23 @@ class SearchToolTests(unittest.TestCase):
         result = Agent(FakeClient([]), "fake", self.ws, permission=allow_all).run_tool("glob", '{"pattern": "../*"}')
         self.assertIn("without '..'", result)
 
+    def test_brace_patterns_expand_like_a_shell(self):
+        from tools import expand_braces
+        self.assertEqual(expand_braces("**/*.{py,js}"), ["**/*.py", "**/*.js"])
+        self.assertEqual(expand_braces("{src,lib}/*.{py,md}"), ["src/*.py", "src/*.md", "lib/*.py", "lib/*.md"])
+        self.assertEqual(expand_braces("*.{py,{js,ts}}"), ["*.py", "*.js", "*.ts"])  # nested
+        self.assertEqual(expand_braces("a{x}b"), ["a{x}b"])  # no comma: literal
+        self.assertEqual(expand_braces("plain/*.py"), ["plain/*.py"])
+        self.assertEqual(len(expand_braces("{a,b,c,d}{a,b,c,d}{a,b,c,d}{a,b,c,d}")), 64)  # capped
+
+    def test_glob_and_grep_accept_brace_patterns(self):
+        tools = Agent(FakeClient([]), "fake", self.ws).tools
+        self.assertEqual(tools.glob("**/*.{py,js}").splitlines(), ["src/app.py", "src/util.js"])
+        out = tools.grep("main", glob="*.{js,md}")
+        self.assertIn("src/util.js", out)
+        self.assertNotIn("app.py", out)
+        self.assertIn("without '..'", Agent(FakeClient([]), "fake", self.ws).run_tool("glob", '{"pattern": "{src,..}/*"}'))
+
     def test_search_tools_run_without_permission(self):
         client = FakeClient([
             reply(tool_calls=[tool_call("1", "grep", pattern="return"), tool_call("2", "glob", pattern="src/*")]),
@@ -692,9 +709,18 @@ class RetryAndObserverTests(unittest.TestCase):
         )
         self.assertEqual(agent.send("hello"), "Recovered.")
         self.assertEqual(sleeps, [1.0, 2.0])
-        self.assertEqual([e[0] for e in events], ["retry", "retry"])
-        self.assertEqual(events[0][1]["attempt"], 1)
-        self.assertEqual(events[1][1]["attempt"], 2)
+        # Retries happen inside one model wait, so a UI spinner keeps running through them.
+        self.assertEqual([e[0] for e in events], ["model_start", "retry", "retry", "model_end"])
+        retries = [kw for ev, kw in events if ev == "retry"]
+        self.assertEqual([r["attempt"] for r in retries], [1, 2])
+
+    def test_model_end_fires_even_when_the_call_fails(self):
+        events = []
+        client = FakeClient([TransientAPIError(401, "invalid api key")])
+        agent = Agent(client, "fake", self.ws, on_event=lambda ev, **kw: events.append(ev), sleep=lambda s: None)
+        with self.assertRaises(TransientAPIError):
+            agent.send("hello")
+        self.assertEqual(events, ["model_start", "model_end"])  # the spinner always stops
 
     def test_non_retryable_error_raises_immediately(self):
         sleeps = []
@@ -726,7 +752,11 @@ class RetryAndObserverTests(unittest.TestCase):
 
         self.assertEqual(answer, "All done.")
         self.assertEqual(buf.getvalue(), "")  # zero direct print() calls inside Agent
-        kinds = [(ev, depth) for ev, depth, _ in events]
+        # Every API call (2 for the parent, 2 for the subagent) is wrapped in model_start / model_end.
+        model = [(ev, depth) for ev, depth, _ in events if ev.startswith("model_")]
+        self.assertEqual(model, [("model_start", 0), ("model_end", 0), ("model_start", 1), ("model_end", 1),
+                                 ("model_start", 1), ("model_end", 1), ("model_start", 0), ("model_end", 0)])
+        kinds = [(ev, depth) for ev, depth, _ in events if not ev.startswith("model_")]
         self.assertEqual(kinds, [
             ("thought", 0),
             ("tool_call", 0),

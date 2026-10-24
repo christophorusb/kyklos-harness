@@ -2,7 +2,7 @@
 
 *κύκλος: "circle, cycle." At its core, a harness is one loop: ask the model, run its tools, feed back the results, repeat.*
 
-A minimal coding-agent harness (~760 lines of Python, plus ~475 lines of tests) that works with any OpenAI-compatible API: Ollama cloud, DeepSeek, OpenRouter, OpenAI, Gemini, local Ollama, LM Studio.
+A small coding-agent harness (~1,800 lines of Python, plus ~880 lines of tests) that works with any OpenAI-compatible API: Ollama cloud, DeepSeek, OpenRouter, OpenAI, Gemini, local Ollama, LM Studio. It has an inline terminal UI, **Kyklos Aero**, in a Frutiger Aero style (see [DESIGN.md](DESIGN.md)).
 
 ## Setup
 
@@ -25,16 +25,52 @@ Copy-Item .env.example .env   # then fill in BASE_URL, API_KEY, MODEL
 
 The agent works in the directory you launch from, or in `WORKSPACE` if you set it in `.env`. A throwaway `sandbox` folder is a good place to start.
 
-REPL commands: `/plan` toggles read-only plan mode (or `/plan <task>` plans a task), `/undo` reverts the last turn's conversation and file edits, `/save [file]` and `/resume [file]` save or load JSONL sessions (the latest session is auto-saved to `.sessions/last.jsonl`), `/compact` summarizes older context now, `/reset` clears the conversation, `/exit` quits, and Ctrl+C interrupts a running turn. After each answer, a dimmed line shows how much of the context window is used.
+Commands (type `/help` for the list, Tab completes them):
+
+| Command | What it does |
+|---|---|
+| `/plan [task]` | Toggle read-only plan mode, or plan one task in it |
+| `/undo` | Revert the last turn's conversation and file edits |
+| `/save [file]`, `/resume [file]` | Save or load a JSONL session. The latest session is also saved automatically to `.sessions/last.jsonl` |
+| `/compact` | Shrink the conversation now |
+| `/reset` | Clear the conversation |
+| `/exit` | Quit (or Ctrl+C twice at an empty prompt) |
+
+## The interface: Kyklos Aero
+
+In a real terminal, Kyklos uses an inline UI built with [Rich](https://github.com/Textualize/rich) and [prompt_toolkit](https://github.com/prompt-toolkit/python-prompt-toolkit). Output scrolls normally and the input line sits at the bottom:
+
+- **Tool calls** show as one line each, `● read_file  kyklos.py  24–31 … 8 lines`, with human-readable arguments and a short summary. `bash` also shows its exit code and last 3 output lines.
+- **A breathing-bubble spinner** shows while the model thinks. Running steps are shown live and disappear once they finish, so the scrollback stays clean.
+- **Subagents** show a live tree of their latest steps, which collapses to one line when they finish.
+- **Permission prompts** are a rounded panel with **glass diff blocks**: added lines in mint, deleted in coral, and modified lines in aqua, with the changed characters glowing. Answer with a single key: `y` / `n` / `p` / `a`. `p` lets you edit the suggested prefix before saving it, and `n` asks for an optional reason.
+- **Answers** are rendered as Markdown, followed by a footer: `ctx 9% · 4 tools · 14s`.
+- **A status bar** while you type shows the model, a context meter, a PLAN badge and the workspace.
+- **Input:** history with ↑/↓ (saved to `.sessions/history`), and Alt+Enter for a new line.
+
+Settings:
+
+| Variable | Effect |
+|---|---|
+| `KYKLOS_UI=plain` | Use the plain, dependency-free REPL instead |
+| `KYKLOS_THEME=plain` | Use the 16 named ANSI colors instead of the Aero truecolor palette |
+| `KYKLOS_ASCII=1` | ASCII glyphs (`o * x`) instead of Unicode (also used automatically when output isn't UTF-8) |
+| `NO_COLOR=1` | No colors at all; glyphs and words still carry every meaning |
+
+When input or output isn't a terminal (piped or scripted runs), Kyklos automatically uses the plain REPL.
 
 ## How it works
 
 | File | Role |
 |---|---|
-| `kyklos.py` | The agent loop, the system prompt, the permission prompt, and the REPL |
+| `kyklos.py` | The agent loop, the system prompt, the permission rules, the command registry, and the plain REPL |
 | `tools.py` | Tool schemas sent to the model, their implementations, and the environment probe |
+| `ui.py` | Kyklos Aero: renders the Agent's events, the permission panel, and the prompt with its status bar |
 | `kyklos.cmd` | Windows launcher |
-| `test_kyklos.py` | Offline tests: a scripted fake model drives the real loop |
+| `test_kyklos.py`, `test_ui.py` | Offline tests: a scripted fake model drives the real loop (and the UI, through a recording console) |
+| `DESIGN.md`, `design/aero_preview.py` | The UI design system, and a dependency-free preview of it |
+
+The `Agent` never prints anything itself: it emits events (`model_start`, `thought`, `tool_call`, `tool_result`, `subagent_start`, …), and a front end renders them. The plain REPL and Kyklos Aero both use the same permission rules (`permission_options` / `apply_permission_answer`) and the same command registry.
 
 The loop in `Agent.send` sends the conversation to the model, runs any tool calls it returns, appends the results, and repeats. It stops when the model answers without calling a tool, or after `MAX_STEPS`.
 
@@ -69,14 +105,14 @@ Errors such as a bad path, an ambiguous edit, a timeout, or invalid JSON go back
 ## Tests
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest test_kyklos -v
+.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui
 ```
 
 ## Ideas for next steps
 
 Roughly in order of how much each one helps:
 
-1. **Streaming output**, so you can watch the answer being written (`stream=True`).
+1. **UI phase 2:** stream answers as they're written (`stream=True`, assembling tool calls from pieces), Esc to interrupt, and a token/cost readout.
 2. **Skills:** list `skills/*/SKILL.md` names and descriptions in the prompt, and load a full file only when the model asks for it.
 3. **Parallel explore subagents** (they're read-only, so they can safely run at the same time), and a cheaper model for subagents.
 4. **MCP client, hooks, web fetch.**
