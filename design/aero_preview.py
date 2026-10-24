@@ -164,7 +164,7 @@ def swatches():
 def banner():
     section("banner")
     word = gradient("kyklos", ["#E8FBFF", "aqua", "sky", "deep"])  # first letter is the white glint
-    meta = c("frost", "  ·  kimi-k2.7-code  ·  Harness Playground  ·  AGENTS.md loaded")
+    meta = c("frost", "  ·  kimi-k2.7-code  ·  kyklos-harness  ·  AGENTS.md loaded")
     print(f" {c('aqua', '○')} {BOLD}{word}{meta}")
     print(c("frost", "   /help for commands · ctrl+c to interrupt"))
 
@@ -263,12 +263,12 @@ def status_bar():
     print("  " + gradient("─" * (WIDTH - 4), ["aqua", "sky", "deep"]))
     meter = gradient("▰▰", ["glint", "mint"]) + c("frost", "▱▱▱")
     print(f"  {c('sky', 'kimi-k2.7-code')} {c('frost', '·')} ctx 12% {meter} {c('frost', '·')} "
-          f"\033[48;2;10;111;214m{BOLD} PLAN {RESET} {c('frost', '·  Harness Playground  ·  /help')}")
+          f"\033[48;2;10;111;214m{BOLD} PLAN {RESET} {c('frost', '·  kyklos-harness  ·  /help')}")
 
 
 def plain_comparison():
     section("for comparison: the plain 16-color fallback (terminal 'cyan')")
-    print(f" \033[36m○\033[0m {BOLD}kyklos{RESET}\033[2m  ·  kimi-k2.7-code  ·  Harness Playground\033[0m")
+    print(f" \033[36m○\033[0m {BOLD}kyklos{RESET}\033[2m  ·  kimi-k2.7-code  ·  kyklos-harness\033[0m")
     print(f"  \033[36m●\033[0m {BOLD}grep{RESET}  \033[2m/--plan|--resume/ in kyklos.py\033[0m      \033[2m3 matches\033[0m")
     print(f"  \033[32m+    if \"--version\" in args:\033[0m   \033[31m-    old line\033[0m")
 

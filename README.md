@@ -2,7 +2,7 @@
 
 *κύκλος: "circle, cycle." At its core, a harness is one loop: ask the model, run its tools, feed back the results, repeat.*
 
-A small coding-agent harness (~2,100 lines of Python, plus ~1,060 lines of tests) that works with any OpenAI-compatible API: Ollama cloud, DeepSeek, OpenRouter, OpenAI, Gemini, local Ollama, LM Studio. It has an inline terminal UI, **Kyklos Aero**, in a Frutiger Aero style (see [DESIGN.md](DESIGN.md)).
+A small coding-agent harness (~2,950 lines of Python, plus ~1,870 lines of tests) that works with any OpenAI-compatible API: Ollama cloud, DeepSeek, OpenRouter, OpenAI, Gemini, local Ollama, LM Studio. It has an inline terminal UI, **Kyklos Aero**, in a Frutiger Aero style (see [DESIGN.md](DESIGN.md)).
 
 ## Setup
 

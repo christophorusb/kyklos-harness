@@ -4,6 +4,15 @@ All notable changes to **Kyklos** since the repository was initialized on 2026-1
 
 ---
 
+## Unreleased — Repository Folder Renamed to kyklos-harness (2026-10-24)
+
+The repository folder moved from `Harness Playground` to `kyklos-harness`. The rename itself happened outside git (the user PATH entry, the venv's `activate` scripts and `pyvenv.cfg`, and `~/.kyklos/projects/` were updated by hand); this commit updates the docs that named the old folder.
+
+- **Docs (`README.md`, `.env.example`):** the PATH setup command and the example `WORKSPACE` path use the new folder. The README's size line is current again: ~2,950 lines of Python plus ~1,870 of tests (it said ~2,100 and ~1,060).
+- **Mockups (`DESIGN.md`, `design/aero_preview.py`):** the folder shown in the welcome line and status bar is now `kyklos-harness`.
+
+---
+
 ## `b9c9a71` — Security Hardening from the Second Audit (2026-10-24)
 
 A second Gemini 3.8 Flash audit (`AUDIT_REPORT.md`, SEC series) proposed seven hardening items. SEC-01, 04 and 06 were reproduced before fixing. SEC-02 (OS sandboxing) and SEC-03 (network egress control) are real gaps but a larger design decision, and SEC-07 (audit log) is a nice-to-have: all three are deferred.

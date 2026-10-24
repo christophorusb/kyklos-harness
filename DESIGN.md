@@ -64,7 +64,7 @@ Tuned for dark backgrounds. All are 24-bit; see §8 for the fallback.
 ### Banner
 Three lines, with no ASCII-art logo. `kyklos` is drawn as a gradient (`#E8FBFF` → aqua → sky → deep), so the first letter is the white "specular" glint.
 ```
- ○ kyklos  ·  kimi-k2.7-code  ·  Harness Playground  ·  AGENTS.md loaded
+ ○ kyklos  ·  kimi-k2.7-code  ·  kyklos-harness  ·  AGENTS.md loaded
    /help for commands · ctrl+c to interrupt
 ```
 
@@ -74,7 +74,7 @@ Three lines, with no ASCII-art logo. `kyklos` is drawn as a gradient (`#E8FBFF` 
 ### Status bar
 Shown only while you type (prompt_toolkit's bottom toolbar). A sky → deep gradient rule sits above it.
 ```
- kimi-k2.7-code · ctx 12% ▰▰▱▱▱ ·  PLAN  · Harness Playground · /help
+ kimi-k2.7-code · ctx 12% ▰▰▱▱▱ ·  PLAN  · kyklos-harness · /help
 ```
 The meter's filled cells are a glint → mint gradient. The `PLAN` badge is white bold text on `deep`, and appears only in plan mode.
 
