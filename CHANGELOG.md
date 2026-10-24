@@ -4,6 +4,18 @@ All notable changes to **Kyklos** since the repository was initialized on 2026-1
 
 ---
 
+## Unreleased — Automatic Context Window Detection (2026-10-24)
+
+- **Context window detection (`kyklos.py`):**
+  - Added `detect_context_window`, which asks Ollama cloud's `/api/show` for the model's `context_length` at startup (5 s timeout; any failure falls back quietly). Only `ollama.com` base URLs are asked, so the API key is never sent anywhere else. Local Ollama is skipped on purpose: it reports the trained maximum, while the server runs with a smaller `num_ctx` unless configured.
+  - Added `choose_context_window` with a fixed priority: `CONTEXT_WINDOW` (always wins; accepts `1_000_000`; a non-number exits with a clear message) → the detected value → `DEFAULT_CONTEXT_WINDOW` (128k). Detection is skipped when `CONTEXT_WINDOW` is set.
+  - Live: `minimax-m3.1-flash` is detected as 1,000,000 tokens in about 1.5 s.
+- **Banners (`kyklos.py`, `ui.py`):** the Aero banner shows the window (`1M context`, or `128k context (default)` when neither detected nor set), and the plain REPL prints `context=1M (detected)`. Added `short_tokens` for the compact form.
+- **Docs (`README.md`, `.env.example`):** explained the priority order, the Ollama-cloud-only detection, and how to set `CONTEXT_WINDOW` for local Ollama.
+- **Tests:** added `ContextWindowTests` (5 tests with a fake `urlopen`: the request's URL, body and auth header; other providers and local Ollama never contacted; failures, missing and implausibly small values ignored; priority order; `short_tokens`) and banner assertions (88 total offline tests).
+
+---
+
 ## `a6513f8` — Run Anywhere, Folder Trust & Audit-Session UI Fixes (2026-10-24)
 
 - **Folder trust (`kyklos.py`, `ui.py`):**

@@ -101,7 +101,14 @@ In a live test, a subagent took 12 steps and read five whole files, while the ma
 
 **Project instructions:** if the workspace has an `AGENTS.md`, it's added to the system prompt, like CLAUDE.md or GEMINI.md in other harnesses. Put project conventions there, such as "use tabs" or "run `npm test` after changes".
 
-**Context compaction:** Kyklos tracks token use from the API's `usage` field, or estimates it at ~4 characters per token. When the conversation passes 75% of `CONTEXT_WINDOW`, it shrinks everything older than the most recent ~20%:
+**Context window:** Kyklos needs to know how big the model's context window is, so it can compact in time. It's chosen at startup and shown in the banner (e.g. `1M context`):
+1. `CONTEXT_WINDOW`, if you set it (in `.env` or the environment), always wins. Setting it lower than the model's maximum keeps turns faster and cheaper.
+2. Otherwise, on **Ollama cloud**, Kyklos asks `/api/show` for the model's `context_length`. For example, `minimax-m3.1-flash` gives 1M and `kimi-k2.7-code` gives 262k, so switching models adjusts the window automatically. This adds about a second to startup and gives up after 5 s.
+3. Otherwise it uses 128k, shown as `128k context (default)`.
+
+Local Ollama isn't asked: it reports the model's trained maximum, but the server runs with a smaller limit unless you configure it (`OLLAMA_CONTEXT_LENGTH`), and silently cuts off what doesn't fit. Set `CONTEXT_WINDOW` to that value instead.
+
+**Context compaction:** Kyklos tracks token use from the API's `usage` field, or estimates it at ~4 characters per token. When the conversation passes 75% of the context window, it shrinks everything older than the most recent ~20%:
 1. **Clear old tool results.** File contents and command output make up most of the context and can be fetched again. All user and assistant messages stay word for word, and no API call is needed. Usually this is enough.
 2. **Summarize, only if that's not enough.** The same model summarizes the older turns. Kyklos then attaches the current request and a log of earlier requests and answers, both word for word, so facts the user was already told can't be lost in a weak summary.
 

@@ -224,7 +224,10 @@ class AeroTurnTests(unittest.TestCase):
         ui = make_ui(self.ws)
         agent = self.agent(ui, [], plan_mode=True)
         ui.banner(agent)
-        self.assertIn("○ kyklos  ·  fake-model", output(ui))
+        self.assertIn("○ kyklos  ·  fake-model  ·  128k context  ·", output(ui))
+        agent.context_source = "default"
+        ui.banner(agent)
+        self.assertIn("128k context (default)", output(ui))
         bar = "".join(text for _, text in ui.toolbar())
         self.assertIn("fake-model", bar)
         self.assertIn(" PLAN ", bar)

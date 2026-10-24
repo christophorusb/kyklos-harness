@@ -691,6 +691,61 @@ class Agent:
         return f"(Stopped after {MAX_STEPS} steps without a final answer.)"
 
 
+# Context window: CONTEXT_WINDOW wins if set; otherwise ask Ollama cloud's /api/show for the model's
+# context_length; otherwise DEFAULT_CONTEXT_WINDOW. Local Ollama isn't asked: it reports the model's
+# trained maximum, but the server runs with a smaller num_ctx unless configured, and silently truncates.
+MIN_DETECTED_CONTEXT = 2048
+
+
+def ollama_cloud_show_url(base_url: str) -> str | None:
+    """The /api/show URL for an Ollama cloud BASE_URL (https://ollama.com/v1), or None for other providers."""
+    from urllib.parse import urlparse
+    u = urlparse(base_url or "")
+    if (u.hostname or "").lower() not in ("ollama.com", "www.ollama.com"):
+        return None
+    return f"{u.scheme or 'https'}://{u.netloc}/api/show"
+
+
+def detect_context_window(base_url: str, api_key: str, model: str, timeout: float = 5.0, urlopen=None) -> int | None:
+    """The model's context length from Ollama cloud, or None if unavailable (other provider, error, timeout)."""
+    url = ollama_cloud_show_url(base_url)
+    if not url:
+        return None
+    import urllib.request
+    request = urllib.request.Request(
+        url, data=json.dumps({"model": model}).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+    )
+    try:
+        with (urlopen or urllib.request.urlopen)(request, timeout=timeout) as response:
+            info = json.loads(response.read().decode("utf-8")).get("model_info") or {}
+    except Exception:  # offline, unknown model, bad JSON...: fall back quietly
+        return None
+    lengths = [v for k, v in info.items() if k.endswith("context_length") and isinstance(v, int)]
+    return lengths[0] if lengths and lengths[0] >= MIN_DETECTED_CONTEXT else None
+
+
+def choose_context_window(env, detected: int | None) -> tuple[int, str]:
+    """(window, source) where source is "CONTEXT_WINDOW", "detected" or "default"."""
+    if env.get("CONTEXT_WINDOW"):
+        try:
+            return int(str(env["CONTEXT_WINDOW"]).replace("_", "").replace(",", "")), "CONTEXT_WINDOW"
+        except ValueError:
+            raise ValueError(f"CONTEXT_WINDOW must be a number of tokens, like 1000000 (got {env['CONTEXT_WINDOW']!r})")
+    if detected:
+        return detected, "detected"
+    return DEFAULT_CONTEXT_WINDOW, "default"
+
+
+def short_tokens(n: int) -> str:
+    """1000000 -> 1M, 1048576 -> 1M, 262144 -> 262k, 128000 -> 128k."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}".rstrip("0").rstrip(".") + "M"
+    if n >= 1_000:
+        return f"{n // 1_000}k"
+    return str(n)
+
+
 # Per-user data lives in ~/.kyklos (override with KYKLOS_HOME), so `kyklos` can run in any folder:
 #   ~/.kyklos/trusted.json                   folders the user said Kyklos may work in
 #   ~/.kyklos/projects/<folder-slug>/        that folder's saved session and input history
@@ -874,7 +929,9 @@ def plain_repl(agent: "Agent", default_session: Path) -> None:
     """The dependency-free REPL, used when output isn't a terminal or KYKLOS_UI=plain."""
     ctx = CommandContext(agent, lambda kind, text: print(text), default_session)
     agents_md = " (AGENTS.md loaded)" if (agent.tools.workspace / "AGENTS.md").is_file() else ""
-    print(f"Kyklos ready. model={agent.model}  workspace={agent.tools.workspace}{agents_md}")
+    source = getattr(agent, "context_source", "default")
+    print(f"Kyklos ready. model={agent.model}  context={short_tokens(agent.context_window)} ({source})  "
+          f"workspace={agent.tools.workspace}{agents_md}")
     print("Type /help for commands.\n")
     while True:
         try:
@@ -914,7 +971,12 @@ def main() -> None:
 
     workspace = Path(os.environ.get("WORKSPACE") or Path.cwd()).resolve()
     client = OpenAI(base_url=os.environ["BASE_URL"], api_key=os.environ["API_KEY"])
-    window = int(os.environ.get("CONTEXT_WINDOW") or DEFAULT_CONTEXT_WINDOW)
+    detected = None if os.environ.get("CONTEXT_WINDOW") else detect_context_window(
+        os.environ["BASE_URL"], os.environ["API_KEY"], os.environ["MODEL"])
+    try:
+        window, window_source = choose_context_window(os.environ, detected)
+    except ValueError as e:
+        sys.exit(str(e))
     home = kyklos_home()
     default_session = project_dir(home, workspace) / "last.jsonl"
 
@@ -952,6 +1014,7 @@ def main() -> None:
                  "or pass --trust to allow it for one run.")
     agent = Agent(client, os.environ["MODEL"], workspace, context_window=window, plan_mode=plan_mode,
                   **({"permission": ui.permission, "on_event": ui.observer} if ui else {}))
+    agent.context_source = window_source
     resume_note = None
     if resume_path:
         try:

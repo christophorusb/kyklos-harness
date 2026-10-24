@@ -26,7 +26,7 @@ from rich.text import Text
 from rich.theme import Theme
 
 from kyklos import (BROAD_WARNING, EXIT, NO_APPROVER_NOTE, COMMANDS, TRUST_EXPLANATION, CommandContext,
-                    apply_permission_answer, denial_note, permission_options, run_command)
+                    apply_permission_answer, denial_note, permission_options, run_command, short_tokens)
 
 MAX_WIDTH = 100
 BASH_FULL_OUTPUT_LINES = 8  # bash output up to this many lines is shown in full; longer shows the last 3
@@ -654,7 +654,10 @@ class AeroUI:
         else:
             word = gradient_text("kyklos", ["#E8FBFF", self._c("aqua"), self._c("sky"), self._c("deep")], bold=True)
         dot = self.g["dot"]
-        meta = f"  {dot}  {agent.model}  {dot}  {self.workspace.name}"
+        context = f"{short_tokens(agent.context_window)} context"
+        if getattr(agent, "context_source", "") == "default":
+            context += " (default)"  # neither detected nor set: a hint that CONTEXT_WINDOW may be worth setting
+        meta = f"  {dot}  {agent.model}  {dot}  {context}  {dot}  {self.workspace.name}"
         if (self.workspace / "AGENTS.md").is_file():
             meta += f"  {dot}  AGENTS.md loaded"
         self.print(Text(" ") + Text(self.g["run"], style="aqua") + Text(" ") + word + Text(meta, style="frost"))

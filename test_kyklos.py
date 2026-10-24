@@ -866,6 +866,74 @@ class TrustTests(unittest.TestCase):
             self.assertEqual(ask_trust_plain(self.project, False), "no")
 
 
+class ContextWindowTests(unittest.TestCase):
+    """Context window detection from Ollama cloud's /api/show, with a fake urlopen (no network)."""
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def read(self):
+            return json.dumps(self.payload).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(self, payload=None, error=None):
+        self.requests = []
+
+        def urlopen(request, timeout=None):
+            self.requests.append((request, timeout))
+            if error:
+                raise error
+            return self.FakeResponse(payload)
+        return urlopen
+
+    def test_reads_context_length_from_ollama_cloud(self):
+        from kyklos import detect_context_window
+        urlopen = self.fake_urlopen({"model_info": {"general.architecture": "minimax",
+                                                    "minimax.context_length": 1000000}})
+        self.assertEqual(detect_context_window("https://ollama.com/v1", "key-123", "minimax-m3.1-flash",
+                                               urlopen=urlopen), 1000000)
+        request, timeout = self.requests[0]
+        self.assertEqual(request.full_url, "https://ollama.com/api/show")
+        self.assertEqual(json.loads(request.data), {"model": "minimax-m3.1-flash"})
+        self.assertEqual(request.get_header("Authorization"), "Bearer key-123")
+        self.assertLessEqual(timeout, 5)  # startup is never held up for long
+
+    def test_other_providers_and_local_ollama_are_not_asked(self):
+        from kyklos import detect_context_window
+        urlopen = self.fake_urlopen({"model_info": {"x.context_length": 1000000}})
+        for base in ("https://api.deepseek.com", "https://openrouter.ai/api/v1", "http://localhost:11434/v1"):
+            self.assertIsNone(detect_context_window(base, "k", "m", urlopen=urlopen))
+        self.assertEqual(self.requests, [])  # the API key never goes anywhere else
+
+    def test_failures_fall_back_to_none(self):
+        from kyklos import detect_context_window
+        for urlopen in (self.fake_urlopen(error=OSError("offline")),
+                        self.fake_urlopen({"model_info": {}}),                       # no context_length
+                        self.fake_urlopen({"model_info": {"x.context_length": 512}}),  # implausibly small
+                        self.fake_urlopen({"error": "model not found"})):
+            self.assertIsNone(detect_context_window("https://ollama.com/v1", "k", "m", urlopen=urlopen))
+
+    def test_context_window_priority(self):
+        from kyklos import DEFAULT_CONTEXT_WINDOW, choose_context_window
+        self.assertEqual(choose_context_window({"CONTEXT_WINDOW": "256000"}, 1000000), (256000, "CONTEXT_WINDOW"))
+        self.assertEqual(choose_context_window({"CONTEXT_WINDOW": "1_000_000"}, None), (1000000, "CONTEXT_WINDOW"))
+        self.assertEqual(choose_context_window({}, 1000000), (1000000, "detected"))
+        self.assertEqual(choose_context_window({}, None), (DEFAULT_CONTEXT_WINDOW, "default"))
+        with self.assertRaises(ValueError):
+            choose_context_window({"CONTEXT_WINDOW": "a lot"}, None)
+
+    def test_short_tokens(self):
+        from kyklos import short_tokens
+        self.assertEqual([short_tokens(n) for n in (1000000, 1048576, 1500000, 262144, 128000, 900)],
+                         ["1M", "1M", "1.5M", "262k", "128k", "900"])
+
+
 class HelperTests(unittest.TestCase):
     def test_permission_prompt_denies_when_no_input(self):
         import builtins
