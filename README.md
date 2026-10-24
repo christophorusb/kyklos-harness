@@ -2,7 +2,7 @@
 
 *κύκλος: "circle, cycle." At its core, a harness is one loop: ask the model, run its tools, feed back the results, repeat.*
 
-A minimal coding-agent harness (~300 lines) that works with any OpenAI-compatible API: Ollama cloud, DeepSeek, OpenRouter, OpenAI, Gemini, local Ollama, LM Studio.
+A minimal coding-agent harness (~760 lines of Python, plus ~475 lines of tests) that works with any OpenAI-compatible API: Ollama cloud, DeepSeek, OpenRouter, OpenAI, Gemini, local Ollama, LM Studio.
 
 ## Setup
 
