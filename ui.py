@@ -684,8 +684,9 @@ class AeroUI:
             row([(frost, "filter: "), ("", state.filter), (aqua, "█")])
         matches = state.matches()
         if not matches:
-            row([(frost, "no match")])
-        cols = [max((len(str(state.rows[i][c])) for i in matches), default=0) for c in range(len(state.rows[0]))]
+            row([(frost, "no match" if state.rows else "nothing to pick")])
+        columns = len(state.rows[0]) if state.rows else 0
+        cols = [max((len(str(state.rows[i][c])) for i in matches), default=0) for c in range(columns)]
         start = max(0, min(matches.index(state.cursor) - max_rows // 2 if state.cursor in matches else 0,
                            len(matches) - max_rows))
         for i in matches[start:start + max_rows]:
@@ -709,6 +710,8 @@ class AeroUI:
         from prompt_toolkit.key_binding import KeyBindings
         from prompt_toolkit.layout import FormattedTextControl, Layout, Window
 
+        if not rows:  # nothing to choose from: don't open an empty box
+            return None
         state = PickerState(rows, cursor, marked, filterable)
         self._pause_live()
         bindings = KeyBindings()

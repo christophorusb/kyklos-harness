@@ -236,19 +236,32 @@ INLINE_CODE_FLAGS = {"-c", "-e", "-p", "-r", "--eval", "--print", "-command", "-
 TOKEN_RE = re.compile(r'"[^"]*"|\'[^\']*\'|\S+')  # words, keeping quoted paths whole
 
 
+def _looks_like_script(token: str) -> bool:
+    """A script path has an extension or a folder in it ('build.py', 'scripts/dev', '.\\x.ps1'), unlike
+    the value of an option such as `-W error` or `-ExecutionPolicy Bypass`."""
+    path = token.strip("\"'")
+    return bool(Path(path).suffix) or "/" in path or "\\" in path
+
+
+def _has_inline_code(tokens: list[str]) -> bool:
+    return any(t.lower() in INLINE_CODE_FLAGS for t in tokens[1:])
+
+
 def _interpreter_prefix(tokens: list[str]) -> str:
     """'py -3 "C:/x/wf.py" check' -> 'py -3 "C:/x/wf.py"', 'py -m unittest x' -> 'py -m unittest'.
-    Inline code (-c, -e, -Command …) or no script at all gets no prefix."""
+    No prefix for inline code (-c, -e, -Command … anywhere), no script, or a "script" that is really an
+    option's value (`python -W error …` must not become the rule 'python -W error')."""
+    if _has_inline_code(tokens):
+        return ""
     is_python = Path(tokens[0]).stem.lower() in PYTHON_STEMS
     i = 1
     while i < len(tokens) and tokens[i].startswith("-"):
-        flag = tokens[i].lower()
-        if flag in INLINE_CODE_FLAGS:
-            return ""
-        if flag == "-m" and is_python:
+        if tokens[i].lower() == "-m" and is_python:
             return " ".join(tokens[:i + 2]) if i + 1 < len(tokens) else ""
         i += 1  # options like -3, -3.11, -u, -NoProfile, --no-warnings
-    return " ".join(tokens[:i + 1]) if i < len(tokens) else ""
+    if i < len(tokens) and _looks_like_script(tokens[i]):
+        return " ".join(tokens[:i + 1])
+    return ""
 
 
 def suggest_prefix(command: str) -> str:
@@ -275,6 +288,10 @@ def command_matches_prefixes(command: str, prefixes: set[str]) -> bool:
     parts = [p.strip() for p in re.split(r"&&|\|\||[;\n]+", command) if p.strip()]
     if not parts:
         return False
+    for sub in parts:  # a rule never approves an interpreter running inline code, whatever it matches
+        tokens = TOKEN_RE.findall(sub)
+        if tokens and Path(tokens[0]).stem.lower() in INTERPRETERS and _has_inline_code(tokens):
+            return False
     clean = {p.strip() for p in prefixes if p.strip()}
     return all(any(sub == p or sub.startswith(p + " ") for p in clean) for sub in parts)
 
@@ -637,14 +654,21 @@ class Agent:
 
     def repair_after_interrupt(self) -> None:
         """After Ctrl+C, give any tool call that never got a result a placeholder one.
-        Providers reject a conversation where a tool call has no matching result."""
+        Providers reject a conversation where a tool call has no matching result. Placeholders go after
+        the turn's real results, so results keep the order the calls were made in."""
         answered = {m["tool_call_id"] for m in self.messages if m["role"] == "tool"}
-        repaired = []
-        for m in self.messages:
+        messages, repaired, i = self.messages, [], 0
+        while i < len(messages):
+            m = messages[i]
             repaired.append(m)
-            for tc in m.get("tool_calls", []):
-                if tc["id"] not in answered:
-                    repaired.append({"role": "tool", "tool_call_id": tc["id"], "content": "Interrupted by the user."})
+            i += 1
+            calls = m.get("tool_calls", [])
+            if calls:
+                while i < len(messages) and messages[i]["role"] == "tool":  # this turn's real results
+                    repaired.append(messages[i])
+                    i += 1
+                repaired += [{"role": "tool", "tool_call_id": tc["id"], "content": "Interrupted by the user."}
+                             for tc in calls if tc["id"] not in answered]
         self.messages = repaired
 
     def run_subagent(self, description: str, prompt: str, mode: str = "explore") -> str:
@@ -785,6 +809,8 @@ def short_tokens(n: int) -> str:
 # [False, "low", "high", "max"]). Levels are labels the user picks; effort_request_value() maps them to
 # the OpenAI-compatible `reasoning_effort` field. "default" sends nothing, so the model decides.
 GENERIC_EFFORTS = ["low", "medium", "high", "max"]  # offered when a model thinks but doesn't list levels
+# Other providers follow OpenAI's reasoning_effort, which has no "max" (it would be rejected with a 400).
+STANDARD_EFFORTS = ["low", "medium", "high"]
 MODEL_CACHE_TTL = 24 * 3600
 
 
@@ -869,8 +895,8 @@ def fetch_model_catalog(base_url: str, api_key: str, client=None, urlopen=None) 
             models = list(pool.map(describe, names))
         return sorted((m for m in models if m["tools"]), key=lambda m: m["name"])
     if client is not None:
-        return sorted(({"name": m.id, "context": None, "tools": True, "efforts": None, "default": None}
-                       for m in client.models.list()), key=lambda m: m["name"])
+        return sorted(({"name": m.id, "context": None, "tools": True, "efforts": list(STANDARD_EFFORTS),
+                        "default": None} for m in client.models.list()), key=lambda m: m["name"])
     return []
 
 
@@ -1060,7 +1086,7 @@ def _cmd_undo(ctx, arg):
     ctx.say("ok", f"Undid the last turn ({'reverted files: ' + ', '.join(reverted) if reverted else 'no files were changed'}).")
 
 
-@command("save", "/save [file]", "Save the session (default .sessions/last.jsonl)")
+@command("save", "/save [file]", "Save the session (default ~/.kyklos/projects/<this folder>/last.jsonl)")
 def _cmd_save(ctx, arg):
     target = Path(arg) if arg else ctx.default_session
     ctx.agent.save_session(target)

@@ -4,6 +4,24 @@ All notable changes to **Kyklos** since the repository was initialized on 2026-1
 
 ---
 
+## Unreleased — Fixes from an External Audit (2026-10-24)
+
+An audit by Gemini 3.8 Flash (`AUDIT_REPORT.md`) listed eight findings. Each was checked against the code and reproduced first: ACT-01 to ACT-07 are fixed here. ACT-08 was declined: it assumed each project has its own `.env`, but Kyklos only reads the `.env` in its install folder, and remembering the picked model globally was a deliberate choice.
+
+- **ACT-01, prefix rules that approved any script (`kyklos.py`):** an option's value was taken for the script, so `python -W error …` suggested the rule `python -W error` (and `powershell -ExecutionPolicy Bypass`, `node --require ./hook.js` likewise). That rule auto-approved `python -W error -c "…"` and `python -W error evil.py`. This was worse than reported, and the report's fix (rejecting only commands with `-c`) would still have allowed `evil.py`. Now:
+  - `_interpreter_prefix` only suggests a rule when the script looks like one (`_looks_like_script`: an extension or a folder in the path), or for Python's `-m module`, and never when inline-code options appear anywhere (`_has_inline_code`).
+  - `command_matches_prefixes` never auto-approves an interpreter command containing inline-code options, whatever rule it matches.
+- **ACT-02, key-input tests hanging in sandboxes (`test_ui.py`):** the picker tests that send real keystrokes start an asyncio event loop, which on Windows needs a socketpair over 127.0.0.1 and can hang where loopback is blocked. `event_loop_can_start()` probes this once, in a thread with a 3 s timeout, and skips those tests if it fails; `KYKLOS_SKIP_KEY_TESTS=1` skips them outright.
+- **ACT-03, writing to a folder (`tools.py`):** `write_file` / `edit_file` on a folder now fail before any permission prompt, with "it's a folder, not a file". Previously the prompt came first, then a `PermissionError`.
+- **ACT-04, `max` effort on other providers (`kyklos.py`):** non-Ollama catalog entries now offer OpenAI's `low · medium · high` (`STANDARD_EFFORTS`); `max` is Ollama-only and would be rejected with a 400.
+- **ACT-05, empty picker (`ui.py`):** `picker_lines` no longer raises `IndexError` with no rows, and `pick` returns at once without opening a box.
+- **ACT-06, `/save` help (`kyklos.py`):** now names the real default, `~/.kyklos/projects/<this folder>/last.jsonl`.
+- **ACT-07, result order after Ctrl+C (`kyklos.py`):** `repair_after_interrupt` adds placeholders after the turn's real results, so results stay in call order.
+- **Docs:** the README's Safety section describes the script-shape rule and inline-code refusal.
+- **Tests:** regression tests for ACT-01, 03, 04, 05, 06 and 07 (121 total offline tests; the report's counts of 67 + 30 didn't match the code).
+
+---
+
 ## `edc83ba` — Model Picker & Per-Model Thinking Effort (2026-10-24)
 
 - **Model catalog (`kyklos.py`):**

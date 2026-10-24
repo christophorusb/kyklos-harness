@@ -30,6 +30,41 @@ def output(ui) -> str:
     return ui.console.export_text()
 
 
+_EVENT_LOOP_OK = None
+
+
+def event_loop_can_start(timeout: float = 3.0) -> bool:
+    """The real-keystroke picker tests run prompt_toolkit's Application, which needs an asyncio event
+    loop. On Windows that loop creates a socketpair over 127.0.0.1, which can hang forever in
+    network-restricted sandboxes. Probe it once, in a thread with a timeout, and skip if it can't.
+    KYKLOS_SKIP_KEY_TESTS=1 skips them outright."""
+    global _EVENT_LOOP_OK
+    if _EVENT_LOOP_OK is None:
+        import os
+        import socket
+        import threading
+        if os.environ.get("KYKLOS_SKIP_KEY_TESTS") == "1":
+            _EVENT_LOOP_OK = False
+        elif os.name != "nt":
+            _EVENT_LOOP_OK = True  # POSIX socketpairs don't use the network
+        else:
+            works = []
+
+            def probe():
+                try:
+                    a, b = socket.socketpair()
+                    a.close()
+                    b.close()
+                    works.append(True)
+                except OSError:
+                    pass
+            thread = threading.Thread(target=probe, daemon=True)
+            thread.start()
+            thread.join(timeout)
+            _EVENT_LOOP_OK = bool(works)
+    return _EVENT_LOOP_OK
+
+
 class DiffTests(unittest.TestCase):
     OLD = "def f():\n    log('x')\n    k = int(w * 0.2)\n    return k\n"
     NEW = "def f():\n    k = int(w * KEEP)\n    m = None\n    return k\n"
@@ -326,6 +361,8 @@ class PickerTests(unittest.TestCase):
     def run_picker(self, keys, **kw):
         from prompt_toolkit.input import create_pipe_input
         from prompt_toolkit.output import DummyOutput
+        if not event_loop_can_start():
+            self.skipTest("this environment can't start an asyncio event loop (blocked loopback socket)")
         ui = make_ui(self.ws)
         with create_pipe_input() as pipe:
             pipe.send_text(keys)
@@ -356,6 +393,14 @@ class PickerTests(unittest.TestCase):
         self.assertIn("enter pick", text)
         self.assertTrue(all(len(line) == 70 for line in text.splitlines()))  # a closed box at the given width
 
+    def test_empty_list_does_not_crash(self):
+        """AUDIT ACT-05: picker_lines raised IndexError with no rows."""
+        from ui import PickerState
+        ui = make_ui(self.ws)
+        text = "".join(t for _, t in ui.picker_lines(PickerState([]), "Pick", width=60))
+        self.assertIn("nothing to pick", text)
+        self.assertIsNone(ui.pick("Pick", []))  # no box opens at all
+
     def test_banner_and_status_bar_show_the_effort(self):
         ui = make_ui(self.ws)
         agent = Agent(FakeClient([]), "kimi-k3", self.ws, on_event=None, effort="high")
@@ -381,6 +426,8 @@ class CommandRegistryTests(unittest.TestCase):
         run_command(self.ctx, "/help")
         for name in ("help", "plan", "undo", "save", "resume", "compact", "reset", "exit"):
             self.assertIn(f"/{name}", self.said[-1][1])
+        self.assertIn("~/.kyklos/projects/", self.said[-1][1])  # AUDIT ACT-06: /save's real default
+        self.assertNotIn(".sessions/last.jsonl", self.said[-1][1])
 
     def test_plan_toggles_and_plan_with_request_returns_it(self):
         self.assertIsNone(run_command(self.ctx, "/plan"))

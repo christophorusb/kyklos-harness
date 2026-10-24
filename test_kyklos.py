@@ -277,6 +277,18 @@ class GitDirTests(unittest.TestCase):
         self.assertFalse((self.ws / ".git" / "COMMIT_EDITMSG_forma.tmp").exists())
         self.assertEqual((self.ws / ".git" / "config").read_text(), "[core]\n")
 
+    def test_folders_are_refused_before_asking_permission(self):
+        """AUDIT ACT-03: write_file on a folder asked for permission, then failed with a PermissionError."""
+        (self.ws / "src").mkdir()
+        client = FakeClient([
+            reply(tool_calls=[tool_call("1", "write_file", path="src", content="x"),
+                              tool_call("2", "edit_file", path="src", old_string="a", new_string="b")]),
+            reply(content="OK."),
+        ])
+        Agent(client, "fake", self.ws, permission=lambda *a: self.fail("should fail before prompting")).send("go")
+        results = [m["content"] for m in client.calls[-1] if m["role"] == "tool"]
+        self.assertTrue(all("it's a folder, not a file" in r for r in results), results)
+
     def test_similar_names_are_still_writable(self):
         for path in (".gitignore", ".github/workflows/ci.yml", "docs/.git-notes.md", "my.git/x"):
             self.tools.write_file(path, "ok")
@@ -531,6 +543,8 @@ class SubagentTests(unittest.TestCase):
         agent.repair_after_interrupt()
         results = {m["tool_call_id"]: m["content"] for m in agent.messages if m["role"] == "tool"}
         self.assertEqual(results, {"a": "ok", "b": "Interrupted by the user."})
+        # AUDIT ACT-07: results keep the order the calls were made in (the placeholder used to come first).
+        self.assertEqual([m["tool_call_id"] for m in agent.messages if m["role"] == "tool"], ["a", "b"])
 
 
 class EditAndPermissionTests(unittest.TestCase):
@@ -635,6 +649,22 @@ class EditAndPermissionTests(unittest.TestCase):
         self.assertTrue(command_matches_prefixes('py -3 "C:/Users/me/.wf/wf.py" check --all', rule))
         self.assertFalse(command_matches_prefixes("py -3 evil.py", rule))
         self.assertFalse(command_matches_prefixes('py -c "print(1)"', rule))
+
+    def test_option_values_are_not_mistaken_for_scripts(self):
+        """AUDIT ACT-01: `python -W error …` suggested the rule 'python -W error', which approved any script."""
+        from kyklos import command_matches_prefixes, suggest_prefix
+        for command in ('python -W error -c "import os"', "python -W error build.py",
+                        'powershell -ExecutionPolicy Bypass -Command "Remove-Item x"',
+                        "node --require ./hook.js -e 'x'", "py -X dev tool"):
+            self.assertEqual(suggest_prefix(command), "", command)
+        self.assertEqual(suggest_prefix("python -u tools/build.py"), "python -u tools/build.py")
+        self.assertEqual(suggest_prefix("powershell -NoProfile -File .\\x.ps1"), "powershell -NoProfile -File .\\x.ps1")
+        # Even a rule that matches never approves an interpreter running inline code.
+        for rule, command in (("python -W error", 'python -W error -c "import os"'),
+                              ("node --require ./hook.js", "node --require ./hook.js -e 'x'"),
+                              ("py", 'py -c "print(1)"')):
+            self.assertFalse(command_matches_prefixes(command, {rule}), command)
+        self.assertTrue(command_matches_prefixes("git status -s", {"git status"}))
 
     def test_ask_permission_prefix_option_saves_rule(self):
         import builtins
@@ -1079,7 +1109,11 @@ class ModelCatalogTests(unittest.TestCase):
         from kyklos import fetch_model_catalog
         client = SimpleNamespace(models=SimpleNamespace(list=lambda: [SimpleNamespace(id="gpt-x"), SimpleNamespace(id="a")]))
         models = fetch_model_catalog("https://api.example.com/v1", "k", client=client, urlopen=lambda *a, **k: self.fail())
-        self.assertEqual([(m["name"], m["efforts"]) for m in models], [("a", None), ("gpt-x", None)])
+        # AUDIT ACT-04: OpenAI-style providers get OpenAI's levels; "max" is Ollama-only and would be a 400.
+        self.assertEqual([(m["name"], m["efforts"]) for m in models],
+                         [("a", ["low", "medium", "high"]), ("gpt-x", ["low", "medium", "high"])])
+        from kyklos import effort_options
+        self.assertEqual(effort_options(models[0]), ["default", "low", "medium", "high"])
 
     def test_model_priority(self):
         from kyklos import choose_model

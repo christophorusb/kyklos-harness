@@ -217,6 +217,8 @@ class Tools:
         """Like _resolve, but also refuses anything inside a .git directory (any level, any case):
         it's git's own database, and a direct write there can corrupt the repository."""
         p = self._resolve(path)
+        if p.is_dir():
+            raise ToolError(f"Cannot {verb} {path}: it's a folder, not a file. Give a file path inside it.")
         if any(part.lower() == ".git" for part in p.relative_to(self.workspace).parts):
             raise ToolError(f"Refusing to {verb} {path}: files inside .git/ are git's own database, and changing "
                             "them directly can corrupt the repository. Use git commands with bash instead; for a "
