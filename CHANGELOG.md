@@ -4,7 +4,7 @@ All notable changes to **Kyklos** since the repository was initialized on 2026-1
 
 ---
 
-## Unreleased — Full-Width Layout & Kyklos Boxes (2026-10-24)
+## `0d14e50` — Full-Width Layout & Kyklos Boxes (2026-10-24)
 
 - **Full terminal width (`ui.py`):** removed the 100-column cap (`MAX_WIDTH`). Tool-line summaries, panels and answers now reach the right edge of the terminal, and the width is re-read on every line, so the layout follows window resizes.
 - **Kyklos boxes (`ui.py`):**
