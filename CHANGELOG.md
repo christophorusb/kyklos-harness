@@ -4,7 +4,7 @@ All notable changes to **Kyklos** since the repository was initialized on 2026-1
 
 ---
 
-## Unreleased — Kyklos Aero UI (Phase 1), Design System & Brace Globs (2026-10-24)
+## `3123b47` — Kyklos Aero UI (Phase 1), Design System & Brace Globs (2026-10-24)
 
 - **Kyklos Aero inline UI (`ui.py`, new):**
   - Inline terminal UI built on Rich + prompt_toolkit, following `DESIGN.md`: Frutiger Aero truecolor tokens (`sky`, `aqua`, `deep`, `mint`, `glint`, `sun`, `coral`, `orchid`, `frost`) with a 16-color `KYKLOS_THEME=plain` variant, and circle-motif glyphs (`○` running → `●` done, `✗`, `⊘`, `◌`, `↻`) with an ASCII fallback (`KYKLOS_ASCII=1`, or automatic on non-UTF-8 output).
@@ -27,7 +27,7 @@ All notable changes to **Kyklos** since the repository was initialized on 2026-1
 - **Tests (`test_kyklos.py`, `test_ui.py`):**
   - Added `test_ui.py` (20 tests): diff pairing and spans, tool summaries, full turns through a recording console, the permission panel (approve, deny with reason, editable prefix, no keyboard), subagent collapse, API errors, ASCII/plain modes, banner and status bar, the command registry, and UI selection.
   - Updated the event-order tests for `model_start` / `model_end`, and added tests for `model_end` on failure and for brace patterns (70 total offline tests).
-- **Docs (`README.md`):** new "The interface: Kyklos Aero" section with settings, a commands table, an updated file map, and updated line counts.
+- **Docs (`README.md`):** new "The interface: Kyklos Aero" section with settings, a commands table, an updated file map, and updated line counts (corrected in the follow-up commit to ~2,100 lines of Python plus ~1,060 lines of tests; the first count skipped blank lines).
 
 ---
 
