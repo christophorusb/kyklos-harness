@@ -4,7 +4,7 @@ All notable changes to **Kyklos** since the repository was initialized on 2026-1
 
 ---
 
-## Unreleased — Model Picker & Per-Model Thinking Effort (2026-10-24)
+## `edc83ba` — Model Picker & Per-Model Thinking Effort (2026-10-24)
 
 - **Model catalog (`kyklos.py`):**
   - `fetch_model_catalog` lists Ollama cloud's models (`/api/tags`) and describes each one in parallel (`/api/show`): context length, tool support and thinking levels (`parse_model_info`). Models without tool support (e.g. `clef:27b`) are left out. Other providers list `/v1/models` ids.
