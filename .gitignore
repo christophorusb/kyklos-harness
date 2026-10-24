@@ -19,3 +19,6 @@ __pycache__/
 
 # The agent's scratch workspace
 sandbox/
+
+# Local log of audit findings (like CHANGELOG.md, but for audits); kept out of git
+/AUDIT_REPORT.md
