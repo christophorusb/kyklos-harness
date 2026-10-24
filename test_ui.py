@@ -297,6 +297,74 @@ class TrustPanelTests(unittest.TestCase):
         self.assertEqual(make_ui(self.ws).ask_trust(self.ws, broad=False), "no")
 
 
+class PickerTests(unittest.TestCase):
+    ROWS = [("minimax-m3.1-flash", "1M"), ("kimi-k3", "1M"), ("kimi-k2.7-code", "262k"), ("glm-5.3", "1M")]
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_state_filters_moves_and_wraps(self):
+        from ui import PickerState
+        s = PickerState(self.ROWS, cursor=0, filterable=True)
+        s.move(-1)
+        self.assertEqual(s.cursor, 3)  # wraps around
+        s.type("kim")
+        self.assertEqual(s.matches(), [1, 2])
+        self.assertEqual(s.cursor, 1)  # snapped to the first match
+        s.move(1)
+        self.assertEqual(s.selected(), 2)
+        s.type("zzz")
+        self.assertIsNone(s.selected())  # nothing matches: Enter picks nothing
+        for _ in range(3):
+            s.backspace()
+        self.assertEqual(s.selected(), 2)
+
+    def run_picker(self, keys, **kw):
+        from prompt_toolkit.input import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        ui = make_ui(self.ws)
+        with create_pipe_input() as pipe:
+            pipe.send_text(keys)
+            return ui.pick("Pick a model", self.ROWS, pt_input=pipe, pt_output=DummyOutput(), **kw), ui
+
+    def test_arrow_keys_and_enter(self):
+        choice, ui = self.run_picker("\x1b[B\x1b[B\r", cursor=0)  # down, down, enter
+        self.assertEqual(choice, 2)
+        self.assertIn("→ Pick a model: kimi-k2.7-code", output(ui))
+
+    def test_typing_filters(self):
+        self.assertEqual(self.run_picker("glm\r", filterable=True)[0], 3)
+
+    def test_escape_cancels(self):
+        choice, ui = self.run_picker("\x1b", cursor=1)
+        self.assertIsNone(choice)
+        self.assertNotIn("→ Pick a model", output(ui))
+
+    def test_drawing(self):
+        from ui import PickerState
+        ui = make_ui(self.ws)
+        state = PickerState(self.ROWS, cursor=1, marked=0, filterable=True)
+        text = "".join(t for _, t in ui.picker_lines(state, "Pick a model", width=70))
+        self.assertIn("╭─ Pick a model", text)
+        self.assertIn("filter: █", text)
+        self.assertIn("● minimax-m3.1-flash", text)  # the current model
+        self.assertIn("❯   kimi-k3", text)          # the cursor
+        self.assertIn("enter pick", text)
+        self.assertTrue(all(len(line) == 70 for line in text.splitlines()))  # a closed box at the given width
+
+    def test_banner_and_status_bar_show_the_effort(self):
+        ui = make_ui(self.ws)
+        agent = Agent(FakeClient([]), "kimi-k3", self.ws, on_event=None, effort="high")
+        ui.agent = agent
+        ui.banner(agent)
+        self.assertIn("kimi-k3 (high effort)", output(ui))
+        self.assertIn("kimi-k3 high", "".join(t for _, t in ui.toolbar()))
+
+
 class CommandRegistryTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

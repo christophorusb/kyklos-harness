@@ -239,6 +239,42 @@ def summarize_result(name: str, args: dict, result: str) -> tuple:
     return status, "", [], ""
 
 
+# ---- picker state --------------------------------------------------------------------------
+
+class PickerState:
+    """What the picker shows and where the cursor is; kept apart from drawing so it can be tested."""
+
+    def __init__(self, rows: list, cursor: int = 0, marked: int = None, filterable: bool = False):
+        self.rows, self.cursor, self.marked, self.filterable = rows, cursor, marked, filterable
+        self.filter = ""
+
+    def matches(self) -> list[int]:
+        needle = self.filter.lower()
+        return [i for i, row in enumerate(self.rows) if needle in " ".join(map(str, row)).lower()]
+
+    def move(self, delta: int) -> None:
+        matches = self.matches()
+        if matches:
+            pos = matches.index(self.cursor) if self.cursor in matches else 0
+            self.cursor = matches[(pos + delta) % len(matches)]
+
+    def type(self, text: str) -> None:
+        self.filter += text
+        self._snap()
+
+    def backspace(self) -> None:
+        self.filter = self.filter[:-1]
+        self._snap()
+
+    def _snap(self) -> None:
+        matches = self.matches()
+        if matches and self.cursor not in matches:
+            self.cursor = matches[0]
+
+    def selected(self):
+        return self.cursor if self.cursor in self.matches() else None
+
+
 # ---- keyboard ------------------------------------------------------------------------------
 
 def read_key_default():
@@ -629,6 +665,95 @@ class AeroUI:
                    indent=indent + 2)
         return False, denial_note(name, reason)
 
+    # -- picker (DESIGN.md §4, Picker): /model and /effort --
+
+    def picker_lines(self, state: "PickerState", title: str, width: int, max_rows: int = 12) -> list:
+        """The picker as prompt_toolkit (style, text) fragments: a rounded box with an optional filter
+        line, the visible rows (❯ cursor, ● the current choice) and the key hints in the bottom border."""
+        sky, frost, aqua = (f"fg:{self._pt_color(t)}" for t in ("sky", "frost", "aqua"))
+        h, v = ("-", "|") if self.ascii else ("─", "│")
+        tl, tr, bl, br = ("+", "+", "+", "+") if self.ascii else ("╭", "╮", "╰", "╯")
+        inner = max(width - 4, 20)
+        out = [(sky, f"{tl}{h} "), ("bold", title), (sky, f" {h * max(inner - len(title) - 1, 1)}{tr}\n")]
+
+        def row(fragments):
+            used = sum(len(t) for _, t in fragments)
+            out.extend([(sky, f"{v} ")] + fragments + [("", " " * max(inner - used, 0)), (sky, f" {v}\n")])
+
+        if state.filterable:
+            row([(frost, "filter: "), ("", state.filter), (aqua, "█")])
+        matches = state.matches()
+        if not matches:
+            row([(frost, "no match")])
+        cols = [max((len(str(state.rows[i][c])) for i in matches), default=0) for c in range(len(state.rows[0]))]
+        start = max(0, min(matches.index(state.cursor) - max_rows // 2 if state.cursor in matches else 0,
+                           len(matches) - max_rows))
+        for i in matches[start:start + max_rows]:
+            first, *rest = [f"{str(cell):<{cols[c]}}" for c, cell in enumerate(state.rows[i])]
+            pointer = (f"{sky} bold", f"{self.g['prompt']} ") if i == state.cursor else ("", "  ")
+            mark = (aqua, f"{self.g['done']} ") if i == state.marked else ("", "  ")
+            text = ("  ".join([first] + rest)).rstrip()[:inner - 4]
+            row([pointer, mark, ("bold" if i == state.cursor else "", text[:len(first)]),
+                 (frost, text[len(first):])])
+        hint = f" ↑↓ move {self.g['dot']} enter pick {self.g['dot']} esc cancel "
+        if len(matches) > max_rows:
+            hint = f" {len(matches)} {'matches' if state.filter else 'models'}  {self.g['dot']}{hint}"
+        out += [(sky, f"{bl}{h * max(inner + 2 - len(hint) - 2, 1)}"), (frost, hint), (sky, f"{h}{h}{br}")]
+        return out
+
+    def pick(self, title: str, rows: list, cursor: int = 0, marked: int = None, filterable: bool = False,
+             pt_input=None, pt_output=None):
+        """An inline arrow-key picker (↑/↓, type to filter, Enter, Esc). Returns the chosen index or None."""
+        from prompt_toolkit.application import Application
+        from prompt_toolkit.formatted_text import FormattedText
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.layout import FormattedTextControl, Layout, Window
+
+        state = PickerState(rows, cursor, marked, filterable)
+        self._pause_live()
+        bindings = KeyBindings()
+
+        @bindings.add("up")
+        @bindings.add("c-p")
+        def _(event):
+            state.move(-1)
+
+        @bindings.add("down")
+        @bindings.add("c-n")
+        def _(event):
+            state.move(1)
+
+        @bindings.add("enter")
+        def _(event):
+            event.app.exit(result=state.selected())
+
+        @bindings.add("escape", eager=True)
+        @bindings.add("c-c")
+        def _(event):
+            event.app.exit(result=None)
+
+        @bindings.add("backspace")
+        def _(event):
+            state.backspace()
+
+        @bindings.add("<any>")
+        def _(event):
+            if state.filterable and event.data and event.data.isprintable():
+                state.type(event.data)
+
+        width = shutil.get_terminal_size((100, 30)).columns - 2
+        control = FormattedTextControl(lambda: FormattedText(self.picker_lines(state, title, width)))
+        app = Application(layout=Layout(Window(control, wrap_lines=False)), key_bindings=bindings,
+                          full_screen=False, erase_when_done=True, input=pt_input, output=pt_output)
+        try:
+            choice = app.run()
+        except (EOFError, KeyboardInterrupt):
+            choice = None
+        if choice is not None:  # leave a one-line record of the choice in the scrollback
+            self.print(Text(f"{self.g['arrow']} {title}: ", style="frost") + Text(str(rows[choice][0]), style="sky"),
+                       indent=2)
+        return choice
+
     # -- folder trust (shown once per folder, before anything is read from it) --
 
     def ask_trust(self, folder: Path, broad: bool) -> str:
@@ -683,7 +808,9 @@ class AeroUI:
         context = f"{short_tokens(agent.context_window)} context"
         if getattr(agent, "context_source", "") == "default":
             context += " (default)"  # neither detected nor set: a hint that CONTEXT_WINDOW may be worth setting
-        meta = f"  {dot}  {agent.model}  {dot}  {context}  {dot}  {self.workspace.name}"
+        effort = getattr(agent, "effort", "default")
+        model = agent.model + (f" ({effort} effort)" if effort != "default" else "")
+        meta = f"  {dot}  {model}  {dot}  {context}  {dot}  {self.workspace.name}"
         if (self.workspace / "AGENTS.md").is_file():
             meta += f"  {dot}  AGENTS.md loaded"
         self.print(Text(" ") + Text(self.g["run"], style="aqua") + Text(" ") + word + Text(meta, style="frost"))
@@ -743,6 +870,8 @@ class AeroUI:
         frost = f"fg:{self._pt_color('frost')}"
         dot = ("", f" {self.g['dot']} ")
         parts.append((f"fg:{self._pt_color('sky')}", agent.model if agent else ""))
+        if agent and getattr(agent, "effort", "default") != "default":
+            parts.append((f"fg:{self._pt_color('aqua')}", f" {agent.effort}"))
         if agent:
             pct = agent.context_tokens() / agent.context_window
             filled = min(5, max(1 if pct > 0 else 0, round(pct * 5)))
@@ -815,7 +944,7 @@ class AeroUI:
         self.answer(answer, footer=self.footer_text(agent, time.monotonic() - start))
         agent.save_session(default_session)
 
-    def run(self, agent, default_session: Path, one_shot: str = None, notice: tuple = None) -> None:
+    def run(self, agent, default_session: Path, one_shot: str = None, notice: tuple = None, **ctx_extras) -> None:
         self.agent = agent
         self.banner(agent)
         if notice:
@@ -823,7 +952,7 @@ class AeroUI:
         if one_shot:
             self.turn(agent, one_shot, default_session)
             return
-        ctx = CommandContext(agent, self.say, default_session)
+        ctx = CommandContext(agent, self.say, default_session, pick=self.pick, **ctx_extras)
         session = self._session(default_session.parent / "history")
         last_interrupt = 0.0
         while True:

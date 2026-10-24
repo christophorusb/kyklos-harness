@@ -4,6 +4,24 @@ All notable changes to **Kyklos** since the repository was initialized on 2026-1
 
 ---
 
+## Unreleased — Model Picker & Per-Model Thinking Effort (2026-10-24)
+
+- **Model catalog (`kyklos.py`):**
+  - `fetch_model_catalog` lists Ollama cloud's models (`/api/tags`) and describes each one in parallel (`/api/show`): context length, tool support and thinking levels (`parse_model_info`). Models without tool support (e.g. `clef:27b`) are left out. Other providers list `/v1/models` ids.
+  - `load_model_catalog` caches the list for a day in `~/.kyklos/models.json` (per `BASE_URL`); `/model --refresh` reloads it. Startup now reads the model's context window from this cache when it can (`cached_model_info`), skipping the `/api/show` request.
+  - Live: 22 tool-capable models fetched in 4.6 s; cached loads are instant.
+- **Thinking effort (`kyklos.py`):**
+  - Effort labels per model (`effort_label`, `effort_options`): a model's own levels from `thinking.values` (`False` → `off`, `True` → `on`), the generic `low · medium · high · max` for models that think without listing levels, and none for models that can't think. `default` is always first.
+  - `effort_request_value` maps labels to `reasoning_effort`: `default` sends nothing, `off` → `"none"`, `on` → `"high"`, others as is. `Agent` takes `effort=` and sends it on every request (summaries too); subagents inherit it. Verified live: kimi-k3 `low` and `off`, minimax-m3.1-flash `high` (generic) and gemma4 `on` all succeed.
+  - Added `Agent.set_model` to switch model, effort and context window mid-conversation.
+- **Commands (`kyklos.py`):** `/model [name]` (a picker, then an effort picker; by name it uses that model's saved effort and suggests close names for typos) and `/effort [level]` (validated against the model's own levels). `CommandContext` gained `pick`, `home`, `load_models` and `context_override`. The plain REPL gets a numbered picker (`pick_plain`).
+- **Settings (`kyklos.py`):** `~/.kyklos/settings.json` stores the last picked model and each model's effort (`load_settings` / `save_settings`). Model priority: `--model` (one run, not saved) > the last picked model > `MODEL` in `.env` (`choose_model`). `MODEL` is only required when nothing else picks a model.
+- **Aero picker (`ui.py`):** `AeroUI.pick`, an inline prompt_toolkit picker in a rounded sky box: ↑/↓ (and Ctrl+P / Ctrl+N), type to filter, Enter, Esc; `❯` cursor, `●` current choice, 12 visible rows with scrolling, key hints in the bottom border, erased afterwards with a one-line record. `PickerState` keeps the logic testable. The banner shows `kimi-k3 (high effort)` and the status bar `kimi-k3 high`.
+- **Docs (`README.md`, `DESIGN.md`):** a models-and-effort section, the new commands and flag, the new `~/.kyklos` files, and a Picker component in the design system.
+- **Tests:** `ModelCatalogTests` (6), `ModelCommandTests` (8) and `PickerTests` (6, including real prompt_toolkit key input through a pipe) (118 total offline tests).
+
+---
+
 ## `0309fd2` — Narrow Interpreter Prefixes & a Protected `.git/` (2026-10-24)
 
 Two safety gaps seen in a real session.

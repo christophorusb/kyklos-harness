@@ -20,6 +20,7 @@ kyklos --plan                            # start in read-only plan mode
 kyklos --resume                          # resume this folder's last session
 kyklos "create fizzbuzz.py and run it"   # one task, then exit
 kyklos --trust "..."                     # trust this folder for one run, without asking (for scripts)
+kyklos --model kimi-k3                   # use another model for one run (not remembered)
 ```
 
 **Using `kyklos` from any folder.** `kyklos.cmd` runs `kyklos.py` with this folder's venv, from wherever you are. Add this folder to your user PATH once, then open a new terminal:
@@ -40,6 +41,8 @@ Your home folder and drive roots can only be trusted for one session. Piped or s
 **Where Kyklos keeps its data:** `~/.kyklos` (or `KYKLOS_HOME`), so projects stay clean:
 - `trusted.json`: the folders you've trusted. Delete an entry to be asked again.
 - `projects/<folder-slug>/last.jsonl` and `history`: each folder's own session and input history.
+- `settings.json`: the model you last picked with `/model`, and each model's thinking effort.
+- `models.json`: the provider's model list, cached for a day.
 
 Commands (type `/help` for the list, Tab completes them):
 
@@ -48,6 +51,8 @@ Commands (type `/help` for the list, Tab completes them):
 | `/plan [task]` | Toggle read-only plan mode, or plan one task in it |
 | `/undo` | Revert the last turn's conversation and file edits |
 | `/save [file]`, `/resume [file]` | Save or load a JSONL session. Each folder's latest session is also saved automatically to `~/.kyklos/projects/<folder-slug>/last.jsonl` |
+| `/model [name]` | Pick the model, then its thinking effort (see below). `/model --refresh` reloads the list |
+| `/effort [level]` | Change the thinking effort for the current model |
 | `/compact` | Shrink the conversation now |
 | `/reset` | Clear the conversation |
 | `/exit` | Quit (or Ctrl+C twice at an empty prompt) |
@@ -101,6 +106,17 @@ The loop in `Agent.send` sends the conversation to the model, runs any tool call
 In a live test, a subagent took 12 steps and read five whole files, while the main agent's context stayed at 6%.
 
 **Project instructions:** if the workspace has an `AGENTS.md`, it's added to the system prompt, like CLAUDE.md or GEMINI.md in other harnesses. Put project conventions there, such as "use tabs" or "run `npm test` after changes".
+
+**Models and thinking effort:** `/model` opens an arrow-key picker of the provider's models: ↑/↓ to move, type to filter, Enter to pick, Esc to cancel. Each model shows its context size and thinking levels. Then a second picker offers *that model's own* effort levels:
+
+| Model kind | Levels offered | Example |
+|---|---|---|
+| Lists its levels (Ollama `/api/show`) | `default` + its levels | kimi-k3: off · low · high · max |
+| Thinking on/off only | `default` · off · on | kimi-k2.7-code, gemma4 |
+| Thinks, but lists no levels | `default` + low · medium · high · max, marked "best effort" | minimax-m3.1-flash |
+| Can't think | no effort picker | mistral-large-3 |
+
+`default` sends nothing, so the model decides. Other levels are sent as `reasoning_effort` (`off` as `"none"`, `on` as `"high"`). Kyklos remembers the picked model (it's used on the next start, ahead of `MODEL` in `.env`) and **each model's own effort**, so switching back to a model restores its level. The conversation carries over when you switch models, and the context window follows the new model, unless `CONTEXT_WINDOW` is set. Models that can't use tools are left out. The banner and status bar show the active effort, e.g. `kimi-k3 high`. On other providers, the list comes from `/v1/models`, with the generic levels.
 
 **Context window:** Kyklos needs to know how big the model's context window is, so it can compact in time. It's chosen at startup and shown in the banner (e.g. `1M context`):
 1. `CONTEXT_WINDOW`, if you set it (in `.env` or the environment), always wins. Setting it lower than the model's maximum keeps turns faster and cheaper.

@@ -149,6 +149,22 @@ One line each:
 - `↻` retry, in sun
 - `✗` error, in coral
 
+### Picker (`/model`, `/effort`)
+An inline rounded box (sky border) drawn below the prompt, erased when done, and replaced by one frost record line (`→ Pick a model: kimi-k3`):
+```
+  ╭─ Pick a model ───────────────────────────────────────────╮
+  │ filter: kim█                                             │
+  │ ❯   kimi-k3          1M    off · low · high · max        │
+  │     kimi-k2.7-code   262k  off · on                      │
+  │   ● minimax-m3.1-flash 1M  low · medium · high · max     │
+  ╰────────────── 22 models · ↑↓ move · enter pick · esc cancel ──╯
+```
+- `❯` (sky, bold) marks the cursor; `●` (aqua) marks the current model or effort.
+- The first column is bold on the cursor row; the other columns are frost.
+- Typing filters the rows (model picker only), and the filter line shows an aqua `█` caret.
+- Up to 12 rows show at once, scrolling with the cursor. The bottom border carries the key hints, plus the count when the list scrolls.
+- The effort picker lists `default` first, with a note: "model decides (max)", or "best effort" for generic levels.
+
 ## 5. Layout
 
 - A 2-space left margin. Each subagent level adds 4 spaces with an orchid `├`/`└`/`│` guide.

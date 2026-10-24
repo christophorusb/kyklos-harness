@@ -40,6 +40,8 @@ class FakeClient:
         self.calls.append(json.loads(json.dumps(kwargs["messages"])))  # snapshot
         self.used_tools.append("tools" in kwargs)
         self.offered.append({t["function"]["name"] for t in kwargs.get("tools", [])})
+        self.extra = getattr(self, "extra", [])
+        self.extra.append({k: v for k, v in kwargs.items() if k not in ("messages", "tools")})
         item = self.replies.pop(0)
         if isinstance(item, Exception):
             raise item
@@ -994,6 +996,200 @@ class ContextWindowTests(unittest.TestCase):
         from kyklos import short_tokens
         self.assertEqual([short_tokens(n) for n in (1000000, 1048576, 1500000, 262144, 128000, 900)],
                          ["1M", "1M", "1.5M", "262k", "128k", "900"])
+
+
+KIMI_K3 = {"capabilities": ["vision", "thinking", "completion", "tools"],
+           "model_info": {"kimi.context_length": 1048576},
+           "thinking": {"values": [False, "low", "high", "max"], "default": "max"}}
+MINIMAX = {"capabilities": ["completion", "tools", "thinking", "vision"],
+           "model_info": {"minimax.context_length": 1000000}}  # thinks, but lists no levels
+MISTRAL = {"capabilities": ["completion", "tools", "vision"], "model_info": {"m.context_length": 262144}}
+CLEF = {"capabilities": ["decision", "vision"], "model_info": {}}  # no tools: can't run Kyklos
+KIMI_CODE = {"capabilities": ["thinking", "completion", "tools"], "model_info": {"k.context_length": 262144},
+             "thinking": {"values": [False, True], "default": True}}
+
+
+class ModelCatalogTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def fake_ollama(self):
+        shows = {"kimi-k3": KIMI_K3, "minimax-m3.1-flash": MINIMAX, "mistral-large-3": MISTRAL, "clef:27b": CLEF}
+
+        class Response:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def read(self):
+                return json.dumps(self.payload).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def urlopen(request, timeout=None):
+            if request.full_url.endswith("/api/tags"):
+                return Response({"models": [{"name": n} for n in shows]})
+            return Response(shows[json.loads(request.data)["model"]])
+        return urlopen
+
+    def test_parse_model_info(self):
+        from kyklos import parse_model_info
+        self.assertEqual(parse_model_info("kimi-k3", KIMI_K3), {
+            "name": "kimi-k3", "context": 1048576, "tools": True,
+            "efforts": ["off", "low", "high", "max"], "default": "max"})
+        self.assertIsNone(parse_model_info("m", MINIMAX)["efforts"])  # thinks, levels unknown
+        self.assertEqual(parse_model_info("m", MISTRAL)["efforts"], [])  # can't think
+        self.assertFalse(parse_model_info("c", CLEF)["tools"])
+        self.assertEqual(parse_model_info("k", KIMI_CODE)["efforts"], ["off", "on"])
+
+    def test_effort_options_and_request_values(self):
+        from kyklos import effort_options, effort_request_value, parse_model_info
+        self.assertEqual(effort_options(parse_model_info("kimi-k3", KIMI_K3)), ["default", "off", "low", "high", "max"])
+        self.assertEqual(effort_options(parse_model_info("m", MINIMAX)), ["default", "low", "medium", "high", "max"])
+        self.assertEqual(effort_options(parse_model_info("m", MISTRAL)), [])
+        self.assertEqual([effort_request_value(x) for x in ("default", None, "off", "on", "low", "max")],
+                         [None, None, "none", "high", "low", "max"])
+
+    def test_catalog_lists_tool_capable_models_and_is_cached_for_a_day(self):
+        from kyklos import cached_model_info, fetch_model_catalog, load_model_catalog
+        calls = []
+
+        def fetch(base_url, api_key, client=None):
+            calls.append(base_url)
+            return fetch_model_catalog(base_url, api_key, urlopen=self.fake_ollama())
+        clock = [1000.0]
+        models = load_model_catalog(self.home, "https://ollama.com/v1", "k", fetch=fetch, now=lambda: clock[0])
+        self.assertEqual([m["name"] for m in models], ["kimi-k3", "minimax-m3.1-flash", "mistral-large-3"])  # no clef
+        load_model_catalog(self.home, "https://ollama.com/v1", "k", fetch=fetch, now=lambda: clock[0] + 3600)
+        self.assertEqual(len(calls), 1)  # served from the cache
+        load_model_catalog(self.home, "https://ollama.com/v1", "k", fetch=fetch, now=lambda: clock[0] + 90000)
+        load_model_catalog(self.home, "https://ollama.com/v1", "k", fetch=fetch, now=lambda: clock[0], refresh=True)
+        self.assertEqual(len(calls), 3)  # expired, then refreshed on request
+        self.assertEqual(cached_model_info(self.home, "https://ollama.com/v1", "kimi-k3")["context"], 1048576)
+        self.assertIsNone(cached_model_info(self.home, "https://other/v1", "kimi-k3"))
+
+    def test_other_providers_list_model_ids_only(self):
+        from kyklos import fetch_model_catalog
+        client = SimpleNamespace(models=SimpleNamespace(list=lambda: [SimpleNamespace(id="gpt-x"), SimpleNamespace(id="a")]))
+        models = fetch_model_catalog("https://api.example.com/v1", "k", client=client, urlopen=lambda *a, **k: self.fail())
+        self.assertEqual([(m["name"], m["efforts"]) for m in models], [("a", None), ("gpt-x", None)])
+
+    def test_model_priority(self):
+        from kyklos import choose_model
+        self.assertEqual(choose_model("x", {"model": "y"}, {"MODEL": "z"}), ("x", "--model"))
+        self.assertEqual(choose_model(None, {"model": "y"}, {"MODEL": "z"}), ("y", "picked"))
+        self.assertEqual(choose_model(None, {}, {"MODEL": "z"}), ("z", "MODEL"))
+
+    def test_agent_sends_reasoning_effort_and_subagents_inherit_it(self):
+        ws = Path(self.tmp.name)
+        client = FakeClient([
+            reply(tool_calls=[tool_call("t1", "task", description="look", prompt="Look.")]),
+            reply(content="Found."),
+            reply(content="Done."),
+        ])
+        agent = Agent(client, "kimi-k3", ws, on_event=None, effort="high")
+        agent.send("go")
+        self.assertEqual([e.get("reasoning_effort") for e in client.extra], ["high", "high", "high"])
+        for effort, sent in (("default", None), ("off", "none"), ("on", "high")):
+            client = FakeClient([reply(content="ok")])
+            Agent(client, "m", ws, on_event=None, effort=effort).send("go")
+            self.assertEqual(client.extra[0].get("reasoning_effort"), sent)
+
+
+class ModelCommandTests(unittest.TestCase):
+    """/model and /effort with a fake catalog and a scripted picker."""
+
+    def setUp(self):
+        from kyklos import parse_model_info
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.catalog = [parse_model_info("kimi-k3", KIMI_K3), parse_model_info("minimax-m3.1-flash", MINIMAX),
+                        parse_model_info("mistral-large-3", MISTRAL)]
+        self.agent = Agent(FakeClient([]), "minimax-m3.1-flash", self.home, on_event=None, context_window=1000000)
+        self.said, self.picks, self.answers = [], [], []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def ctx(self, answers=(), context_override=False):
+        from kyklos import CommandContext
+        self.answers = list(answers)
+
+        def pick(title, rows, cursor=0, marked=None, filterable=False):
+            self.picks.append((title, rows, cursor, marked))
+            return self.answers.pop(0)
+        return CommandContext(self.agent, lambda kind, text: self.said.append((kind, text)), self.home / "s.jsonl",
+                              pick=pick, home=self.home, load_models=lambda refresh=False: self.catalog,
+                              context_override=context_override)
+
+    def test_pick_model_then_effort_and_remember_both(self):
+        from kyklos import load_settings, run_command
+        run_command(self.ctx(answers=[0, 3]), "/model")  # kimi-k3, then "high"
+        title, rows, cursor, marked = self.picks[0]
+        self.assertEqual(rows[0], ("kimi-k3", "1M", "off · low · high · max"))
+        self.assertEqual(rows[2][2], "no thinking")
+        self.assertEqual(marked, 1)  # minimax is the current model
+        self.assertEqual(self.picks[1][0], "Thinking effort for kimi-k3")
+        self.assertEqual(self.picks[1][1][0], ("default", "model decides (max)"))
+        self.assertEqual((self.agent.model, self.agent.effort, self.agent.context_window), ("kimi-k3", "high", 1048576))
+        self.assertEqual(load_settings(self.home), {"model": "kimi-k3", "efforts": {"kimi-k3": "high"}})
+        self.assertIn("Using kimi-k3 · effort high · 1M context.", self.said[-1][1])
+
+    def test_each_model_remembers_its_own_effort(self):
+        from kyklos import run_command
+        run_command(self.ctx(answers=[0, 3]), "/model")       # kimi-k3 high
+        run_command(self.ctx(answers=[1, 2]), "/model")       # minimax: low (generic levels)
+        self.assertEqual(self.picks[-1][1][1][1], "best effort: this model doesn't list its levels")
+        run_command(self.ctx(), "/model kimi-k3")              # by name: uses kimi's saved effort
+        self.assertEqual((self.agent.model, self.agent.effort), ("kimi-k3", "high"))
+
+    def test_models_without_thinking_skip_the_effort_picker(self):
+        from kyklos import run_command
+        run_command(self.ctx(answers=[2]), "/model")  # mistral
+        self.assertEqual(len(self.picks), 1)
+        self.assertEqual((self.agent.model, self.agent.effort), ("mistral-large-3", "default"))
+        run_command(self.ctx(), "/effort")
+        self.assertEqual(self.said[-1], ("warn", "mistral-large-3 doesn't support thinking."))
+
+    def test_cancel_keeps_everything(self):
+        from kyklos import run_command
+        run_command(self.ctx(answers=[None]), "/model")
+        run_command(self.ctx(answers=[0, None]), "/model")
+        self.assertEqual((self.agent.model, self.agent.effort), ("minimax-m3.1-flash", "default"))
+        self.assertFalse((self.home / "settings.json").exists())
+
+    def test_effort_by_name_and_validation(self):
+        from kyklos import run_command
+        run_command(self.ctx(), "/effort max")
+        self.assertEqual(self.agent.effort, "max")
+        run_command(self.ctx(), "/effort turbo")
+        self.assertEqual(self.said[-1], ("error", "minimax-m3.1-flash offers: default, low, medium, high, max."))
+
+    def test_unknown_model_name_suggests_close_ones(self):
+        from kyklos import run_command
+        run_command(self.ctx(), "/model kimi")
+        self.assertEqual(self.said[-1], ("error", "No model named kimi. Did you mean: kimi-k3?"))
+
+    def test_context_window_override_is_kept(self):
+        from kyklos import run_command
+        run_command(self.ctx(answers=[0, 0], context_override=True), "/model")
+        self.assertEqual(self.agent.context_window, 1000000)  # CONTEXT_WINDOW wins over kimi's 1M
+
+    def test_plain_picker(self):
+        import builtins
+        from unittest import mock
+        from kyklos import pick_plain
+        rows = [("a", "1M"), ("b", "262k")]
+        for typed, expected in (("2", 1), ("", 0), ("q", None), ("9", None)):
+            with mock.patch.object(builtins, "input", return_value=typed), mock.patch("builtins.print"):
+                self.assertEqual(pick_plain("Pick", rows, cursor=0), expected)
 
 
 class NoKeyboardTests(unittest.TestCase):
