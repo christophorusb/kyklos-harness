@@ -81,11 +81,18 @@ The meter's filled cells are a glint → mint gradient. The `PLAN` badge is whit
 ### Spinner line
 `◯ thinking · 12s · ctrl+c to interrupt`, in frost with the bubble animating. It's replaced in place when output arrives, and it **stops before any permission prompt**.
 
-### Thoughts
-Text the model writes alongside tool calls appears in frost, indented 2 spaces.
+### Kyklos boxes (the model's words)
+Everything the model says to you appears in a rounded box shaped like the permission panel, titled with the wordmark (`○ kyklos`, the `○` in aqua and `kyklos` as the gradient), spanning the full terminal width:
+- **Progress notes** (text the model writes alongside tool calls) get a `deep`-bordered box with frost Markdown: quieter than the answer.
+- **The final answer** gets a `sky`-bordered box (see Answer below).
+```
+  ╭─ ○ kyklos ───────────────────────────────────────────────────────────╮
+  │ I'll check where MAX_STEPS and COMPACT_AT are defined.               │
+  ╰──────────────────────────────────────────────────────────────────────╯
+```
 
 ### Tool call line
-`○`/`●` + the **bold** tool name + human-readable arguments (frost), with a short summary right-aligned at `min(width, 100)`.
+`○`/`●` + the **bold** tool name + human-readable arguments (frost), with a short summary aligned to the right edge of the terminal.
 
 | Tool | Arguments shown | Summary |
 |---|---|---|
@@ -128,10 +135,13 @@ While a subagent runs, a **live block** updates in place, showing its last 3 ste
 When it finishes, the block **collapses** to one line: `● task  explore · Find compaction constants   12 steps · 41s`. Its permission prompts still appear, indented under it.
 
 ### Answer
-Rendered Markdown, flush with the 2-space margin, with **no prefix** (no `●` and no "kyklos ›"). Inline code is aqua; code blocks use Rich's terminal-color syntax theme. Headings are modest: bold, no full-width rules.
+Rendered Markdown in a `sky`-bordered kyklos box. Inline code is aqua; code blocks use Rich's terminal-color syntax theme. Headings are modest: bold and left-aligned, with no full-width rules.
 
 ### Turn footer
-`ctx 9% · 4 tools · 14s` in frost, one line after each answer.
+`ctx 9% · 4 tools · 14s` in frost, set into the answer box's bottom border on the right:
+```
+  ╰──────────────────────────────────────────────── ctx 9% · 4 tools · 14s ─╯
+```
 
 ### Notices
 One line each:
@@ -143,8 +153,8 @@ One line each:
 
 - A 2-space left margin. Each subagent level adds 4 spaces with an orchid `├`/`└`/`│` guide.
 - One blank line between turns and around answers; none between tool calls.
-- Prose wraps at `min(terminal width, 100)`. Code, diffs and commands never wrap; long lines are cut off with `…`.
-- Right-aligned summaries align to the same `min(width, 100)` column.
+- Everything uses the **full terminal width**, re-read on every line so it follows window resizes. Code, diffs and commands never wrap; long lines are cut off with `…`.
+- Right-aligned summaries align to the right edge of the terminal.
 
 ## 6. Interaction
 
@@ -182,3 +192,4 @@ One line each:
 - Glass diff blocks with three kinds: added, deleted, modified.
 - `frost` for muted text, the breathing-bubble spinner, and a PLAN badge with a solid background: all approved.
 - No prefix on answers, collapsing subagent blocks, a turn footer: approved from the preview.
+- Later the same day, after using it: the layout uses the full terminal width instead of capping at 100 columns, and the model's progress notes and answers go into `○ kyklos` boxes shaped like the permission panel, with the turn footer set into the answer box's border. `design/aero_preview.py` still shows the earlier, unboxed versions.

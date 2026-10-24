@@ -4,6 +4,7 @@ Run:  python -m unittest test_ui -v
 """
 
 import io
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -112,13 +113,29 @@ class AeroTurnTests(unittest.TestCase):
         ])
         ui.turn(agent, "what does main return?", self.session)
         out = output(ui)
-        self.assertIn("  Looking first.", out)
+        lines = out.splitlines()
+        # The progress note and the answer are each a box titled with the wordmark.
+        self.assertEqual(sum(1 for l in lines if re.search(r"^  .─ +○ kyklos ─", l)), 2)
+        self.assertRegex(out, r"│ Looking first\. +│")
         self.assertRegex(out, r"● read_file  app\.py  1–2 +2 lines")
         self.assertRegex(out, r"● grep  /return/ +1 match in 1 file")
-        self.assertRegex(out, r"\n  Done\s*\n")  # h1 is left-aligned at the margin, not centered
-        self.assertIn("It returns 42.", out)
-        self.assertRegex(out, r"ctx \d+% · 2 tools · \d+s")
+        self.assertRegex(out, r"│ Done +│")  # h1 is left-aligned inside the box, not centered
+        self.assertRegex(out, r"│ It returns 42\. +│")
+        # The turn's stats sit in the answer box's bottom border.
+        self.assertRegex(out, r"(?m)─ ctx \d+% · 2 tools · \d+s ─.\s*$")
         self.assertTrue(self.session.is_file())  # the session is saved after each turn
+
+    def test_everything_uses_the_full_terminal_width(self):
+        console = Console(file=io.StringIO(), force_terminal=True, width=160, record=True)
+        ui = AeroUI(self.ws, console=console, animate=False, ascii_mode=False)
+        agent = self.agent(ui, [reply(tool_calls=[tool_call("1", "read_file", path="app.py")]),
+                                reply(content="Done.")])
+        ui.turn(agent, "go", self.session)
+        lines = [l.rstrip() for l in console.export_text().splitlines() if l.strip()]
+        tool_line = next(l for l in lines if "read_file" in l)
+        self.assertEqual(len(tool_line), 160)  # the summary sits at the right edge, not at column 100
+        box_top = next(l for l in lines if "kyklos" in l)
+        self.assertEqual(len(box_top), 160)
 
     def test_edit_permission_panel_shows_diff_once_and_applies(self):
         ui = make_ui(self.ws, keys=["y"])

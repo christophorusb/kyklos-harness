@@ -28,7 +28,6 @@ from rich.theme import Theme
 from kyklos import (BROAD_WARNING, EXIT, NO_APPROVER_NOTE, COMMANDS, TRUST_EXPLANATION, CommandContext,
                     apply_permission_answer, denial_note, permission_options, run_command, short_tokens)
 
-MAX_WIDTH = 100
 BASH_FULL_OUTPUT_LINES = 8  # bash output up to this many lines is shown in full; longer shows the last 3
 
 # ---- tokens (DESIGN.md §2) ------------------------------------------------------------------
@@ -308,13 +307,14 @@ class AeroUI:
 
     @property
     def width(self) -> int:
-        return min(self.console.width, MAX_WIDTH)
+        """The full terminal width, read on every use so the layout follows window resizes."""
+        return self.console.width
 
     def _c(self, token: str) -> str:
         return self.colors[token]
 
     def _line(self, left: Text, right: Text = None, indent: int = 2) -> Text:
-        """A row with an optional right-aligned summary at min(width, 100). When space runs out, the
+        """A row with an optional summary aligned to the right edge of the terminal. When space runs out, the
         summary is shortened first (to at most ~35% of the row), so the tool name and its target stay readable."""
         right = (right or Text()).copy()
         left = left.copy()
@@ -433,8 +433,11 @@ class AeroUI:
         self._thinking.pop(depth, None)
 
     def _on_thought(self, depth, text="", **_):
+        """Progress notes the model writes between tool calls: a kyklos box with a deep border and frost text,
+        quieter than the final answer's box."""
         if depth == 0 and text.strip():
-            self.print(Text(text.strip(), style="frost"), indent=2)
+            self.print(self.kyklos_box(AeroMarkdown(text.strip(), style="frost", code_theme="ansi_dark"),
+                                       border="deep"), indent=2)
 
     def _on_tool_call(self, depth, name="", arguments="", **_):
         try:
@@ -660,11 +663,22 @@ class AeroUI:
 
     # -- chrome: banner, notices, answer, footer --
 
-    def banner(self, agent) -> None:
+    def wordmark(self) -> Text:
+        """The gradient "kyklos" (DESIGN.md §4, Banner): the white first letter is the glint."""
         if self.plain:
-            word = Text("kyklos", style="bold sky")
-        else:
-            word = gradient_text("kyklos", ["#E8FBFF", self._c("aqua"), self._c("sky"), self._c("deep")], bold=True)
+            return Text("kyklos", style="bold sky")
+        return gradient_text("kyklos", ["#E8FBFF", self._c("aqua"), self._c("sky"), self._c("deep")], bold=True)
+
+    def kyklos_box(self, body, border: str = "sky", footer: Text = None) -> Panel:
+        """A rounded box titled with the wordmark, for the model's words (progress notes and answers),
+        shaped like the permission panel and as wide as the terminal."""
+        title = Text(f"{self.g['run']} ", style="aqua") + self.wordmark()  # Rich pads titles with a space
+        return Panel(body, title=title, title_align="left", subtitle=footer, subtitle_align="right",
+                     box=box.ASCII if self.ascii else box.ROUNDED, border_style=border,
+                     width=self.width - 2, padding=(0, 1))
+
+    def banner(self, agent) -> None:
+        word = self.wordmark()
         dot = self.g["dot"]
         context = f"{short_tokens(agent.context_window)} context"
         if getattr(agent, "context_source", "") == "default":
@@ -681,20 +695,22 @@ class AeroUI:
         prefix = {"ok": self.g["done"] + " ", "error": self.g["fail"] + " ", "warn": "! "}.get(kind, "")
         self.print(Text(prefix + text, style=style), indent=2)
 
-    def answer(self, text: str) -> None:
+    def answer(self, text: str, footer: Text = None) -> None:
+        """The final answer: rendered Markdown in a sky-bordered kyklos box, with the turn's stats
+        (ctx · tools · time) set into the bottom border."""
         self._pause_live()
         self.print()
-        self.print(AeroMarkdown(text or "(no answer)", code_theme="ansi_dark"), indent=2)
+        self.print(self.kyklos_box(AeroMarkdown(text or "(no answer)", code_theme="ansi_dark"), footer=footer),
+                   indent=2)
         self.print()
 
-    def footer(self, agent, seconds: float) -> None:
+    def footer_text(self, agent, seconds: float) -> Text:
         pct = agent.context_tokens() / agent.context_window
         parts = [f"ctx {pct:.0%}"]
         if self.turn_tools:
             parts.append(_plural(self.turn_tools, "tool"))
         parts.append(f"{seconds:.0f}s")
-        self.print(Text(f" {self.g['dot']} ".join(parts), style="frost"), indent=2)
-        self.print()
+        return Text(f" {self.g['dot']} ".join(parts), style="frost")
 
     # -- input: prompt, status bar, completion --
 
@@ -796,9 +812,8 @@ class AeroUI:
             self.print()
             return
         self.reset_transient()
-        self.answer(answer)
+        self.answer(answer, footer=self.footer_text(agent, time.monotonic() - start))
         agent.save_session(default_session)
-        self.footer(agent, time.monotonic() - start)
 
     def run(self, agent, default_session: Path, one_shot: str = None, notice: tuple = None) -> None:
         self.agent = agent

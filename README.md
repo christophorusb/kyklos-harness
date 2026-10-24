@@ -60,7 +60,8 @@ In a real terminal, Kyklos uses an inline UI built with [Rich](https://github.co
 - **A breathing-bubble spinner** shows while the model thinks. Running steps are shown live and disappear once they finish, so the scrollback stays clean.
 - **Subagents** show a live tree of their latest steps, which collapses to one line when they finish.
 - **Permission prompts** are a rounded panel with **glass diff blocks**: added lines in mint, deleted in coral, and modified lines in aqua, with the changed characters glowing. Answer with a single key: `y` / `n` / `p` / `a`. `p` lets you edit the suggested prefix before saving it, and `n` asks for an optional reason.
-- **Answers** are rendered as Markdown, followed by a footer: `ctx 9% · 4 tools · 14s`.
+- **The model's words** appear in rounded `○ kyklos` boxes (with the gradient wordmark), shaped like the permission panel. Progress notes get a subtle deep-blue border; the final answer is rendered Markdown in a sky-blue box, with `ctx 9% · 4 tools · 14s` set into its bottom border.
+- **Full width:** everything spans the whole terminal and follows window resizes.
 - **A status bar** while you type shows the model, a context meter, a PLAN badge and the workspace.
 - **Input:** history with ↑/↓ (kept per folder in `~/.kyklos/projects/<folder-slug>/history`), and Alt+Enter for a new line.
 

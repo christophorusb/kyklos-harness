@@ -4,6 +4,18 @@ All notable changes to **Kyklos** since the repository was initialized on 2026-1
 
 ---
 
+## Unreleased — Full-Width Layout & Kyklos Boxes (2026-10-24)
+
+- **Full terminal width (`ui.py`):** removed the 100-column cap (`MAX_WIDTH`). Tool-line summaries, panels and answers now reach the right edge of the terminal, and the width is re-read on every line, so the layout follows window resizes.
+- **Kyklos boxes (`ui.py`):**
+  - Added `wordmark()` (the gradient `kyklos`, now shared with the banner) and `kyklos_box()`, a rounded panel titled `○ kyklos`, shaped like the permission panel and spanning the terminal.
+  - The model's progress notes (`thought` events) appear in a `deep`-bordered box as frost Markdown; the final answer is Markdown in a `sky`-bordered box.
+  - The turn footer (`ctx N% · N tools · Ns`) moved into the answer box's bottom border (`footer_text`, replacing `footer`).
+- **Docs (`DESIGN.md`, `README.md`):** updated the components, layout and decisions log; `design/aero_preview.py` still shows the earlier unboxed design.
+- **Tests (`test_ui.py`):** the turn test now checks both boxes, their content and the footer in the border; added a full-width test at 160 columns (94 total offline tests).
+
+---
+
 ## `53d9105` — No More Frozen Commands (2026-10-24)
 
 Fixes the CLI looking stuck after answering `y` to an "Allow bash?" prompt. There were two causes, which made each other worse.
