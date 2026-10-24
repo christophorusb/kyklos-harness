@@ -15,15 +15,31 @@ Copy-Item .env.example .env   # then fill in BASE_URL, API_KEY, MODEL
 ## Run
 
 ```powershell
-.\kyklos                                   # interactive
-.\kyklos --plan                            # start in read-only plan mode
-.\kyklos --resume                          # resume the last saved session
-.\kyklos "create fizzbuzz.py and run it"   # one task, then exit
+kyklos                                   # interactive
+kyklos --plan                            # start in read-only plan mode
+kyklos --resume                          # resume this folder's last session
+kyklos "create fizzbuzz.py and run it"   # one task, then exit
+kyklos --trust "..."                     # trust this folder for one run, without asking (for scripts)
 ```
 
-`kyklos.cmd` runs `kyklos.py` with this folder's venv. If you add this folder to your PATH, you can type `kyklos` from anywhere.
+**Using `kyklos` from any folder.** `kyklos.cmd` runs `kyklos.py` with this folder's venv, from wherever you are. Add this folder to your user PATH once, then open a new terminal:
 
-The agent works in the directory you launch from, or in `WORKSPACE` if you set it in `.env`. A throwaway `sandbox` folder is a good place to start.
+```powershell
+[Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";C:\path\to\kyklos-harness", "User")
+```
+
+Kyklos works in the folder you launch it from. Setting `WORKSPACE` in `.env` pins it to one folder instead.
+
+**Folder trust.** The first time you run Kyklos in a folder, it asks whether you trust it. This happens before it reads anything there, including `AGENTS.md`, which goes straight into the model's instructions.
+- `y` trusts the folder and everything inside it, and remembers that.
+- `o` trusts it for this session only.
+- `n` quits.
+
+Your home folder and drive roots can only be trusted for one session. Piped or scripted runs can't answer the question, so they exit unless the folder is already trusted, or you pass `--trust` (or set `KYKLOS_TRUST=1`) for that run.
+
+**Where Kyklos keeps its data:** `~/.kyklos` (or `KYKLOS_HOME`), so projects stay clean:
+- `trusted.json`: the folders you've trusted. Delete an entry to be asked again.
+- `projects/<folder-slug>/last.jsonl` and `history`: each folder's own session and input history.
 
 Commands (type `/help` for the list, Tab completes them):
 
@@ -31,7 +47,7 @@ Commands (type `/help` for the list, Tab completes them):
 |---|---|
 | `/plan [task]` | Toggle read-only plan mode, or plan one task in it |
 | `/undo` | Revert the last turn's conversation and file edits |
-| `/save [file]`, `/resume [file]` | Save or load a JSONL session. The latest session is also saved automatically to `.sessions/last.jsonl` |
+| `/save [file]`, `/resume [file]` | Save or load a JSONL session. Each folder's latest session is also saved automatically to `~/.kyklos/projects/<folder-slug>/last.jsonl` |
 | `/compact` | Shrink the conversation now |
 | `/reset` | Clear the conversation |
 | `/exit` | Quit (or Ctrl+C twice at an empty prompt) |
@@ -46,7 +62,7 @@ In a real terminal, Kyklos uses an inline UI built with [Rich](https://github.co
 - **Permission prompts** are a rounded panel with **glass diff blocks**: added lines in mint, deleted in coral, and modified lines in aqua, with the changed characters glowing. Answer with a single key: `y` / `n` / `p` / `a`. `p` lets you edit the suggested prefix before saving it, and `n` asks for an optional reason.
 - **Answers** are rendered as Markdown, followed by a footer: `ctx 9% · 4 tools · 14s`.
 - **A status bar** while you type shows the model, a context meter, a PLAN badge and the workspace.
-- **Input:** history with ↑/↓ (saved to `.sessions/history`), and Alt+Enter for a new line.
+- **Input:** history with ↑/↓ (kept per folder in `~/.kyklos/projects/<folder-slug>/history`), and Alt+Enter for a new line.
 
 Settings:
 

@@ -219,11 +219,18 @@ def format_diff(old_text: str, new_text: str, max_lines: int = 24) -> str:
     return "\n".join(styled)
 
 
+SHELL_KEYWORDS = {"if", "else", "elseif", "try", "catch", "finally", "for", "foreach", "while", "do", "switch",
+                  "function", "param", "begin", "process", "end", "return", "then", "fi", "case", "until"}
+COMMAND_WORD_RE = re.compile(r"^[A-Za-z0-9_.\\/:-]+$")
+
+
 def suggest_prefix(command: str) -> str:
-    """Suggest a reusable command prefix for a bash call (e.g. 'git status', 'py -m unittest')."""
+    """Suggest a reusable command prefix for a bash call (e.g. 'git status', 'py -m unittest').
+    Returns "" when the command doesn't start with a program name (a quoted string, a variable,
+    a script block or a keyword like `if`), since a rule like '"---' would be meaningless."""
     first = re.split(r"&&|\|\||[;\n|]", command)[0].strip()
     words = first.split()
-    if not words:
+    if not words or not COMMAND_WORD_RE.match(words[0]) or words[0].lower() in SHELL_KEYWORDS:
         return ""
     stem = Path(words[0]).stem.lower()
     if stem in PYTHON_STEMS:
@@ -684,6 +691,89 @@ class Agent:
         return f"(Stopped after {MAX_STEPS} steps without a final answer.)"
 
 
+# Per-user data lives in ~/.kyklos (override with KYKLOS_HOME), so `kyklos` can run in any folder:
+#   ~/.kyklos/trusted.json                   folders the user said Kyklos may work in
+#   ~/.kyklos/projects/<folder-slug>/        that folder's saved session and input history
+def kyklos_home(env=os.environ) -> Path:
+    return Path(env.get("KYKLOS_HOME") or Path.home() / ".kyklos")
+
+
+def project_slug(folder: Path) -> str:
+    """A folder path as one directory name: D:\\work\\my app -> D--work-my-app."""
+    return re.sub(r"[^A-Za-z0-9._-]", "-", str(Path(folder).resolve()))
+
+
+def project_dir(home: Path, folder: Path) -> Path:
+    return home / "projects" / project_slug(folder)
+
+
+def _same_or_inside(path: Path, folder: Path) -> bool:
+    p, f = os.path.normcase(str(path)), os.path.normcase(str(folder))
+    return p == f or p.startswith(f.rstrip("\\/") + os.sep)
+
+
+def trusted_folders(home: Path) -> list[str]:
+    try:
+        return json.loads((home / "trusted.json").read_text(encoding="utf-8")).get("folders", [])
+    except (OSError, ValueError):
+        return []
+
+
+def is_trusted(home: Path, folder: Path) -> bool:
+    """Trusting a folder also covers everything inside it."""
+    folder = Path(folder).resolve()
+    return any(_same_or_inside(folder, Path(t)) for t in trusted_folders(home))
+
+
+def trust_folder(home: Path, folder: Path) -> None:
+    folders = trusted_folders(home)
+    folder = str(Path(folder).resolve())
+    if not any(os.path.normcase(f) == os.path.normcase(folder) for f in folders):
+        folders.append(folder)
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "trusted.json").write_text(json.dumps({"folders": folders}, indent=2), encoding="utf-8")
+
+
+def is_broad_folder(folder: Path) -> bool:
+    """Your home folder or a drive root: trusting it would expose everything underneath."""
+    folder = Path(folder).resolve()
+    return folder == folder.parent or os.path.normcase(str(folder)) == os.path.normcase(str(Path.home().resolve()))
+
+
+TRUST_EXPLANATION = ("Kyklos will read files here and load this folder's AGENTS.md into its instructions. "
+                     "With your approval, it can also edit files and run commands. "
+                     "Only trust folders whose contents you trust.")
+BROAD_WARNING = ("This is your home folder or a drive root, so Kyklos could read everything under it. "
+                 "It can only be trusted for this session.")
+
+
+def resolve_trust(home: Path, folder: Path, interactive: bool, preapproved: bool, ask) -> bool:
+    """Decide whether Kyklos may work in `folder`, before anything (like AGENTS.md) is read from it.
+    `ask(folder, broad)` returns "yes" (trust and remember), "once" (this session) or "no"."""
+    if preapproved or is_trusted(home, folder):
+        return True
+    if not interactive:
+        return False
+    broad = is_broad_folder(folder)
+    choice = ask(folder, broad)
+    if choice == "yes" and not broad:  # broad folders are never remembered, whatever the front end returns
+        trust_folder(home, folder)
+        return True
+    return choice in ("yes", "once")
+
+
+def ask_trust_plain(folder: Path, broad: bool) -> str:
+    print(f"\nTrust this folder?  {folder}\n  {TRUST_EXPLANATION}")
+    if broad:
+        print(f"  \033[31m! {BROAD_WARNING}\033[0m")
+    options = "[o]nce / [n]o" if broad else "[y]es, remember / [o]nce / [n]o"
+    try:
+        answer = input(f"  {options}: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return "no"
+    return {"y": "yes", "yes": "yes", "o": "once", "once": "once"}.get(answer, "no")
+
+
 # Slash commands: one registry shared by the plain REPL and the Aero UI, which also generates /help.
 # A handler takes (ctx, arg) and returns None, EXIT, or text to send to the agent as a request.
 EXIT = object()
@@ -822,14 +912,19 @@ def main() -> None:
     if missing:
         sys.exit(f"Missing {', '.join(missing)}. Copy .env.example to .env and fill it in.")
 
-    workspace = Path(os.environ.get("WORKSPACE") or Path.cwd())
+    workspace = Path(os.environ.get("WORKSPACE") or Path.cwd()).resolve()
     client = OpenAI(base_url=os.environ["BASE_URL"], api_key=os.environ["API_KEY"])
     window = int(os.environ.get("CONTEXT_WINDOW") or DEFAULT_CONTEXT_WINDOW)
-    default_session = here / ".sessions" / "last.jsonl"
+    home = kyklos_home()
+    default_session = project_dir(home, workspace) / "last.jsonl"
 
     args = list(sys.argv[1:])
     plan_mode = False
     resume_path = None
+    preapproved = os.environ.get("KYKLOS_TRUST") == "1"
+    if "--trust" in args:  # trust the folder for this run only, without asking (for scripts)
+        args.remove("--trust")
+        preapproved = True
     if "--plan" in args:
         args.remove("--plan")
         plan_mode = True
@@ -850,6 +945,11 @@ def main() -> None:
             ui = AeroUI(workspace)
         except ImportError:  # rich / prompt_toolkit not installed: fall back to the plain REPL
             ui = None
+    # Decide trust before the Agent exists: creating it reads this folder's AGENTS.md into the prompt.
+    if not resolve_trust(home, workspace, interactive=sys.stdin.isatty(), preapproved=preapproved,
+                         ask=ui.ask_trust if ui else ask_trust_plain):
+        sys.exit(f"Kyklos isn't trusted to work in {workspace}. Run kyklos there in a terminal to decide, "
+                 "or pass --trust to allow it for one run.")
     agent = Agent(client, os.environ["MODEL"], workspace, context_window=window, plan_mode=plan_mode,
                   **({"permission": ui.permission, "on_event": ui.observer} if ui else {}))
     resume_note = None

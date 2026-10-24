@@ -4,6 +4,30 @@ All notable changes to **Kyklos** since the repository was initialized on 2026-1
 
 ---
 
+## Unreleased — Run Anywhere & Folder Trust (2026-10-24)
+
+- **Folder trust (`kyklos.py`, `ui.py`):**
+  - Added `resolve_trust`, called in `main()` **before** the `Agent` is created, so an untrusted folder's `AGENTS.md` never reaches the model's instructions.
+  - New trust prompts: `AeroUI.ask_trust` (a rounded panel with single keys: `y` trust and remember, `o` this session only, `n` quit; Esc or no keyboard means no) and `ask_trust_plain` for the plain REPL.
+  - Trusting a folder covers its subfolders (`is_trusted`, with case-insensitive path matching on Windows; sibling folders that merely share a prefix are not covered).
+  - Home folders and drive roots (`is_broad_folder`) get a coral warning, and can only be trusted for one session; the core enforces this whatever the front end returns.
+  - Non-interactive runs exit unless the folder is trusted or `--trust` / `KYKLOS_TRUST=1` allows that run (never remembered).
+- **Per-user data in `~/.kyklos` (`kyklos.py`):**
+  - Added `kyklos_home` (overridable with `KYKLOS_HOME`), `project_slug` and `project_dir`.
+  - `trusted.json` lists trusted folders. Each folder's session (`last.jsonl`) and input history now live in `projects/<folder-slug>/` instead of a shared `.sessions/` in the Kyklos folder, so `/resume` in one project can no longer load another project's conversation.
+- **UI fixes from a real security-audit session (`ui.py`, `kyklos.py`):**
+  - A denial reason is shown once, on the panel's `⊘ denied: …` line; the tool line now just says `denied by you` (or `denied: no one to approve`), instead of repeating the reason and squeezing the command off the line.
+  - `suggest_prefix` no longer offers rules for commands that don't start with a program name (a quoted string, a `$variable`, a script block, or keywords like `if` / `try`), which had suggested `p prefix '"---'`.
+  - When a tool line runs out of room, the right-aligned summary is shortened first (to at most ~35% of the row), so the tool name and its target stay readable.
+  - `bash` output of up to 8 lines is shown in full; longer output shows `… N earlier lines` and the last 3. A short multi-section result (like a `Test-Path` answer) had been cut to its last 3 lines.
+- **Run from any folder (`README.md`, `.env.example`):**
+  - Documented adding the Kyklos folder to the user PATH, and that leaving `WORKSPACE` unset makes Kyklos work in the launch folder.
+- **Tests (`test_kyklos.py`, `test_ui.py`):**
+  - Added `TrustTests` (7 tests: slugs, remember vs once vs `--trust`, subfolder and sibling matching, broad folders, non-interactive refusal, corrupt-file tolerance, plain prompt answers) and `TrustPanelTests` (3 tests).
+  - Added regression tests for the four UI fixes, using commands from the audit session (83 total offline tests).
+
+---
+
 ## `3123b47` — Kyklos Aero UI (Phase 1), Design System & Brace Globs (2026-10-24)
 
 - **Kyklos Aero inline UI (`ui.py`, new):**

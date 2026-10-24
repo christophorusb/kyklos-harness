@@ -559,6 +559,19 @@ class EditAndPermissionTests(unittest.TestCase):
         self.assertFalse(is_auto_allowed("bash", {"command": "git status | sh"}, allowed))
         self.assertFalse(is_auto_allowed("bash", {"command": "git status $(whoami)"}, allowed))
 
+    def test_no_prefix_suggested_when_a_command_does_not_start_with_a_program(self):
+        from kyklos import suggest_prefix
+        # Seen in a real session: a PowerShell script starting with a string literal suggested '"---'.
+        self.assertEqual(suggest_prefix('"--- electron binary present? ---"; if (Test-Path x) { 1 }'), "")
+        for command in ("if (Test-Path .env) { 1 }", "try { Invoke-RestMethod x } catch { 2 }",
+                        "$r = Get-Item x", "{ ls }", "(Get-Date)", "@('a') | % { $_ }"):
+            self.assertEqual(suggest_prefix(command), "", command)
+        # Real programs still get a prefix.
+        self.assertEqual(suggest_prefix("git status -s"), "git status")
+        self.assertEqual(suggest_prefix("npm audit --omit=dev 2>&1"), "npm audit")
+        self.assertEqual(suggest_prefix(r".\scripts\build.ps1 -Release"), r".\scripts\build.ps1")
+        self.assertEqual(suggest_prefix("Get-ChildItem -Recurse"), "Get-ChildItem")
+
     def test_ask_permission_prefix_option_saves_rule(self):
         import builtins
         from unittest import mock
@@ -766,6 +779,91 @@ class RetryAndObserverTests(unittest.TestCase):
             ("subagent_end", 1),
             ("tool_result", 0),
         ])
+
+
+class TrustTests(unittest.TestCase):
+    """Folder trust and per-project data dirs, with a temporary ~/.kyklos."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.home, self.project = root / "kyklos-home", root / "work" / "my app"
+        self.project.mkdir(parents=True)
+        self.asked = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def ask(self, answer):
+        def fn(folder, broad):
+            self.asked.append((folder, broad))
+            return answer
+        return fn
+
+    def test_project_dirs_are_per_folder_slugs(self):
+        from kyklos import project_dir, project_slug
+        slug = project_slug(self.project)
+        self.assertNotRegex(slug, r"[\\/: ]")
+        self.assertTrue(slug.endswith("work-my-app"))
+        self.assertEqual(project_dir(self.home, self.project), self.home / "projects" / slug)
+        self.assertNotEqual(project_slug(self.project), project_slug(self.project.parent))
+
+    def test_yes_is_remembered_and_covers_subfolders_only(self):
+        from kyklos import is_trusted, resolve_trust
+        self.assertTrue(resolve_trust(self.home, self.project, True, False, self.ask("yes")))
+        self.assertTrue(is_trusted(self.home, self.project))
+        (self.project / "src").mkdir()
+        self.assertTrue(is_trusted(self.home, self.project / "src"))
+        self.assertFalse(is_trusted(self.home, self.project.parent))
+        sibling = self.project.parent / "my app 2"  # shares a prefix, but isn't inside
+        sibling.mkdir()
+        self.assertFalse(is_trusted(self.home, sibling))
+        # A trusted folder never asks again.
+        self.asked.clear()
+        self.assertTrue(resolve_trust(self.home, self.project, True, False, self.ask("no")))
+        self.assertEqual(self.asked, [])
+
+    def test_once_and_preapproved_are_not_remembered(self):
+        from kyklos import is_trusted, resolve_trust
+        self.assertTrue(resolve_trust(self.home, self.project, True, False, self.ask("once")))
+        self.assertTrue(resolve_trust(self.home, self.project, False, True, self.ask("no")))  # --trust
+        self.assertFalse(is_trusted(self.home, self.project))
+
+    def test_no_and_non_interactive_refuse(self):
+        from kyklos import resolve_trust
+        self.assertFalse(resolve_trust(self.home, self.project, True, False, self.ask("no")))
+        self.asked.clear()
+        self.assertFalse(resolve_trust(self.home, self.project, False, False, self.ask("yes")))
+        self.assertEqual(self.asked, [])  # nobody to ask in a piped run
+
+    def test_broad_folders_are_never_remembered(self):
+        from unittest import mock
+        import kyklos
+        with mock.patch.object(kyklos, "is_broad_folder", return_value=True):
+            self.assertTrue(kyklos.resolve_trust(self.home, self.project, True, False, self.ask("yes")))
+        self.assertEqual(self.asked[-1][1], True)
+        self.assertFalse(kyklos.is_trusted(self.home, self.project))
+        self.assertTrue(kyklos.is_broad_folder(Path.home()))
+        self.assertTrue(kyklos.is_broad_folder(Path(Path.home().anchor)))
+        self.assertFalse(kyklos.is_broad_folder(self.project))
+
+    def test_trust_store_dedupes_and_survives_a_corrupt_file(self):
+        from kyklos import trust_folder, trusted_folders
+        trust_folder(self.home, self.project)
+        trust_folder(self.home, self.project)
+        self.assertEqual(len(trusted_folders(self.home)), 1)
+        (self.home / "trusted.json").write_text("{not json")
+        self.assertEqual(trusted_folders(self.home), [])
+
+    def test_plain_prompt_answers(self):
+        import builtins
+        from unittest import mock
+        from kyklos import ask_trust_plain
+        for typed, expected in (("y", "yes"), ("o", "once"), ("n", "no"), ("", "no")):
+            with mock.patch.object(builtins, "input", return_value=typed), mock.patch("builtins.print"):
+                self.assertEqual(ask_trust_plain(self.project, False), expected)
+        with mock.patch.object(builtins, "input", side_effect=EOFError), mock.patch("builtins.print"):
+            self.assertEqual(ask_trust_plain(self.project, False), "no")
 
 
 class HelperTests(unittest.TestCase):

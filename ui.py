@@ -25,10 +25,11 @@ from rich.panel import Panel
 from rich.text import Text
 from rich.theme import Theme
 
-from kyklos import (EXIT, NO_APPROVER_NOTE, COMMANDS, CommandContext, apply_permission_answer, denial_note,
-                    permission_options, run_command)
+from kyklos import (BROAD_WARNING, EXIT, NO_APPROVER_NOTE, COMMANDS, TRUST_EXPLANATION, CommandContext,
+                    apply_permission_answer, denial_note, permission_options, run_command)
 
 MAX_WIDTH = 100
+BASH_FULL_OUTPUT_LINES = 8  # bash output up to this many lines is shown in full; longer shows the last 3
 
 # ---- tokens (DESIGN.md §2) ------------------------------------------------------------------
 
@@ -208,8 +209,8 @@ def summarize_result(name: str, args: dict, result: str) -> tuple:
     if status == "fail":
         return status, result[len("Error:"):].strip().splitlines()[0], [], ""
     if status == "denied":
-        reason = result.split("Reason:", 1)[1].strip() if "Reason:" in result else ""
-        return status, "denied by you" + (f": {reason}" if reason else ""), [], ""
+        # The reason is already shown on the permission panel's "⊘ denied: …" line; don't repeat it here.
+        return status, "denied: no one to approve" if "nobody is available" in result else "denied by you", [], ""
     if status == "interrupted":
         return status, "interrupted", [], ""
     if name == "read_file":
@@ -232,8 +233,10 @@ def summarize_result(name: str, args: dict, result: str) -> tuple:
     if name == "bash":
         first, _, rest = result.partition("\n")
         code = first.replace("exit code", "").strip()
-        tail = [l for l in rest.splitlines() if l.strip()][-3:]
-        return ("ok" if code == "0" else "exitfail"), f"exit {code}", tail, ""
+        lines = [l for l in rest.splitlines() if l.strip()]
+        if len(lines) > BASH_FULL_OUTPUT_LINES:  # long output: the end matters most for commands
+            lines = [f"… {len(lines) - 3} earlier lines"] + lines[-3:]
+        return ("ok" if code == "0" else "exitfail"), f"exit {code}", lines, ""
     return status, "", [], ""
 
 
@@ -311,10 +314,16 @@ class AeroUI:
         return self.colors[token]
 
     def _line(self, left: Text, right: Text = None, indent: int = 2) -> Text:
-        """A row with an optional right-aligned summary at min(width, 100), cutting the left part with … if needed."""
-        right = right or Text()
-        room = self.width - indent - right.cell_len - (2 if right.cell_len else 0)
+        """A row with an optional right-aligned summary at min(width, 100). When space runs out, the
+        summary is shortened first (to at most ~35% of the row), so the tool name and its target stay readable."""
+        right = (right or Text()).copy()
         left = left.copy()
+        available = self.width - indent
+        if left.cell_len + 2 + right.cell_len > available:
+            right_max = max(12, int(available * 0.35))
+            if right.cell_len > right_max:
+                right.truncate(right_max, overflow="ellipsis")
+        room = available - right.cell_len - (2 if right.cell_len else 0)
         if left.cell_len > room:
             left.truncate(max(room, 8), overflow="ellipsis")
         gap = self.width - indent - left.cell_len - right.cell_len
@@ -466,6 +475,7 @@ class AeroUI:
         self.turn_tools += 1
         self.print(self._line(left, right))
         for row in tail:
+            row = row.replace("…", self.g["ellipsis"]) if row.startswith("…") else row
             self.print(Text(f"{self.g['pipe']} {row}", style="frost", overflow="ellipsis", no_wrap=True), indent=4)
         if status == "ok" and "old" in info and not info["panel_shown"]:
             self._print_diff(info, indent=4, max_rows=12)  # auto-approved edits still show what changed, once
@@ -603,6 +613,38 @@ class AeroUI:
         self.print(Text(f"{self.g['denied']} denied" + (f": {reason}" if reason else ""), style="coral"),
                    indent=indent + 2)
         return False, denial_note(name, reason)
+
+    # -- folder trust (shown once per folder, before anything is read from it) --
+
+    def ask_trust(self, folder: Path, broad: bool) -> str:
+        """Returns "yes" (trust and remember), "once" (this session) or "no"."""
+        keys = ([] if broad else [("y", "yes, trust it")]) + [("o", "once, this session"), ("n", "no, quit")]
+        choices = Text()
+        for i, (k, label) in enumerate(keys):
+            if i:
+                choices += Text(f"  {self.g['dot']}  ", style="frost")
+            choices += Text(k, style="bold sun") + Text(f" {label}")
+        body = [Text(str(folder), style="bold"), Text(""), Text(TRUST_EXPLANATION, style="frost")]
+        if broad:
+            body += [Text(""), Text(f"! {BROAD_WARNING}", style="coral")]
+        self.print()
+        self.print(Panel(Group(*body, Text(""), choices), title=Text("Trust this folder?", style="bold"),
+                         title_align="left", box=box.ASCII if self.ascii else box.ROUNDED,
+                         border_style="coral" if broad else "sun", width=self.width - 2, padding=(0, 1)), indent=2)
+        valid = {k for k, _ in keys}
+        while True:
+            key = self.read_key()
+            if key is None or key in ("\x03", "\x1b"):
+                key = "n"
+            key = key.lower()
+            if key in valid:
+                break
+        choice = {"y": "yes", "o": "once", "n": "no"}[key]
+        note = {"yes": f"{self.g['arrow']} trusted; Kyklos won't ask again for this folder",
+                "once": f"{self.g['arrow']} trusted for this session only", "no": f"{self.g['denied']} not trusted"}[choice]
+        self.print(Text(note, style="coral" if choice == "no" else "frost"), indent=4)
+        self.print()
+        return choice
 
     # -- chrome: banner, notices, answer, footer --
 

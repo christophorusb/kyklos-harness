@@ -68,10 +68,19 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(summarize_result("grep", {}, "No matches.")[1], "no matches")
         self.assertEqual(summarize_result("glob", {}, "a.py\nb.py")[1], "2 files")
         status, summary, tail, _ = summarize_result("bash", {}, "exit code 1\nl1\nl2\nl3\nl4")
-        self.assertEqual((status, summary, tail), ("exitfail", "exit 1", ["l2", "l3", "l4"]))
+        self.assertEqual((status, summary, tail), ("exitfail", "exit 1", ["l1", "l2", "l3", "l4"]))  # short: all
         self.assertEqual(summarize_result("read_file", {}, "Error: File not found: x")[:2], ("fail", "File not found: x"))
+        # The reason was already shown on the panel's "denied:" line, so the tool line doesn't repeat it.
         self.assertEqual(summarize_result("bash", {}, "The user denied this bash call. Reason: no")[:2],
-                         ("denied", "denied by you: no"))
+                         ("denied", "denied by you"))
+        self.assertEqual(summarize_result("bash", {}, "The bash call was denied: nobody is available to approve it.")[1],
+                         "denied: no one to approve")
+
+    def test_short_bash_output_is_shown_in_full_and_long_output_keeps_the_end(self):
+        eight = "exit code 0\n" + "\n".join(f"line {i}" for i in range(8))
+        self.assertEqual(len(summarize_result("bash", {}, eight)[2]), 8)
+        twenty = "exit code 0\n" + "\n".join(f"line {i}" for i in range(20))
+        self.assertEqual(summarize_result("bash", {}, twenty)[2], ["… 17 earlier lines", "line 17", "line 18", "line 19"])
 
     def test_call_descriptions_are_human_readable(self):
         self.assertEqual(describe_call("grep", {"pattern": "def", "path": "src", "glob": "*.py"}), "/def/ in src  *.py")
@@ -147,7 +156,8 @@ class AeroTurnTests(unittest.TestCase):
         ui.turn(agent, "list files", self.session)
         out = output(ui)
         self.assertIn("⊘ denied: use grep instead", out)
-        self.assertRegex(out, r"⊘ bash  \$ dir +denied by you: use grep instead")
+        self.assertRegex(out, r"⊘ bash  \$ dir +denied by you")
+        self.assertEqual(out.count("use grep instead"), 1)  # the reason is shown once, not twice
         tool_msg = [m for m in agent.messages if m["role"] == "tool"][-1]["content"]
         self.assertIn("Reason: use grep instead", tool_msg)
 
@@ -184,6 +194,14 @@ class AeroTurnTests(unittest.TestCase):
         self.assertNotIn("def main", out)  # the subagent's steps were transient
         self.assertRegex(out, r"ctx \d+% · 1 tool · \d+s")
 
+    def test_long_summary_is_shortened_before_the_tool_label(self):
+        from rich.text import Text
+        ui = make_ui(self.ws)
+        row = ui._line(Text("bash  $ git log --oneline"), Text("denied: " + "x" * 120)).plain
+        self.assertIn("bash  $ git log --oneline", row)  # the label stays readable
+        self.assertIn("…", row)  # the summary is cut instead
+        self.assertLessEqual(len(row.rstrip()), ui.width)
+
     def test_api_error_is_reported_not_raised(self):
         ui = make_ui(self.ws)
         agent = self.agent(ui, [TransientAPIError(401, "invalid api key")])
@@ -212,6 +230,34 @@ class AeroTurnTests(unittest.TestCase):
         self.assertIn(" PLAN ", bar)
         self.assertRegex(bar, r"ctx \d+% ")
         self.assertIn("(plan) ", "".join(text for _, text in ui.prompt_message()))
+
+
+class TrustPanelTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_panel_explains_and_takes_single_keys(self):
+        for key, expected in (("y", "yes"), ("o", "once"), ("n", "no"), ("\x1b", "no")):
+            ui = make_ui(self.ws, keys=[key])
+            self.assertEqual(ui.ask_trust(self.ws, broad=False), expected)
+        out = output(ui)
+        self.assertIn("Trust this folder?", out)
+        self.assertIn("AGENTS.md", out)
+        self.assertIn("y yes, trust it  ·  o once, this session  ·  n no, quit", out)
+
+    def test_broad_folder_offers_no_remember_option(self):
+        ui = make_ui(self.ws, keys=["y", "o"])  # "y" isn't offered, so it's ignored; "o" answers
+        self.assertEqual(ui.ask_trust(self.ws, broad=True), "once")
+        out = output(ui)
+        self.assertIn("home folder or a drive root", out)
+        self.assertNotIn("y yes", out)
+
+    def test_no_keyboard_means_no(self):
+        self.assertEqual(make_ui(self.ws).ask_trust(self.ws, broad=False), "no")
 
 
 class CommandRegistryTests(unittest.TestCase):
