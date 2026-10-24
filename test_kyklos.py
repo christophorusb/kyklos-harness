@@ -40,7 +40,10 @@ class FakeClient:
         self.calls.append(json.loads(json.dumps(kwargs["messages"])))  # snapshot
         self.used_tools.append("tools" in kwargs)
         self.offered.append({t["function"]["name"] for t in kwargs.get("tools", [])})
-        return self.replies.pop(0)
+        item = self.replies.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
 
 
 def assert_tool_results_paired(test, messages):
@@ -658,6 +661,81 @@ class SessionAndUndoTests(unittest.TestCase):
         self.assertTrue(restored.plan_mode)
         self.assertEqual(restored.turn_log, [("what is in existing.py?", "existing.py has v = 1.")])
         self.assertEqual(restored.usage_mark, (321, 2))
+
+
+class TransientAPIError(Exception):
+    def __init__(self, status_code: int, message: str = "rate limited"):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class RetryAndObserverTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        (self.ws / "app.py").write_text("x = 1\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_retries_transient_429_and_503_with_exponential_backoff(self):
+        sleeps, events = [], []
+        client = FakeClient([
+            TransientAPIError(429, "rate limit"),
+            TransientAPIError(503, "overloaded"),
+            reply(content="Recovered."),
+        ])
+        agent = Agent(
+            client, "fake", self.ws,
+            on_event=lambda ev, **kw: events.append((ev, kw)),
+            sleep=sleeps.append,
+        )
+        self.assertEqual(agent.send("hello"), "Recovered.")
+        self.assertEqual(sleeps, [1.0, 2.0])
+        self.assertEqual([e[0] for e in events], ["retry", "retry"])
+        self.assertEqual(events[0][1]["attempt"], 1)
+        self.assertEqual(events[1][1]["attempt"], 2)
+
+    def test_non_retryable_error_raises_immediately(self):
+        sleeps = []
+        client = FakeClient([TransientAPIError(401, "invalid api key")])
+        agent = Agent(client, "fake", self.ws, on_event=None, sleep=sleeps.append)
+        with self.assertRaises(TransientAPIError):
+            agent.send("hello")
+        self.assertEqual(sleeps, [])
+
+    def test_custom_observer_receives_events_without_printing_to_stdout(self):
+        import contextlib
+        import io
+        events = []
+        client = FakeClient([
+            reply(content="Checking.", tool_calls=[
+                tool_call("t1", "task", description="search app", prompt="read app.py"),
+            ]),
+            reply(tool_calls=[tool_call("s1", "read_file", path="app.py")]),
+            reply(content="app.py has x = 1."),
+            reply(content="All done."),
+        ])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            agent = Agent(
+                client, "fake", self.ws,
+                on_event=lambda ev, depth=0, **kw: events.append((ev, depth, kw)),
+            )
+            answer = agent.send("inspect app.py")
+
+        self.assertEqual(answer, "All done.")
+        self.assertEqual(buf.getvalue(), "")  # zero direct print() calls inside Agent
+        kinds = [(ev, depth) for ev, depth, _ in events]
+        self.assertEqual(kinds, [
+            ("thought", 0),
+            ("tool_call", 0),
+            ("subagent_start", 1),
+            ("tool_call", 1),
+            ("tool_result", 1),
+            ("subagent_end", 1),
+            ("tool_result", 0),
+        ])
 
 
 class HelperTests(unittest.TestCase):

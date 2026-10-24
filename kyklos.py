@@ -15,9 +15,10 @@ import platform
 import re
 import sys
 import textwrap
+import time
 from pathlib import Path
 
-from openai import OpenAI
+from openai import APIConnectionError, APITimeoutError, InternalServerError, OpenAI, RateLimitError
 
 from tools import SAFE_TOOLS, SCHEMAS, SHELL_NAME, ToolError, Tools, command_touches_secret, probe_commands
 
@@ -26,6 +27,9 @@ if hasattr(sys.stdout, "reconfigure"):
 
 MAX_STEPS = 50  # hard stop so a confused model can't loop forever
 MAX_INSTRUCTIONS_CHARS = 20_000
+MAX_API_RETRIES = 3
+RETRY_BASE_DELAY = 1.0
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 # Context management: when the conversation passes COMPACT_AT of the window, compact the part
 # older than the most recent KEEP_RECENT of the window, in two stages:
@@ -304,11 +308,40 @@ def ask_permission(name: str, args: dict, always_allowed: set) -> tuple[bool, st
     return False, f"The user denied this {name} call." + (f" Reason: {reason}" if reason else "")
 
 
+def is_retryable_error(e: Exception) -> bool:
+    """True for transient rate-limit, 5xx, timeout, and connection errors."""
+    if isinstance(e, (RateLimitError, InternalServerError, APIConnectionError, APITimeoutError)):
+        return True
+    return getattr(e, "status_code", None) in RETRYABLE_STATUS_CODES
+
+
+def console_observer(event: str, depth: int = 0, **data) -> None:
+    """Default terminal renderer for Agent events. A UI can replace this callback."""
+    indent = "    " * depth
+    if event == "thought":
+        print(textwrap.indent(f"\033[2m{data['text']}\033[0m", indent))
+    elif event == "tool_call":
+        print(f"{indent}\033[36m> {data['name']}\033[0m \033[2m{data['arguments'][:200]}\033[0m")
+    elif event == "tool_result":
+        print(textwrap.indent(preview(data["result"]), indent))
+    elif event == "subagent_start":
+        print(f"{indent}\033[35m[subagent: {data['description']} ({data['mode']})]\033[0m")
+    elif event == "subagent_end":
+        print(f"{indent}\033[35m[subagent done in {data['steps']} steps]\033[0m")
+    elif event == "compact":
+        detail = (f"cleared {data['pruned']} old tool results"
+                  if data["stage"] == "pruned" else "summarized older turns")
+        print(f"{indent}\033[2m(Context compacted: {detail}, ~{data['before']:,} -> ~{data['after']:,} tokens)\033[0m")
+    elif event == "retry":
+        print(f"{indent}\033[33m(API error: {data['error']}; retrying in {data['delay']:.0f}s "
+              f"[{data['attempt']}/{data['max_attempts']}])\033[0m")
+
+
 class Agent:
     def __init__(self, client, model: str, workspace: Path, permission=ask_permission,
                  context_window: int = DEFAULT_CONTEXT_WINDOW, tool_names: set = None,
                  depth: int = 0, always_allowed: set = None, plan_mode: bool = False,
-                 before_write=None):
+                 before_write=None, on_event=console_observer, sleep=time.sleep):
         self.client = client
         self.model = model
         self.active_snapshots: dict[Path, bytes | None] | None = None
@@ -318,6 +351,8 @@ class Agent:
         self.context_window = context_window
         self.depth = depth  # 0 for the main agent, 1 for a subagent
         self.indent = "    " * depth  # subagent output is indented under the task call
+        self.on_event = on_event
+        self.sleep = sleep
         all_schemas = SCHEMAS + [TASK_SCHEMA]
         if tool_names is None:
             tool_names = {s["function"]["name"] for s in all_schemas}
@@ -327,6 +362,22 @@ class Agent:
         self.always_allowed: set[str] = always_allowed if always_allowed is not None else set()
         self.last_steps = 0
         self.reset()
+
+    def _emit(self, event: str, **data) -> None:
+        if self.on_event:
+            self.on_event(event, depth=self.depth, **data)
+
+    def _complete(self, **kwargs):
+        """Call chat.completions.create, retrying transient rate-limit, 5xx, and connection errors."""
+        for attempt in range(1, MAX_API_RETRIES + 1):
+            try:
+                return self.client.chat.completions.create(**kwargs)
+            except Exception as e:
+                if attempt >= MAX_API_RETRIES or not is_retryable_error(e):
+                    raise
+                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                self._emit("retry", attempt=attempt, max_attempts=MAX_API_RETRIES, delay=delay, error=str(e))
+                self.sleep(delay)
 
     def _record_file_snapshot(self, p: Path) -> None:
         if self.active_snapshots is not None and p not in self.active_snapshots:
@@ -449,13 +500,12 @@ class Agent:
             self.messages = [self.messages[0]] + pruned_body
             self.usage_mark = None
             if self.context_tokens() <= self.context_window * PRUNE_TARGET:
-                print(f"{self.indent}\033[2m(Context compacted: cleared {pruned} old tool results, "
-                      f"~{before:,} -> ~{self.context_tokens():,} tokens)\033[0m")
+                self._emit("compact", stage="pruned", pruned=pruned, before=before, after=self.context_tokens())
                 return True
 
         # Stage 2: summarize the old part (from the original messages, so nothing is lost to stage 1).
         transcript = render_transcript(body[:cut], max_chars=int(self.context_window * 0.5) * 4)
-        response = self.client.chat.completions.create(
+        response = self._complete(
             model=self.model,
             messages=[{"role": "system", "content": SUMMARY_PROMPT}, {"role": "user", "content": transcript}],
         )
@@ -478,7 +528,7 @@ class Agent:
             tail.insert(0, {"role": "user", "content": note})
         self.messages = [self.messages[0]] + tail
         self.usage_mark = None
-        print(f"{self.indent}\033[2m(Context compacted: summarized older turns, ~{before:,} -> ~{self.context_tokens():,} tokens)\033[0m")
+        self._emit("compact", stage="summarized", before=before, after=self.context_tokens())
         return True
 
     def run_tool(self, name: str, raw_args: str) -> str:
@@ -534,10 +584,10 @@ class Agent:
         sub = Agent(self.client, self.model, self.tools.workspace, permission=self.permission,
                     context_window=self.context_window, tool_names=SUBAGENT_TOOLS[mode],
                     depth=self.depth + 1, always_allowed=self.always_allowed,
-                    before_write=self._before_write)
-        print(f"{sub.indent}\033[35m[subagent: {description} ({mode})]\033[0m")
+                    before_write=self._before_write, on_event=self.on_event, sleep=self.sleep)
+        sub._emit("subagent_start", description=description, mode=mode)
         answer = sub.send(prompt)
-        print(f"{sub.indent}\033[35m[subagent done in {sub.last_steps} steps]\033[0m")
+        sub._emit("subagent_end", description=description, mode=mode, steps=sub.last_steps)
         return answer or "(The subagent finished without an answer.)"
 
     def send(self, user_text: str) -> str:
@@ -570,7 +620,7 @@ class Agent:
                             f"if your model supports more, or split the task into smaller steps.)")
                 if self.compact():
                     compactions += 1
-            response = self.client.chat.completions.create(
+            response = self._complete(
                 model=self.model, messages=self.messages, tools=self.schemas
             )
             usage = getattr(response, "usage", None)
@@ -596,11 +646,11 @@ class Agent:
                 return msg.content or ""
 
             if msg.content:
-                print(textwrap.indent(f"\033[2m{msg.content}\033[0m", self.indent))
+                self._emit("thought", text=msg.content)
             for tc in msg.tool_calls:
-                print(f"{self.indent}\033[36m> {tc.function.name}\033[0m \033[2m{tc.function.arguments[:200]}\033[0m")
+                self._emit("tool_call", name=tc.function.name, arguments=tc.function.arguments)
                 result = self.run_tool(tc.function.name, tc.function.arguments)
-                print(textwrap.indent(preview(result), self.indent))
+                self._emit("tool_result", name=tc.function.name, result=result)
                 self.messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
         return f"(Stopped after {MAX_STEPS} steps without a final answer.)"
