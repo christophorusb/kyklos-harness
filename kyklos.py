@@ -8,16 +8,21 @@ Run:  kyklos            (interactive REPL, via kyklos.cmd)
       kyklos "do X"     (one task, then exit)
 """
 
+import difflib
 import json
 import os
 import platform
+import re
 import sys
 import textwrap
 from pathlib import Path
 
 from openai import OpenAI
 
-from tools import SAFE_TOOLS, SCHEMAS, SHELL_NAME, ToolError, Tools, probe_commands
+from tools import SAFE_TOOLS, SCHEMAS, SHELL_NAME, ToolError, Tools, command_touches_secret, probe_commands
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 MAX_STEPS = 50  # hard stop so a confused model can't loop forever
 MAX_INSTRUCTIONS_CHARS = 20_000
@@ -177,23 +182,117 @@ def preview(text: str, max_lines: int = 6, max_chars: int = 500) -> str:
     return "\033[2m" + "\n".join(shown or ["  │ (no output)"]) + "\033[0m"
 
 
+MULTIWORD_CMDS = {"git", "npm", "pnpm", "yarn", "uv", "cargo", "go", "pip", "dotnet"}
+PYTHON_STEMS = {"py", "python", "python3"}
+UNSAFE_SHELL_RE = re.compile(r"[><`]|\$\(|(?<!\|)\|(?!\|)|(?<!&)&(?!&)")
+
+
+def format_diff(old_text: str, new_text: str, max_lines: int = 24) -> str:
+    """Colored unified diff for file edit/write permission prompts."""
+    diff = list(difflib.unified_diff(
+        old_text.splitlines(), new_text.splitlines(), lineterm="", n=2
+    ))[2:]  # skip --- and +++ headers
+    if not diff:
+        return "  \033[2m(no text changes)\033[0m"
+    styled = []
+    for line in diff[:max_lines]:
+        if line.startswith("@@"):
+            styled.append(f"  \033[36m{line}\033[0m")
+        elif line.startswith("-"):
+            styled.append(f"  \033[31m{line}\033[0m")
+        elif line.startswith("+"):
+            styled.append(f"  \033[32m{line}\033[0m")
+        else:
+            styled.append(f"  \033[2m{line}\033[0m")
+    if len(diff) > max_lines:
+        styled.append(f"  \033[2m... ({len(diff) - max_lines} more diff lines)\033[0m")
+    return "\n".join(styled)
+
+
+def suggest_prefix(command: str) -> str:
+    """Suggest a reusable command prefix for a bash call (e.g. 'git status', 'py -m unittest')."""
+    first = re.split(r"&&|\|\||[;\n|]", command)[0].strip()
+    words = first.split()
+    if not words:
+        return ""
+    stem = Path(words[0]).stem.lower()
+    if stem in PYTHON_STEMS:
+        if len(words) >= 3 and words[1] == "-m":
+            return " ".join(words[:3])
+        if len(words) >= 4 and words[1].startswith("-3") and words[2] == "-m":
+            return " ".join(words[:4])
+    if stem in MULTIWORD_CMDS and len(words) >= 2 and not words[1].startswith("-"):
+        return " ".join(words[:2])
+    return words[0]
+
+
+def command_matches_prefixes(command: str, prefixes: set[str]) -> bool:
+    """True if command is a safe command (or &&/||/; chain) where every part matches an allowed prefix."""
+    if UNSAFE_SHELL_RE.search(command):
+        return False
+    parts = [p.strip() for p in re.split(r"&&|\|\||[;\n]+", command) if p.strip()]
+    if not parts:
+        return False
+    clean = {p.strip() for p in prefixes if p.strip()}
+    return all(any(sub == p or sub.startswith(p + " ") for p in clean) for sub in parts)
+
+
+def is_auto_allowed(name: str, args: dict, always_allowed: set[str]) -> bool:
+    """True if a tool call may run without prompting the user."""
+    if name in SAFE_TOOLS:
+        return True
+    if name == "bash":
+        cmd = str(args.get("command", ""))
+        if command_touches_secret(cmd):
+            return False
+        if "bash" in always_allowed:
+            return True
+        prefixes = {r[5:] for r in always_allowed if r.startswith("bash:")}
+        return bool(prefixes) and command_matches_prefixes(cmd, prefixes)
+    return name in always_allowed
+
+
 def ask_permission(name: str, args: dict, always_allowed: set) -> tuple[bool, str]:
     """Ask the user before a risky tool runs. Returns (allowed, note_for_model)."""
     print(f"\n\033[33m? {name}\033[0m")
-    for key, value in args.items():
-        shown = str(value)
-        if len(shown) > 600:
-            shown = shown[:600] + f"... ({len(shown)} chars)"
-        print(f"  {key}: {shown}")
+    if name == "edit_file" and "old_string" in args and "new_string" in args:
+        print(f"  path: {args.get('path', '')}")
+        print(format_diff(str(args["old_string"]), str(args["new_string"])))
+    elif name == "write_file" and "content" in args:
+        print(f"  path: {args.get('path', '')}")
+        print(format_diff("", str(args["content"])))
+    else:
+        for key, value in args.items():
+            shown = str(value)
+            if len(shown) > 600:
+                shown = shown[:600] + f"... ({len(shown)} chars)"
+            print(f"  {key}: {shown}")
+
+    cmd = str(args.get("command", "")) if name == "bash" else ""
+    touches_secret = name == "bash" and command_touches_secret(cmd)
+    prefix = suggest_prefix(cmd) if name == "bash" and not touches_secret else ""
+    if touches_secret:
+        print("  \033[31m! This command references a secret file.\033[0m")
+        prompt = "  Allow once? [y]es / [n]o: "
+    elif prefix:
+        prompt = f"  Allow? [y]es / [n]o / [p]refix '{prefix}' / [a]lways for bash: "
+    else:
+        prompt = "  Allow? [y]es / [n]o / [a]lways for this tool: "
+
     try:
-        answer = input("  Allow? [y]es / [n]o / [a]lways for this tool: ").strip().lower()
+        answer = input(prompt).strip()
     except EOFError:  # no keyboard, e.g. piped or scripted run
         print("  (no input available: denied)")
         return False, f"The {name} call was denied: nobody is available to approve it. Use read-only tools instead."
-    if answer in ("a", "always"):
+    low = answer.lower()
+    if not touches_secret and low in ("a", "always"):
         always_allowed.add(name)
         return True, ""
-    if answer in ("y", "yes"):
+    if prefix and (low in ("p", "prefix") or low.startswith("p ")):
+        chosen = answer[2:].strip() if low.startswith("p ") and answer[2:].strip() else prefix
+        always_allowed.add(f"bash:{chosen}")
+        return True, ""
+    if low in ("y", "yes"):
         return True, ""
     reason = input("  Reason to tell the model (optional): ").strip()
     return False, f"The user denied this {name} call." + (f" Reason: {reason}" if reason else "")
@@ -321,7 +420,13 @@ class Agent:
             except TypeError as e:
                 return f"Error: bad arguments for task: {e}"
         fn = getattr(self.tools, name)
-        if name not in SAFE_TOOLS and name not in self.always_allowed:
+        try:
+            self.tools.check(name, args)
+        except ToolError as e:
+            return f"Error: {e}"
+        except (KeyError, TypeError) as e:
+            return f"Error: bad arguments for {name}: {e}"
+        if not is_auto_allowed(name, args, self.always_allowed):
             allowed, note = self.permission(name, args, self.always_allowed)
             if not allowed:
                 return note

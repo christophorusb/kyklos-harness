@@ -10,6 +10,7 @@ import platform
 import re
 import shutil
 import subprocess
+import textwrap
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
@@ -70,6 +71,82 @@ def is_secret_file(p: Path) -> bool:
     return p.suffix.lower() in {".pem", ".key", ".p12", ".pfx"} or name.startswith(("id_rsa", "id_ed25519", "id_ecdsa"))
 
 
+def command_touches_secret(command: str) -> bool:
+    """True if any token in a shell command looks like a secret file path (e.g. .env, *.pem, id_rsa)."""
+    for token in re.split(r'[\s;|&><=,"\'()`]+', command):
+        cleaned = token.rstrip("*?")
+        if cleaned and is_secret_file(Path(cleaned)):
+            return True
+    return False
+
+
+def _base_indent(s: str) -> str:
+    """Leading whitespace stripped by textwrap.dedent."""
+    for raw, dedented in zip(s.splitlines(), textwrap.dedent(s).splitlines()):
+        if dedented.strip():
+            return raw[: len(raw) - len(dedented)]
+    return ""
+
+
+def _match_edit(text: str, old_string: str, new_string: str) -> tuple[str, str]:
+    """Find old_string in text (exact, trailing-space-tolerant, or indent-shifted).
+    Returns (matched_slice_in_text, adjusted_new_string) or raises ToolError."""
+    if not old_string:
+        raise ToolError("old_string must not be empty. Use write_file to create or overwrite a file.")
+    if "\r\n" not in text:
+        old_string = old_string.replace("\r\n", "\n")
+        new_string = new_string.replace("\r\n", "\n")
+
+    count = text.count(old_string)
+    if count == 1:
+        return old_string, new_string
+    if count > 1:
+        raise ToolError(f"old_string matches {count} places. Include more surrounding lines to make it unique.")
+
+    file_lines = text.splitlines(keepends=True)
+    old_lines = old_string.splitlines()
+    n = len(old_lines)
+    if n == 0 or n > len(file_lines):
+        raise ToolError("old_string not found. Re-read the file and copy the text exactly.")
+
+    def span_at(i: int) -> str:
+        span = "".join(file_lines[i : i + n])
+        if not old_string.endswith("\n") and span.endswith("\n"):
+            span = span[:-2] if span.endswith("\r\n") else span[:-1]
+        return span
+
+    # Fallback 1: ignore trailing whitespace on each line.
+    target_rstrip = [l.rstrip() for l in old_lines]
+    hits = [i for i in range(len(file_lines) - n + 1)
+            if [l.rstrip() for l in file_lines[i : i + n]] == target_rstrip]
+    if len(hits) > 1:
+        raise ToolError(f"old_string matches {len(hits)} places. Include more surrounding lines to make it unique.")
+    if len(hits) == 1:
+        return span_at(hits[0]), new_string
+
+    # Fallback 2: ignore uniform leading indentation offset (re-indenting new_string to match the file).
+    target_dedent = [l.rstrip() for l in textwrap.dedent(old_string).splitlines()]
+    if any(target_dedent):
+        hits = [i for i in range(len(file_lines) - n + 1)
+                if [l.rstrip() for l in textwrap.dedent("".join(file_lines[i : i + n])).splitlines()] == target_dedent]
+        if len(hits) > 1:
+            raise ToolError(f"old_string matches {len(hits)} places. Include more surrounding lines to make it unique.")
+        if len(hits) == 1:
+            span = span_at(hits[0])
+            old_ind, file_ind = _base_indent(old_string), _base_indent(span)
+            reindented = []
+            for line in new_string.splitlines(keepends=True):
+                if not line.strip():
+                    reindented.append(line)
+                elif line.startswith(old_ind):
+                    reindented.append(file_ind + line[len(old_ind):])
+                else:
+                    reindented.append(file_ind + line.lstrip(" \t"))
+            return span, "".join(reindented)
+
+    raise ToolError("old_string not found. Re-read the file and copy the text exactly.")
+
+
 class ToolError(Exception):
     """An error message meant for the model, not a crash."""
 
@@ -113,24 +190,35 @@ class Tools:
 
     def write_file(self, path: str, content: str) -> str:
         p = self._resolve(path)
+        if is_secret_file(p):
+            raise ToolError(f"Refusing to write {path}: it likely contains secrets. Ask the user to change it.")
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} chars to {path}"
 
-    def edit_file(self, path: str, old_string: str, new_string: str) -> str:
+    def _prepare_edit(self, path: str, old_string: str, new_string: str) -> tuple[Path, str, str, str]:
         p = self._resolve(path)
         if not p.is_file():
             raise ToolError(f"File not found: {path}")
         if is_secret_file(p):  # edit errors echo nothing, but keep secrets files hands-off entirely
             raise ToolError(f"Refusing to edit {path}: it likely contains secrets. Ask the user to change it.")
         text = p.read_text(encoding="utf-8")
-        count = text.count(old_string)
-        if count == 0:
-            raise ToolError("old_string not found. Re-read the file and copy the text exactly.")
-        if count > 1:
-            raise ToolError(f"old_string matches {count} places. Include more surrounding lines to make it unique.")
-        p.write_text(text.replace(old_string, new_string, 1), encoding="utf-8")
+        matched_old, adjusted_new = _match_edit(text, old_string, new_string)
+        return p, text, matched_old, adjusted_new
+
+    def edit_file(self, path: str, old_string: str, new_string: str) -> str:
+        p, text, matched_old, adjusted_new = self._prepare_edit(path, old_string, new_string)
+        p.write_text(text.replace(matched_old, adjusted_new, 1), encoding="utf-8")
         return f"Edited {path}"
+
+    def check(self, name: str, args: dict) -> None:
+        """Validate a write/edit call before asking the user for permission."""
+        if name == "write_file":
+            p = self._resolve(args["path"])
+            if is_secret_file(p):
+                raise ToolError(f"Refusing to write {args['path']}: it likely contains secrets. Ask the user to change it.")
+        elif name == "edit_file":
+            self._prepare_edit(args["path"], args["old_string"], args["new_string"])
 
     def _rel(self, p: Path) -> str:
         return p.relative_to(self.workspace).as_posix()

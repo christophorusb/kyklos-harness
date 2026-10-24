@@ -36,7 +36,7 @@ REPL commands: `/reset` clears the conversation, `/compact` summarizes it now, `
 
 The loop in `Agent.send` sends the conversation to the model, runs any tool calls it returns, appends the results, and repeats. It stops when the model answers without calling a tool, or after `MAX_STEPS`.
 
-**Tools:** `read_file` (with line numbers), `grep` (regex search across files), `glob` (find files by pattern), `write_file`, `edit_file` (exact unique string replacement), and `bash` (PowerShell on Windows, bash elsewhere). Search skips `.git`, `.venv`, `node_modules` and binary files. Each result appears as a short dimmed preview under its call.
+**Tools:** `read_file` (with line numbers), `grep` (regex search across files), `glob` (find files by pattern), `write_file`, `edit_file` (unique string replacement with trailing-whitespace and indentation-offset tolerance), and `bash` (PowerShell on Windows, bash elsewhere). Search skips `.git`, `.venv`, `node_modules` and binary files. Each result appears as a short dimmed preview under its call.
 
 **Subagents:** the `task` tool hands a self-contained job to a fresh `Agent` with an empty context. Only its final answer comes back, so a long search costs the main conversation one tool result instead of every file read. Subagent output is indented under the `task` call.
 - `explore` mode (default) has only `read_file`, `grep` and `glob`, so it never asks for permission.
@@ -56,9 +56,9 @@ The step the model is working on is always kept whole, and a tool call is never 
 **Environment awareness:** at startup Kyklos runs `--version` on common commands (`py`, `python`, `node`, `git`…). It tells the model which ones work and which don't, so the model doesn't waste calls finding out.
 
 **Safety:**
-- `read_file`, `grep` and `glob` run without asking. Every other tool asks first: `y` allows once, `a` allows that tool for the rest of the session, and `n` denies it and sends your reason back to the model.
+- `read_file`, `grep` and `glob` run without asking. Every other tool asks first (after validating paths and edits, and showing a colored unified diff for `edit_file` / `write_file`): `y` allows once, `p` (or `p <prefix>`) allows safe `bash` commands matching that prefix (`git status`, `py -m unittest`), `a` allows that tool for the rest of the session, and `n` denies it and sends your reason back to the model.
 - Paths can't leave the workspace.
-- Secret files can't be read or edited: `.env` and `.env.*` (except `.env.example`, `.sample`, `.template`), `*.pem`, `*.key`, `*.p12`, `*.pfx` and `id_rsa*`-style SSH keys. `grep` skips them too. `bash` could still `cat` them, but only after you approve the command.
+- Secret files can't be read, written or edited: `.env` and `.env.*` (except `.env.example`, `.sample`, `.template`), `*.pem`, `*.key`, `*.p12`, `*.pfx` and `id_rsa*`-style SSH keys. `grep` skips them too. `bash` commands that reference a secret file always ask for one-time approval, even if `bash` or a prefix was allowed for the session.
 - Tool output is truncated to 20k characters, and each turn is capped at 50 steps.
 - Ctrl+C during a turn gives any unfinished tool call an "Interrupted" result, so the conversation stays valid for the next request.
 
@@ -75,10 +75,9 @@ Errors such as a bad path, an ambiguous edit, a timeout, or invalid JSON go back
 Roughly in order of how much each one helps:
 
 1. **Streaming output**, so you can watch the answer being written (`stream=True`).
-2. **Saved permission rules:** allow `bash` by command prefix (`py `, `git status`) instead of "always for this tool".
-3. **Plan mode:** a read-only tool set for exploring and proposing before changing anything.
-4. **Skills:** list `skills/*/SKILL.md` names and descriptions in the prompt, and load a full file only when the model asks for it.
-5. **Parallel explore subagents** (they're read-only, so they can safely run at the same time), and a cheaper model for subagents.
-6. **Session save and resume:** write conversations to JSONL.
-7. **MCP client, hooks, web fetch.**
-8. **A sandbox:** run `bash` inside Docker or a git worktree.
+2. **Plan mode:** a read-only tool set for exploring and proposing before changing anything.
+3. **Skills:** list `skills/*/SKILL.md` names and descriptions in the prompt, and load a full file only when the model asks for it.
+4. **Parallel explore subagents** (they're read-only, so they can safely run at the same time), and a cheaper model for subagents.
+5. **Session save and resume:** write conversations to JSONL.
+6. **MCP client, hooks, web fetch.**
+7. **A sandbox:** run `bash` inside Docker or a git worktree.

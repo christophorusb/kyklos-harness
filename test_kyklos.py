@@ -199,6 +199,33 @@ class SecretFileTests(unittest.TestCase):
             self.tools.edit_file(".env", "sk-super-secret", "x")
         self.assertIn("sk-super-secret", (self.ws / ".env").read_text())
 
+    def test_write_file_refuses_secret_files(self):
+        from tools import ToolError
+        for name in (".env", ".env.production", "id_rsa"):
+            with self.assertRaises(ToolError):
+                self.tools.write_file(name, "overwritten")
+        self.assertIn("sk-super-secret", (self.ws / ".env").read_text())
+
+    def test_bash_secret_guard_forces_permission_even_when_bash_always_allowed(self):
+        asked = []
+
+        def record_and_deny(name, args, always):
+            asked.append((name, args["command"]))
+            return False, "Denied secret access."
+
+        client = FakeClient([
+            reply(tool_calls=[
+                tool_call("1", "bash", command="echo safe"),
+                tool_call("2", "bash", command="cat .env.example"),
+                tool_call("3", "bash", command="cat .env"),
+                tool_call("4", "bash", command="Get-Content config/.env.local"),
+            ]),
+            reply(content="Done."),
+        ])
+        agent = Agent(client, "fake", self.ws, permission=record_and_deny, always_allowed={"bash"})
+        agent.send("run commands")
+        self.assertEqual(asked, [("bash", "cat .env"), ("bash", "Get-Content config/.env.local")])
+
 
 class AgentsMdTests(unittest.TestCase):
     def test_agents_md_goes_into_system_prompt(self):
@@ -440,6 +467,94 @@ class SubagentTests(unittest.TestCase):
         agent.repair_after_interrupt()
         results = {m["tool_call_id"]: m["content"] for m in agent.messages if m["role"] == "tool"}
         self.assertEqual(results, {"a": "ok", "b": "Interrupted by the user."})
+
+
+class EditAndPermissionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        self.tools = Agent(FakeClient([]), "fake", self.ws).tools
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_edit_file_ignores_trailing_whitespace_differences(self):
+        (self.ws / "a.py").write_text("def f():   \n    return 1  \n")
+        self.tools.edit_file("a.py", "def f():\n    return 1", "def f():\n    return 2")
+        self.assertEqual((self.ws / "a.py").read_text(), "def f():\n    return 2\n")
+
+    def test_edit_file_matches_shifted_indentation_and_reindents_replacement(self):
+        (self.ws / "cls.py").write_text("class C:\n    def m(self):\n        if True:\n            return 1\n")
+        # Model omits class-level 4-space indentation in both old_string and new_string
+        self.tools.edit_file(
+            "cls.py",
+            "def m(self):\n    if True:\n        return 1",
+            "def m(self):\n    if True:\n        return 2",
+        )
+        self.assertEqual(
+            (self.ws / "cls.py").read_text(),
+            "class C:\n    def m(self):\n        if True:\n            return 2\n",
+        )
+
+    def test_edit_file_rejects_empty_old_string(self):
+        from tools import ToolError
+        (self.ws / "a.py").write_text("x = 1\n")
+        with self.assertRaises(ToolError):
+            self.tools.edit_file("a.py", "", "x = 2\n")
+
+    def test_invalid_edit_or_secret_fails_without_prompting_permission(self):
+        (self.ws / "a.py").write_text("x = 1\n")
+        (self.ws / ".env").write_text("SECRET=1\n")
+        client = FakeClient([
+            reply(tool_calls=[
+                tool_call("1", "edit_file", path="a.py", old_string="not_there", new_string="y = 2"),
+                tool_call("2", "edit_file", path=".env", old_string="SECRET=1", new_string="SECRET=2"),
+                tool_call("3", "write_file", path=".env", content="SECRET=2"),
+                tool_call("4", "write_file", path="../escape.txt", content="bad"),
+            ]),
+            reply(content="Failed."),
+        ])
+        agent = Agent(client, "fake", self.ws, permission=lambda *a: self.fail("invalid call must not prompt"))
+        agent.send("try bad edits")
+        results = [m["content"] for m in client.calls[-1] if m["role"] == "tool"]
+        self.assertIn("old_string not found", results[0])
+        self.assertIn("Refusing to edit .env", results[1])
+        self.assertIn("Refusing to write .env", results[2])
+        self.assertIn("outside the workspace", results[3])
+
+    def test_bash_prefix_permission_allows_matching_commands_and_chains_only(self):
+        from kyklos import is_auto_allowed, suggest_prefix
+        self.assertEqual(suggest_prefix("git status -s"), "git status")
+        self.assertEqual(suggest_prefix("py -m unittest test_kyklos -v"), "py -m unittest")
+        self.assertEqual(suggest_prefix("pytest -q"), "pytest")
+
+        allowed = {"bash:git status", "bash:py -m unittest"}
+        self.assertTrue(is_auto_allowed("bash", {"command": "git status"}, allowed))
+        self.assertTrue(is_auto_allowed("bash", {"command": "git status -s"}, allowed))
+        self.assertTrue(is_auto_allowed("bash", {"command": "git status && py -m unittest -v"}, allowed))
+        # Different subcommand, chained unknown command, redirection, pipe, or subshell must prompt:
+        self.assertFalse(is_auto_allowed("bash", {"command": "git push"}, allowed))
+        self.assertFalse(is_auto_allowed("bash", {"command": "git status && rm -rf ."}, allowed))
+        self.assertFalse(is_auto_allowed("bash", {"command": "git status > out.txt"}, allowed))
+        self.assertFalse(is_auto_allowed("bash", {"command": "git status | sh"}, allowed))
+        self.assertFalse(is_auto_allowed("bash", {"command": "git status $(whoami)"}, allowed))
+
+    def test_ask_permission_prefix_option_saves_rule(self):
+        import builtins
+        from unittest import mock
+        from kyklos import ask_permission, is_auto_allowed
+        always = set()
+        with mock.patch.object(builtins, "input", return_value="p"):
+            ok, _ = ask_permission("bash", {"command": "git status -s"}, always)
+        self.assertTrue(ok)
+        self.assertIn("bash:git status", always)
+        self.assertTrue(is_auto_allowed("bash", {"command": "git status --porcelain"}, always))
+
+    def test_format_diff_shows_removed_and_added_lines(self):
+        from kyklos import format_diff
+        out = format_diff("a = 1\nb = 2\n", "a = 1\nb = 3\n")
+        self.assertIn("-b = 2", out)
+        self.assertIn("+b = 3", out)
 
 
 class HelperTests(unittest.TestCase):
