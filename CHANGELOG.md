@@ -4,7 +4,7 @@ All notable changes to **Kyklos** since the repository was initialized on 2026-1
 
 ---
 
-## Unreleased — Narrow Interpreter Prefixes & a Protected `.git/` (2026-10-24)
+## `0309fd2` — Narrow Interpreter Prefixes & a Protected `.git/` (2026-10-24)
 
 Two safety gaps seen in a real session.
 
