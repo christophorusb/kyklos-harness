@@ -4,7 +4,7 @@ All notable changes to **Kyklos** since the repository was initialized on 2026-1
 
 ---
 
-## Unreleased — Run Anywhere & Folder Trust (2026-10-24)
+## `a6513f8` — Run Anywhere, Folder Trust & Audit-Session UI Fixes (2026-10-24)
 
 - **Folder trust (`kyklos.py`, `ui.py`):**
   - Added `resolve_trust`, called in `main()` **before** the `Agent` is created, so an untrusted folder's `AGENTS.md` never reaches the model's instructions.
