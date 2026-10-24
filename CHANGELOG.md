@@ -4,6 +4,22 @@ All notable changes to **Kyklos** since the repository was initialized on 2026-1
 
 ---
 
+## Unreleased — Narrow Interpreter Prefixes & a Protected `.git/` (2026-10-24)
+
+Two safety gaps seen in a real session.
+
+- **Interpreter prefixes name what they run (`kyklos.py`):**
+  - For `py -3 "C:/Users/me/.wf/wf.py" check`, `suggest_prefix` offered `py`, a rule that would have auto-approved any Python for the rest of the session. Interpreters (`py`, `python`, `node`, `deno`, `bun`, `ruby`, `perl`, `php`, `pwsh`, `powershell`, `bash`, `sh`) now get a prefix through their script or module: `py -3 "C:/Users/me/.wf/wf.py"`, `py -3.11 -m unittest`, `node --no-warnings scripts/dev.mjs`.
+  - Inline code (`-c`, `-e`, `-p`, `-r`, `--eval`, `--print`, `-Command`, `-EncodedCommand`) and interpreter-only commands (`py`, `node --version`) get no prefix.
+  - Quoted script paths stay whole (`TOKEN_RE`), so the saved rule matches the same script again. `npx` joins the two-word commands (`npx tsc`).
+- **No writes inside `.git/` (`tools.py`):**
+  - Added `Tools._resolve_writable`: `write_file`, `edit_file` and the pre-permission `check` refuse any path with a `.git` component (any depth or case, including nested repositories). The error points the model to git commands and `git commit -F <file>` with a message file outside `.git/`. In the session, the model had written `.git/COMMIT_EDITMSG_forma.tmp`.
+  - Names like `.gitignore`, `.github/` and `my.git/` stay writable.
+- **Docs (`README.md`):** both rules are in the Safety section.
+- **Tests:** added an interpreter-prefix test (using the session's command, inline-code cases, and rule matching) and `GitDirTests` (3 tests: refused writes and edits incl. nested and upper-case `.GIT`, similar names allowed, refusal before any permission prompt) (98 total offline tests).
+
+---
+
 ## `0d14e50` — Full-Width Layout & Kyklos Boxes (2026-10-24)
 
 - **Full terminal width (`ui.py`):** removed the 100-column cap (`MAX_WIDTH`). Tool-line summaries, panels and answers now reach the right edge of the terminal, and the width is re-read on every line, so the layout follows window resizes.

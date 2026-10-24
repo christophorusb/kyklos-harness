@@ -247,6 +247,48 @@ class SecretFileTests(unittest.TestCase):
         self.assertEqual(asked, [("bash", "cat .env"), ("bash", "Get-Content config/.env.local")])
 
 
+class GitDirTests(unittest.TestCase):
+    """write_file / edit_file must never touch git's own database."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        (self.ws / ".git").mkdir()
+        (self.ws / ".git" / "config").write_text("[core]\n")
+        (self.ws / "sub" / ".git").mkdir(parents=True)  # a nested repository
+        self.tools = Agent(FakeClient([]), "fake", self.ws).tools
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_writes_and_edits_inside_git_are_refused(self):
+        from tools import ToolError
+        # Seen in a real session: the model wrote .git/COMMIT_EDITMSG_forma.tmp.
+        for call in (lambda: self.tools.write_file(".git/COMMIT_EDITMSG_forma.tmp", "msg"),
+                     lambda: self.tools.write_file("sub/.git/hooks/pre-commit", "evil"),
+                     lambda: self.tools.write_file(".GIT/config", "x"),  # case-insensitive filesystems
+                     lambda: self.tools.edit_file(".git/config", "[core]", "[evil]"),
+                     lambda: self.tools.check("write_file", {"path": ".git/x", "content": ""})):
+            with self.assertRaises(ToolError) as caught:
+                call()
+            self.assertIn("git commit -F", str(caught.exception))
+        self.assertFalse((self.ws / ".git" / "COMMIT_EDITMSG_forma.tmp").exists())
+        self.assertEqual((self.ws / ".git" / "config").read_text(), "[core]\n")
+
+    def test_similar_names_are_still_writable(self):
+        for path in (".gitignore", ".github/workflows/ci.yml", "docs/.git-notes.md", "my.git/x"):
+            self.tools.write_file(path, "ok")
+            self.assertEqual((self.ws / path).read_text(), "ok")
+
+    def test_refused_before_asking_permission(self):
+        client = FakeClient([
+            reply(tool_calls=[tool_call("1", "write_file", path=".git/COMMIT_EDITMSG", content="x")]),
+            reply(content="OK."),
+        ])
+        Agent(client, "fake", self.ws, permission=lambda *a: self.fail("should fail before prompting")).send("go")
+        self.assertIn("git's own database", [m for m in client.calls[-1] if m["role"] == "tool"][-1]["content"])
+
+
 class AgentsMdTests(unittest.TestCase):
     def test_agents_md_goes_into_system_prompt(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -571,6 +613,26 @@ class EditAndPermissionTests(unittest.TestCase):
         self.assertEqual(suggest_prefix("npm audit --omit=dev 2>&1"), "npm audit")
         self.assertEqual(suggest_prefix(r".\scripts\build.ps1 -Release"), r".\scripts\build.ps1")
         self.assertEqual(suggest_prefix("Get-ChildItem -Recurse"), "Get-ChildItem")
+
+    def test_interpreter_prefixes_name_what_they_run(self):
+        from kyklos import command_matches_prefixes, suggest_prefix
+        # Seen in a real session: this offered 'py', which would have allowed any Python at all.
+        self.assertEqual(suggest_prefix('py -3 "C:/Users/me/.wf/wf.py" check --staged 2>&1 | Select-Object -Last 20'),
+                         'py -3 "C:/Users/me/.wf/wf.py"')
+        self.assertEqual(suggest_prefix("py -3.11 -m unittest test_x"), "py -3.11 -m unittest")
+        self.assertEqual(suggest_prefix("python tools/build.py --release"), "python tools/build.py")
+        self.assertEqual(suggest_prefix("node --no-warnings scripts/dev.mjs"), "node --no-warnings scripts/dev.mjs")
+        self.assertEqual(suggest_prefix("powershell -NoProfile -File .\\x.ps1"), "powershell -NoProfile -File .\\x.ps1")
+        self.assertEqual(suggest_prefix("npx tsc --noEmit"), "npx tsc")
+        # Inline code, or no script at all, gets no rule.
+        for command in ('py -c "import os; os.remove(\'x\')"', "node -e \"require('fs')\"", "py", "py -3",
+                        'powershell -Command "Remove-Item x"', 'bash -c "rm -rf x"', "node --version"):
+            self.assertEqual(suggest_prefix(command), "", command)
+        # The saved rule matches the same script again, and not other Python.
+        rule = {'py -3 "C:/Users/me/.wf/wf.py"'}
+        self.assertTrue(command_matches_prefixes('py -3 "C:/Users/me/.wf/wf.py" check --all', rule))
+        self.assertFalse(command_matches_prefixes("py -3 evil.py", rule))
+        self.assertFalse(command_matches_prefixes('py -c "print(1)"', rule))
 
     def test_ask_permission_prefix_option_saves_rule(self):
         import builtins

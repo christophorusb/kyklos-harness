@@ -197,7 +197,7 @@ def preview(text: str, max_lines: int = 6, max_chars: int = 500) -> str:
     return "\033[2m" + "\n".join(shown or ["  │ (no output)"]) + "\033[0m"
 
 
-MULTIWORD_CMDS = {"git", "npm", "pnpm", "yarn", "uv", "cargo", "go", "pip", "dotnet"}
+MULTIWORD_CMDS = {"git", "npm", "npx", "pnpm", "yarn", "uv", "cargo", "go", "pip", "dotnet"}
 PYTHON_STEMS = {"py", "python", "python3"}
 UNSAFE_SHELL_RE = re.compile(r"[><`]|\$\(|(?<!\|)\|(?!\|)|(?<!&)&(?!&)")
 
@@ -229,23 +229,43 @@ SHELL_KEYWORDS = {"if", "else", "elseif", "try", "catch", "finally", "for", "for
 COMMAND_WORD_RE = re.compile(r"^[A-Za-z0-9_.\\/:-]+$")
 
 
+# Interpreters run whatever they're given, so a rule for one must name *what* it runs:
+# 'py -3 tools/build.py' or 'node scripts/dev.mjs', never just 'py' (that would allow any Python).
+INTERPRETERS = PYTHON_STEMS | {"node", "deno", "bun", "ruby", "perl", "php", "pwsh", "powershell", "bash", "sh"}
+INLINE_CODE_FLAGS = {"-c", "-e", "-p", "-r", "--eval", "--print", "-command", "-encodedcommand"}
+TOKEN_RE = re.compile(r'"[^"]*"|\'[^\']*\'|\S+')  # words, keeping quoted paths whole
+
+
+def _interpreter_prefix(tokens: list[str]) -> str:
+    """'py -3 "C:/x/wf.py" check' -> 'py -3 "C:/x/wf.py"', 'py -m unittest x' -> 'py -m unittest'.
+    Inline code (-c, -e, -Command …) or no script at all gets no prefix."""
+    is_python = Path(tokens[0]).stem.lower() in PYTHON_STEMS
+    i = 1
+    while i < len(tokens) and tokens[i].startswith("-"):
+        flag = tokens[i].lower()
+        if flag in INLINE_CODE_FLAGS:
+            return ""
+        if flag == "-m" and is_python:
+            return " ".join(tokens[:i + 2]) if i + 1 < len(tokens) else ""
+        i += 1  # options like -3, -3.11, -u, -NoProfile, --no-warnings
+    return " ".join(tokens[:i + 1]) if i < len(tokens) else ""
+
+
 def suggest_prefix(command: str) -> str:
     """Suggest a reusable command prefix for a bash call (e.g. 'git status', 'py -m unittest').
     Returns "" when the command doesn't start with a program name (a quoted string, a variable,
-    a script block or a keyword like `if`), since a rule like '"---' would be meaningless."""
+    a script block or a keyword like `if`), since a rule like '"---' would be meaningless, and for
+    interpreters running inline code or no script."""
     first = re.split(r"&&|\|\||[;\n|]", command)[0].strip()
-    words = first.split()
-    if not words or not COMMAND_WORD_RE.match(words[0]) or words[0].lower() in SHELL_KEYWORDS:
+    tokens = TOKEN_RE.findall(first)
+    if not tokens or not COMMAND_WORD_RE.match(tokens[0]) or tokens[0].lower() in SHELL_KEYWORDS:
         return ""
-    stem = Path(words[0]).stem.lower()
-    if stem in PYTHON_STEMS:
-        if len(words) >= 3 and words[1] == "-m":
-            return " ".join(words[:3])
-        if len(words) >= 4 and words[1].startswith("-3") and words[2] == "-m":
-            return " ".join(words[:4])
-    if stem in MULTIWORD_CMDS and len(words) >= 2 and not words[1].startswith("-"):
-        return " ".join(words[:2])
-    return words[0]
+    stem = Path(tokens[0]).stem.lower()
+    if stem in INTERPRETERS:
+        return _interpreter_prefix(tokens)
+    if stem in MULTIWORD_CMDS and len(tokens) >= 2 and not tokens[1].startswith("-"):
+        return " ".join(tokens[:2])
+    return tokens[0]
 
 
 def command_matches_prefixes(command: str, prefixes: set[str]) -> bool:

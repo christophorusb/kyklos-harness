@@ -213,6 +213,16 @@ class Tools:
             raise ToolError(f"Path {path!r} is outside the workspace {self.workspace}")
         return p
 
+    def _resolve_writable(self, path: str, verb: str) -> Path:
+        """Like _resolve, but also refuses anything inside a .git directory (any level, any case):
+        it's git's own database, and a direct write there can corrupt the repository."""
+        p = self._resolve(path)
+        if any(part.lower() == ".git" for part in p.relative_to(self.workspace).parts):
+            raise ToolError(f"Refusing to {verb} {path}: files inside .git/ are git's own database, and changing "
+                            "them directly can corrupt the repository. Use git commands with bash instead; for a "
+                            "commit message, write it to a file outside .git/ and run `git commit -F <file>`.")
+        return p
+
     @staticmethod
     def _truncate(text: str) -> str:
         if len(text) <= MAX_OUTPUT_CHARS:
@@ -239,7 +249,7 @@ class Tools:
         return self._truncate(numbered or "(empty file)")
 
     def write_file(self, path: str, content: str) -> str:
-        p = self._resolve(path)
+        p = self._resolve_writable(path, "write")
         if is_secret_file(p):
             raise ToolError(f"Refusing to write {path}: it likely contains secrets. Ask the user to change it.")
         if self.before_write:
@@ -249,7 +259,7 @@ class Tools:
         return f"Wrote {len(content)} chars to {path}"
 
     def _prepare_edit(self, path: str, old_string: str, new_string: str) -> tuple[Path, str, str, str]:
-        p = self._resolve(path)
+        p = self._resolve_writable(path, "edit")
         if not p.is_file():
             raise ToolError(f"File not found: {path}")
         if is_secret_file(p):  # edit errors echo nothing, but keep secrets files hands-off entirely
@@ -268,7 +278,7 @@ class Tools:
     def check(self, name: str, args: dict) -> None:
         """Validate a write/edit call before asking the user for permission."""
         if name == "write_file":
-            p = self._resolve(args["path"])
+            p = self._resolve_writable(args["path"], "write")
             if is_secret_file(p):
                 raise ToolError(f"Refusing to write {args['path']}: it likely contains secrets. Ask the user to change it.")
         elif name == "edit_file":
