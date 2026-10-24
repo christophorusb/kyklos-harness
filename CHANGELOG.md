@@ -4,7 +4,7 @@ All notable changes to **Kyklos** since the repository was initialized on 2026-1
 
 ---
 
-## Unreleased — Repository Folder Renamed to kyklos-harness (2026-10-24)
+## `f23f9c5` — Repository Folder Renamed to kyklos-harness (2026-10-24)
 
 The repository folder moved from `Harness Playground` to `kyklos-harness`. The rename itself happened outside git (the user PATH entry, the venv's `activate` scripts and `pyvenv.cfg`, and `~/.kyklos/projects/` were updated by hand); this commit updates the docs that named the old folder.
 
