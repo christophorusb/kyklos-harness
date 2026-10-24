@@ -4,7 +4,7 @@ All notable changes to **Kyklos** since the repository was initialized on 2026-1
 
 ---
 
-## Unreleased — No More Frozen Commands (2026-10-24)
+## `53d9105` — No More Frozen Commands (2026-10-24)
 
 Fixes the CLI looking stuck after answering `y` to an "Allow bash?" prompt. There were two causes, which made each other worse.
 
