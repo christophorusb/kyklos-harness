@@ -4,7 +4,7 @@ All notable changes to **Kyklos** since the repository was initialized on 2026-1
 
 ---
 
-## Unreleased — Automatic Context Window Detection (2026-10-24)
+## `aaf6ee9` — Automatic Context Window Detection (2026-10-24)
 
 - **Context window detection (`kyklos.py`):**
   - Added `detect_context_window`, which asks Ollama cloud's `/api/show` for the model's `context_length` at startup (5 s timeout; any failure falls back quietly). Only `ollama.com` base URLs are asked, so the API key is never sent anywhere else. Local Ollama is skipped on purpose: it reports the trained maximum, while the server runs with a smaller `num_ctx` unless configured.
