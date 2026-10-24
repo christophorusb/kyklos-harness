@@ -186,6 +186,16 @@ def expand_braces(pattern: str) -> list[str]:
     return [pattern]
 
 
+UNIX_TOOLS = ["grep", "sed", "awk", "head", "tail"]
+
+
+@lru_cache(maxsize=1)
+def missing_unix_tools() -> list[str]:
+    """Unix text tools that models reach for but plain PowerShell doesn't have (unless, say,
+    Git for Windows put them on PATH). Empty on other systems."""
+    return [t for t in UNIX_TOOLS if not shutil.which(t)] if IS_WINDOWS else []
+
+
 class ToolError(Exception):
     """An error message meant for the model, not a crash."""
 
@@ -322,14 +332,21 @@ class Tools:
         return "\n".join(files) or "No files matched."
 
     def bash(self, command: str, timeout: int = 120) -> str:
-        argv = ["powershell", "-NoProfile", "-Command", command] if IS_WINDOWS else ["bash", "-c", command]
+        # Commands get no keyboard. Their output is captured, so a prompt ("Confirm", Read-Host, npx's
+        # "Ok to proceed?", git asking for a password) would be invisible and hang until the timeout.
+        # Without stdin, and with PowerShell's -NonInteractive, such prompts fail at once with an error
+        # the model can read and react to.
+        argv = (["powershell", "-NoProfile", "-NonInteractive", "-Command", command] if IS_WINDOWS
+                else ["bash", "-c", command])
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}  # git fails instead of asking for credentials
         try:
             r = subprocess.run(
-                argv, cwd=self.workspace, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=timeout,
+                argv, cwd=self.workspace, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                encoding="utf-8", errors="replace", timeout=timeout, env=env,
             )
         except subprocess.TimeoutExpired:
-            raise ToolError(f"Command timed out after {timeout}s")
+            raise ToolError(f"Command timed out after {timeout}s. If it waits for input, pass the answer as "
+                            "a flag instead (e.g. -Force, --yes); if it's just slow, use a larger timeout.")
         out = (r.stdout or "") + (r.stderr or "")
         return self._truncate(f"exit code {r.returncode}\n{out}".rstrip())
 

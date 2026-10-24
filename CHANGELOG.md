@@ -4,6 +4,21 @@ All notable changes to **Kyklos** since the repository was initialized on 2026-1
 
 ---
 
+## Unreleased — No More Frozen Commands (2026-10-24)
+
+Fixes the CLI looking stuck after answering `y` to an "Allow bash?" prompt. There were two causes, which made each other worse.
+
+- **Commands get no keyboard (`tools.py`):**
+  - `bash` now runs with `stdin=DEVNULL`, PowerShell gets `-NonInteractive`, and `GIT_TERMINAL_PROMPT=0` is set. Previously a command that asked something ("Confirm", `Read-Host`, `npx`'s "Ok to proceed?", a git password) waited on the user's keyboard while its output, including the question, was captured and invisible, until the 120 s timeout. Now such a prompt fails in about a second with an error the model can read (verified: `Read-Host` and a confirming `Remove-Item` both exit after ~1 s, and nothing is deleted).
+  - The timeout error now suggests passing the answer as a flag (`-Force`, `--yes`) or using a larger timeout.
+- **A live running line after approval (`ui.py`):**
+  - The permission panel paused the live zone, and nothing resumed it until the command finished, so even a normal slow command (`npm install`, a test run) showed a frozen screen. Approving now resumes the live zone, showing `○ bash  $ npm test   14s` with a timer that starts at approval (`_running_row`; running entries now carry a start time). Running steps inside a subagent's tree get the same timer.
+- **Missing Unix tools named up front (`tools.py`, `kyklos.py`):**
+  - Added `missing_unix_tools`: on Windows, the system prompt now says "Not available in this PowerShell: grep, sed, awk, head, tail" with PowerShell equivalents (the grep tool or `Select-String`, `Get-Content -TotalCount / -Tail`, `-replace`). In a real session, the model had piped into `grep` twice and failed with `CommandNotFoundException`.
+- **Tests:** added `NoKeyboardTests` (4 tests: an input prompt fails fast, git's credential prompt is off, the timeout hint, missing tools in the prompt) and a UI test for the resumed live zone and timer (93 total offline tests).
+
+---
+
 ## `aaf6ee9` — Automatic Context Window Detection (2026-10-24)
 
 - **Context window detection (`kyklos.py`):**

@@ -114,12 +114,13 @@ Local Ollama isn't asked: it reports the model's trained maximum, but the server
 
 The step the model is working on is always kept whole, and a tool call is never separated from its result. If one turn needs more than 3 compactions, Kyklos stops with a message instead of looping: the task doesn't fit the window.
 
-**Environment awareness:** at startup Kyklos runs `--version` on common commands (`py`, `python`, `node`, `git`…). It tells the model which ones work and which don't, so the model doesn't waste calls finding out.
+**Environment awareness:** at startup Kyklos runs `--version` on common commands (`py`, `python`, `node`, `git`…). It tells the model which ones work and which don't, so the model doesn't waste calls finding out. On Windows it also names the Unix tools PowerShell lacks (`grep`, `sed`, `awk`, `head`, `tail`) and what to use instead.
 
 **Safety:**
 - `read_file`, `grep` and `glob` run without asking. Every other tool asks first (after validating paths and edits, and showing a colored unified diff for `edit_file` / `write_file`): `y` allows once, `p` (or `p <prefix>`) allows safe `bash` commands matching that prefix (`git status`, `py -m unittest`), `a` allows that tool for the rest of the session, and `n` denies it and sends your reason back to the model.
 - Paths can't leave the workspace.
 - Secret files can't be read, written or edited: `.env` and `.env.*` (except `.env.example`, `.sample`, `.template`), `*.pem`, `*.key`, `*.p12`, `*.pfx` and `id_rsa*`-style SSH keys. `grep` skips them too. `bash` commands that reference a secret file always ask for one-time approval, even if `bash` or a prefix was allowed for the session.
+- `bash` commands get no keyboard (PowerShell runs with `-NonInteractive`, and git with `GIT_TERMINAL_PROMPT=0`). A command that would stop to ask something (a "Confirm" prompt, `Read-Host`, `npx`'s "Ok to proceed?", a git password) fails at once with an error the model can read, instead of hanging invisibly until the 120-second timeout.
 - Tool output is truncated to 20k characters, and each turn is capped at 50 steps.
 - Ctrl+C during a turn gives any unfinished tool call an "Interrupted" result, so the conversation stays valid for the next request.
 

@@ -934,6 +934,50 @@ class ContextWindowTests(unittest.TestCase):
                          ["1M", "1M", "1.5M", "262k", "128k", "900"])
 
 
+class NoKeyboardTests(unittest.TestCase):
+    """Commands must never wait for keyboard input they can't get (their output is captured, so a
+    prompt would be invisible and hang until the timeout)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.tools = Agent(FakeClient([]), "fake", Path(self.tmp.name)).tools
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_command_that_asks_for_input_fails_fast_instead_of_hanging(self):
+        import time
+        from tools import IS_WINDOWS
+        start = time.monotonic()
+        result = self.tools.bash('Read-Host "Continue?"' if IS_WINDOWS else "read answer", timeout=20)
+        self.assertLess(time.monotonic() - start, 15)  # it would otherwise sit until the timeout
+        self.assertFalse(result.startswith("exit code 0"))
+        if IS_WINDOWS:
+            self.assertIn("NonInteractive", result)  # an error the model can read and react to
+
+    def test_git_never_prompts_for_credentials(self):
+        from tools import IS_WINDOWS
+        result = self.tools.bash("$env:GIT_TERMINAL_PROMPT" if IS_WINDOWS else "echo $GIT_TERMINAL_PROMPT")
+        self.assertEqual(result.splitlines()[-1].strip(), "0")
+
+    def test_timeout_message_suggests_what_to_do(self):
+        from tools import IS_WINDOWS, ToolError
+        with self.assertRaises(ToolError) as caught:
+            self.tools.bash("Start-Sleep -Seconds 5" if IS_WINDOWS else "sleep 5", timeout=1)
+        self.assertIn("pass the answer as a flag", str(caught.exception))
+
+    def test_missing_unix_tools_are_named_in_the_system_prompt(self):
+        from unittest import mock
+        import kyklos
+        with mock.patch.object(kyklos, "missing_unix_tools", return_value=["grep", "sed"]):
+            text = kyklos.describe_commands()
+        self.assertIn("Not available in this", text)
+        self.assertIn("grep, sed", text)
+        self.assertIn("Select-String", text)
+        with mock.patch.object(kyklos, "missing_unix_tools", return_value=[]):
+            self.assertNotIn("Select-String", kyklos.describe_commands())
+
+
 class HelperTests(unittest.TestCase):
     def test_permission_prompt_denies_when_no_input(self):
         import builtins

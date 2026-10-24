@@ -202,6 +202,23 @@ class AeroTurnTests(unittest.TestCase):
         self.assertIn("…", row)  # the summary is cut instead
         self.assertLessEqual(len(row.rstrip()), ui.width)
 
+    def test_approved_command_shows_as_running_with_a_timer(self):
+        import time
+        ui = make_ui(self.ws, keys=["y"])
+        ui.animate = True  # this test needs the live zone
+        ui._running[0] = ("bash", "$ npm test", time.monotonic() - 60)  # the model asked a minute ago
+        try:
+            allowed, _ = ui.permission("bash", {"command": "npm test"}, set())
+            self.assertTrue(allowed)
+            self.assertIsNotNone(ui._live)  # the live zone is back after the panel paused it
+            self.assertLess(time.monotonic() - ui._running[0][2], 5)  # the timer restarted on approval
+        finally:
+            ui.reset_transient()
+        ui._running[0] = ("bash", "$ npm test", time.monotonic() - 14)
+        left, right = ui._running_row(ui._running[0])
+        self.assertIn("bash  $ npm test", left.plain)
+        self.assertEqual(right.plain, "14s")
+
     def test_api_error_is_reported_not_raised(self):
         ui = make_ui(self.ws)
         agent = self.agent(ui, [TransientAPIError(401, "invalid api key")])

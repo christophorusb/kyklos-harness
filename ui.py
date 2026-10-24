@@ -298,7 +298,7 @@ class AeroUI:
         self.agent = None
         self._live = None
         self._thinking: dict[int, tuple] = {}   # depth -> (start time, purpose)
-        self._running: dict[int, tuple] = {}    # depth -> (tool name, label)
+        self._running: dict[int, tuple] = {}    # depth -> (tool name, label, start time)
         self._pending: dict[int, dict] = {}     # depth -> info about the call in progress
         self._subs: list[dict] = []             # running subagents, innermost last
         self._last_sub = None
@@ -359,7 +359,7 @@ class AeroUI:
     def _refresh(self) -> None:
         if not self.animate:
             return
-        needed = bool(self._thinking or self._subs or any(n != "task" for n, _ in self._running.values()))
+        needed = bool(self._thinking or self._subs or any(r[0] != "task" for r in self._running.values()))
         if needed and self._live is None:
             self._live = Live(get_renderable=self._render_live, console=self.console,
                               refresh_per_second=12, transient=True)
@@ -380,11 +380,18 @@ class AeroUI:
         self._pending.clear()
         self._subs.clear()
 
+    def _running_row(self, entry: tuple) -> tuple:
+        """(left, right) for a tool that's still running, with a timer once it passes a second,
+        so a slow command looks busy instead of frozen."""
+        name, label, start = entry
+        secs = int(time.monotonic() - start)
+        return self._tool_text(self.g["run"], "aqua", name, label), (Text(f"{secs}s", style="frost") if secs else None)
+
     def _render_live(self):
         rows = []
         running = self._running.get(0)
         if running and running[0] != "task":
-            rows.append(self._line(self._tool_text(self.g["run"], "aqua", running[0], running[1])))
+            rows.append(self._line(*self._running_row(running)))
         for i, sub in enumerate(self._subs):
             depth = i + 1
             indent = 2 + 4 * i
@@ -396,7 +403,7 @@ class AeroUI:
             items = list(sub["steps"])  # (left, right) pairs of finished steps
             now = self._running.get(depth)
             if now:
-                items.append((self._tool_text(self.g["run"], "aqua", now[0], now[1]), None))
+                items.append(self._running_row(now))
             elif depth in self._thinking:
                 items.append((Text(f"{self.g['dot']} thinking", style="frost"), None))
             for k, (left, right) in enumerate(items):
@@ -438,7 +445,7 @@ class AeroUI:
         if name in ("edit_file", "write_file"):  # capture "before" now: the tool overwrites it
             info.update(self._diff_source(name, args))
         self._pending[depth] = info
-        self._running[depth] = (name, describe_call(name, args))
+        self._running[depth] = (name, describe_call(name, args), time.monotonic())
 
     def _on_tool_result(self, depth, name="", result="", **_):
         self._running.pop(depth, None)
@@ -608,6 +615,11 @@ class AeroUI:
             how = {"y": "allowed once", "a": f"allowed {name} for this session",
                    "p": f"allowed commands starting with '{answer[2:].strip() or prefix}'"}[key]
             self.print(Text(f"{self.g['arrow']} {how}", style="frost"), indent=indent + 2)
+            # The panel paused the live zone; bring it back so the approved command shows as running,
+            # with its timer starting now rather than when the model asked.
+            if depth in self._running:
+                self._running[depth] = (*self._running[depth][:2], time.monotonic())
+            self._refresh()
             return True, ""
         reason = self.edit_line("  reason for the model (optional): ").strip()
         self.print(Text(f"{self.g['denied']} denied" + (f": {reason}" if reason else ""), style="coral"),

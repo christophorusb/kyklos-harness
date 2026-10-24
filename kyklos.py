@@ -20,7 +20,8 @@ from pathlib import Path
 
 from openai import APIConnectionError, APITimeoutError, InternalServerError, OpenAI, RateLimitError
 
-from tools import SAFE_TOOLS, SCHEMAS, SHELL_NAME, ToolError, Tools, command_touches_secret, probe_commands
+from tools import (SAFE_TOOLS, SCHEMAS, SHELL_NAME, ToolError, Tools, command_touches_secret, missing_unix_tools,
+                   probe_commands)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -131,6 +132,10 @@ def describe_commands() -> str:
         lines.append("Commands that work here: " + ", ".join(f"{c} ({v})" for c, v in working.items()) + ".")
     if broken_python:
         lines.append(f"Not available here, don't use: {', '.join(broken_python)}.")
+    missing = missing_unix_tools()
+    if missing:
+        lines.append(f"Not available in this {SHELL_NAME}: {', '.join(missing)}. Instead use the grep tool or "
+                     "Select-String, Get-Content -TotalCount / -Tail, and the -replace operator.")
     return "\n".join(lines)
 
 
