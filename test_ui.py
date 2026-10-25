@@ -11,7 +11,7 @@ from pathlib import Path
 
 from rich.console import Console
 
-from kyklos import EXIT, Agent, CommandContext, run_command, wants_aero_ui
+from kyklos import EXIT, Agent, CommandContext, __version__, run_command, wants_aero_ui
 from test_kyklos import FakeClient, TransientAPIError, reply, tool_call
 from ui import (LARGE_WORDMARK_LINES, AeroUI, describe_call, diff_counts, diff_ops, summarize_result,
                 trim_context)
@@ -334,6 +334,19 @@ class AeroTurnTests(unittest.TestCase):
         ui_ascii = AeroUI(self.ws, console=console_ascii, ascii_mode=True, theme="plain")
         rule_ascii = ui_ascii.gradient_rule(20)
         self.assertEqual(rule_ascii.plain, "-" * 20)
+
+    def test_gradient_rule_label_keeps_the_rule_s_width(self):
+        """The version sits in a gap near the right end, without making the shelf wider."""
+        ui = make_ui(self.ws)
+        plain_rule = ui.gradient_rule(38)
+        labelled = ui.gradient_rule(38, label="v9.9.9")
+        self.assertEqual(len(labelled.plain), len(plain_rule.plain), "the label must not widen the shelf")
+        self.assertTrue(labelled.plain.endswith(" v9.9.9 ─"))
+
+    def test_banner_shows_the_version_in_the_shelf(self):
+        ui = make_ui(self.ws)
+        ui.banner(self.agent(ui, []))
+        self.assertIn(f"v{__version__} ", output(ui))
 
     def test_large_wordmark_geometry(self):
         """A padded rectangle with a one-column shear: what keeps the letters sitting on a diagonal."""

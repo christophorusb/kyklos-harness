@@ -193,17 +193,23 @@ def large_wordmark():
     return "".join(out)
 
 
-def gradient_rule(length=38):  # as wide as the wordmark above it
+def gradient_rule(length=38, label=None):  # as wide as the wordmark above it
     stops = ["aqua", "sky", "deep"]
     cols = [rgb(PALETTE[s][0] if s in PALETTE else s) for s in stops]
-    out = ["  "]
-    for i in range(length):
+    tail = f" {label} " if label else ""
+    dashes = max(length - len(tail) - 1, 0) if label else length
+
+    def dash(i):
         t = i / max(length - 1, 1) * (len(cols) - 1)
         idx = min(int(t), len(cols) - 2)
         frac = t - idx
         c1, c2 = cols[idx], cols[idx + 1]
         red, green, blue = (round(c1[k] + (c2[k] - c1[k]) * frac) for k in range(3))
-        out.append(f"\033[38;2;{red};{green};{blue}m─")
+        return f"\033[38;2;{red};{green};{blue}m─"
+
+    out = ["  "] + [dash(i) for i in range(dashes)]
+    if label:  # the version rests in a gap near the right end, like the turn footer in a box border
+        out.append(f"{RESET}{c('frost', tail)}{dash(length - 1)}")
     out.append(RESET)
     return "".join(out)
 
@@ -211,7 +217,7 @@ def gradient_rule(length=38):  # as wide as the wordmark above it
 def banner():
     section("banner")
     print(large_wordmark(), end="")
-    print(gradient_rule())
+    print(gradient_rule(label="v0.1.0"))  # keep in step with __version__ in kyklos.py
     print()
     word = gradient("kyklos", ["#E8FBFF", "aqua", "sky", "deep"])  # first letter is the white glint
     meta = c("frost", "  ·  kimi-k2.7-code  ·  kyklos-harness  ·  AGENTS.md loaded")

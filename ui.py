@@ -26,7 +26,8 @@ from rich.text import Text
 from rich.theme import Theme
 
 from kyklos import (BROAD_WARNING, EXIT, NO_APPROVER_NOTE, COMMANDS, TRUST_EXPLANATION, CommandContext,
-                    apply_permission_answer, denial_note, permission_options, run_command, short_tokens)
+                    __version__, apply_permission_answer, denial_note, permission_options, run_command,
+                    short_tokens)
 
 BASH_FULL_OUTPUT_LINES = 8  # bash output up to this many lines is shown in full; longer shows the last 3
 
@@ -835,18 +836,31 @@ class AeroUI:
                 out.append("\n")
         return out
 
-    def gradient_rule(self, length: int = LARGE_WORDMARK_WIDTH) -> Text:
-        """A sleek gradient rule shelf (aqua -> sky -> deep) to underline the large wordmark."""
+    def gradient_rule(self, length: int = LARGE_WORDMARK_WIDTH, label: str = None) -> Text:
+        """A sleek gradient rule shelf (aqua -> sky -> deep) to underline the large wordmark.
+
+        `label` is set into the rule's right end, the way the turn footer sits in the answer box's
+        border: the rule keeps its full-width gradient, with the label resting in a gap near the end.
+        """
+        rule = self.g["rule"]
+        tail = f" {label} " if label else ""
+        dashes = max(length - len(tail) - 1, 0) if label else length
         if self.plain:
-            return Text(self.g["rule"] * length, style="sky")
+            return Text(rule * dashes + tail + (rule if label else ""), style="sky")
         stops = [self._c("aqua"), self._c("sky"), self._c("deep")]
-        out = Text()
         num_stops = len(stops)
-        for i in range(length):
+
+        def rule_color(i: int) -> str:
             t = i / max(length - 1, 1) * (num_stops - 1)
             idx = min(int(t), num_stops - 2)
-            color = mix(stops[idx], stops[idx + 1], t - idx)
-            out.append(self.g["rule"], style=color)
+            return mix(stops[idx], stops[idx + 1], t - idx)
+
+        out = Text()
+        for i in range(dashes):
+            out.append(rule, style=rule_color(i))
+        if label:
+            out.append(tail, style="frost")
+            out.append(rule, style=rule_color(length - 1))
         return out
 
     def kyklos_box(self, body, border: str = "sky", footer: Text = None) -> Panel:
@@ -861,7 +875,8 @@ class AeroUI:
         if self.width >= 48:
             self.print()
             self.print(self.large_wordmark(), indent=2)
-            self.print(self.gradient_rule(), indent=2)  # the shelf is exactly as wide as the wordmark
+            # the shelf is exactly as wide as the wordmark, with the version set into its right end
+            self.print(self.gradient_rule(label=f"v{__version__}"), indent=2)
             self.print()
         word = self.wordmark()
         dot = self.g["dot"]

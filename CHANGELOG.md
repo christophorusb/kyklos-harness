@@ -2,6 +2,25 @@
 
 All notable changes to **Kyklos** since the repository was initialized on 2026-10-24.
 
+Releases are versioned from `v0.1.0` onward, following [semantic versioning](https://semver.org). Pre-1.0,
+a breaking change bumps the minor. To cut one: bump `__version__` in `kyklos.py` and add a
+`## v<x.y.z> — <title> (<date>)` section here. Entries above that point predate versioning and are
+titled by commit instead.
+
+---
+
+## v0.1.0 — First Versioned Release (2026-10-25)
+
+Kyklos starts carrying a version number.
+
+- **`__version__` (`kyklos.py`):** the single source of truth, read by the UI rather than duplicated.
+- **Version in the banner (`ui.py`, `design/aero_preview.py`):** `gradient_rule` takes an optional `label`, set into the shelf's right end the way a turn footer sits in an answer box's border. The label rests in a gap, so the rule keeps its full width and gradient:
+  ```
+    ───────────────────────────── v0.1.0 ─
+  ```
+  It rides with the large wordmark, so it's hidden along with it on terminals under 48 columns.
+- **Tests (`test_ui.py`):** the shelf keeps its width when labelled, and the banner shows the current `__version__`.
+
 ---
 
 ## Startup UI: Large Rich Text Banner in Frutiger Aero Gradient (2026-10-25)
@@ -12,7 +31,7 @@ Inspired by startup displays in Antigravity CLI, Claude Code, and Hermes, the Ky
 - **Gradient rule shelf (`ui.py`):** an `aqua` → `sky` → `deep` rule underlines the wordmark before the metadata line.
 - **Narrow terminal auto-collapse:** if terminal width is less than 48 columns (e.g., small split panes or compact terminals), the banner automatically collapses to the compact inline wordmark line to prevent awkward wrapping.
 - **Fallbacks:** full support for `plain` ANSI themes (`bold sky` styling) and ASCII mode (`-` rules and ASCII-safe slant characters).
-- **Tests & Docs (`test_ui.py`, `DESIGN.md`):** added unit tests for large wordmark rendering, narrow-width collapse, and plain/ASCII fallbacks (36 tests passing in `test_ui.py`). Updated design documentation and reference mockup `design/aero_preview.py`.
+- **Tests & Docs (`test_ui.py`, `DESIGN.md`):** added unit tests for large wordmark rendering, narrow-width collapse, and plain/ASCII fallbacks (39 tests passing in `test_ui.py`). Updated design documentation and reference mockup `design/aero_preview.py`.
 
 ---
 

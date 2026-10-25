@@ -26,6 +26,9 @@ from tools import (SAFE_TOOLS, SCHEMAS, SHELL_NAME, ToolError, Tools, command_to
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+__version__ = "0.1.0"  # semver, pre-1.0: breaking changes bump the minor. Cut a release by adding
+#                        a `## v<x.y.z> — <title> (<date>)` section to CHANGELOG.md and bumping this.
+
 MAX_STEPS = 50  # hard stop so a confused model can't loop forever
 MAX_INSTRUCTIONS_CHARS = 20_000
 MAX_API_RETRIES = 3

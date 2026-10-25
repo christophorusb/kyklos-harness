@@ -69,12 +69,14 @@ Startup renders a large stylized rich-text wordmark in the Frutiger Aero gradien
     / ,<    \  / ,<  / /   / / / /\__ \
    / /| |   / / /| |/ /___/ /_/ /___/ /
   /_/ |_|  /_/_/ |_/_____/\____//____/
-  ──────────────────────────────────────
+  ───────────────────────────── v0.1.0 ─
 
  ○ kyklos  ·  kimi-k2.7-code  ·  kyklos-harness  ·  AGENTS.md loaded
    /help for commands · ctrl+c to interrupt
 ```
-When terminal width is under 48 columns (e.g. narrow split panes), the banner collapses cleanly to the compact inline wordmark line.
+The version (`__version__` in `kyklos.py`) is set into the shelf's right end, the way a turn footer sits in the answer box's border. It rests in a gap, so the rule keeps its full width and its gradient.
+
+When terminal width is under 48 columns (e.g. narrow split panes), the banner collapses cleanly to the compact inline wordmark line — and with it the shelf, so the version isn't shown there.
 
 ### Input prompt
 `❯` in sky blue, with `(plan) ❯` in plan mode. Your input stays in scrollback as typed, so it isn't echoed again.
