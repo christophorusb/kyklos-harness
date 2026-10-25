@@ -444,6 +444,10 @@ class Agent:
         # Shared with subagents, so "always allow" carries over in both directions.
         self.always_allowed: set[str] = always_allowed if always_allowed is not None else set()
         self.last_steps = 0
+        # Billed tokens for the whole session: prompt + completion over every API call, including
+        # compaction summaries and subagents. Set here rather than in reset(), so /reset clears the
+        # conversation without forgetting what has already been spent.
+        self.session_tokens = 0
         self.reset()
 
     def _emit(self, event: str, **data) -> None:
@@ -459,7 +463,9 @@ class Agent:
                 try:
                     effort = effort_request_value(self.effort)
                     extra = {"reasoning_effort": effort} if effort else {}
-                    return self.client.chat.completions.create(**kwargs, **extra)
+                    response = self.client.chat.completions.create(**kwargs, **extra)
+                    self._count_usage(response)  # every API call lands here, so the tally is complete
+                    return response
                 except Exception as e:
                     if attempt >= MAX_API_RETRIES or not is_retryable_error(e):
                         raise
@@ -468,6 +474,15 @@ class Agent:
                     self.sleep(delay)
         finally:
             self._emit("model_end", purpose=purpose)
+
+    def _count_usage(self, response) -> None:
+        """Add one call's billed tokens to the session tally. Providers that report no usage are
+        skipped rather than estimated: a spend figure that quietly guesses would be worse than none."""
+        usage = getattr(response, "usage", None)
+        if not usage:
+            return
+        self.session_tokens += ((getattr(usage, "prompt_tokens", 0) or 0)
+                                + (getattr(usage, "completion_tokens", 0) or 0))
 
     def _record_file_snapshot(self, p: Path) -> None:
         if self.active_snapshots is not None and p not in self.active_snapshots:
@@ -537,7 +552,8 @@ class Agent:
         """Write the conversation (excluding the system prompt, which is rebuilt on load) to JSONL."""
         path.parent.mkdir(parents=True, exist_ok=True)
         lines = [json.dumps(m, ensure_ascii=False) for m in self.messages[1:]]
-        meta = {"_meta": "state", "turn_log": self.turn_log, "usage_mark": self.usage_mark, "plan_mode": self.plan_mode}
+        meta = {"_meta": "state", "turn_log": self.turn_log, "usage_mark": self.usage_mark,
+                "plan_mode": self.plan_mode, "session_tokens": self.session_tokens}
         lines.append(json.dumps(meta, ensure_ascii=False))
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -553,6 +569,7 @@ class Agent:
             if obj.get("_meta") == "state":
                 self.turn_log = [tuple(t) for t in obj.get("turn_log", [])]
                 self.usage_mark = tuple(obj["usage_mark"]) if obj.get("usage_mark") else None
+                self.session_tokens = int(obj.get("session_tokens", 0))  # older sessions have none
                 self.set_plan_mode(bool(obj.get("plan_mode", False)))
             elif "role" in obj and obj["role"] != "system":
                 self.messages.append(obj)
@@ -695,6 +712,7 @@ class Agent:
                     effort=self.effort)
         sub._emit("subagent_start", description=description, mode=mode)
         answer = sub.send(prompt)
+        self.session_tokens += sub.session_tokens  # a subagent's calls are billed to this session too
         sub._emit("subagent_end", description=description, mode=mode, steps=sub.last_steps)
         return answer or "(The subagent finished without an answer.)"
 

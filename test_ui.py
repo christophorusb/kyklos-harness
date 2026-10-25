@@ -348,6 +348,34 @@ class AeroTurnTests(unittest.TestCase):
         ui.banner(self.agent(ui, []))
         self.assertIn(f"v{__version__} ", output(ui))
 
+    def test_status_line_is_pinned_in_the_live_zone_during_a_turn(self):
+        """It used to vanish on Enter, because the toolbar only exists while prompt_toolkit runs."""
+        ui = make_ui(self.ws)
+        agent = self.agent(ui, [])
+        ui.agent = agent
+        agent.session_tokens = 1500
+
+        def live_text():
+            return "".join(r.plain for r in ui._render_live().renderables)
+
+        ui._turn_active = False
+        self.assertNotIn("ctx ", live_text())
+
+        ui._turn_active = True
+        live = live_text()
+        self.assertIn("ctx ", live)
+        self.assertIn("1k used", live)
+        self.assertIn(agent.model, live)
+
+    def test_status_line_has_one_source_for_both_renderings(self):
+        """The toolbar and the live zone draw the same segments, so they cannot drift apart."""
+        ui = make_ui(self.ws)
+        agent = self.agent(ui, [])
+        agent.session_tokens = 1500
+        segments = "".join(text for _, text in ui.status_segments(agent))
+        self.assertEqual(ui.status_text(agent).plain, " " + segments)
+        self.assertIn("1k used", segments)
+
     def test_large_wordmark_geometry(self):
         """A padded rectangle with a one-column shear: what keeps the letters sitting on a diagonal."""
         self.assertEqual(len({len(line) for line in LARGE_WORDMARK_LINES}), 1, "rows must be padded alike")

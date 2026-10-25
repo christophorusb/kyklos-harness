@@ -9,6 +9,14 @@ titled by commit instead.
 
 ---
 
+## Unreleased
+
+- **The status bar stays put (`ui.py`):** it used to vanish the moment you pressed Enter and return only after the answer, because it lives in prompt_toolkit's `bottom_toolbar`, which only exists while `PromptSession.prompt()` is running. It is now also pinned to the foot of the live zone for the duration of a turn. `AeroUI.status_segments` is the one list of segments both renderings draw from, so the toolbar and the live zone can't drift apart. A `_turn_active` flag keeps the live zone up across the gaps between a tool finishing and the next model call, so the line doesn't blink.
+- **Session token use in the status bar (`kyklos.py`, `ui.py`):** `Agent.session_tokens` sums prompt + completion tokens over every API call and shows beside the context meter as `48k used`. The tally is taken in `_complete`, the one place every call passes through, so compaction summaries count too; a subagent's tokens roll into its parent when it finishes. It survives `/reset` — that clears the conversation, not what you've already spent — and round-trips through a saved session. Providers that report no `usage` are skipped rather than estimated, so the figure is either real or absent.
+- **Tests (`test_kyklos.py`, `test_ui.py`):** the tally accumulates, survives `/reset`, stays at zero without provider usage, and round-trips; the status line is absent from the live zone when idle and present during a turn, and both renderings share one source.
+
+---
+
 ## v0.1.0 — First Versioned Release (2026-10-25)
 
 Kyklos starts carrying a version number.

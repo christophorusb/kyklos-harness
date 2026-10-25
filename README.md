@@ -91,7 +91,7 @@ In a real terminal, Kyklos uses an inline UI built with [Rich](https://github.co
 - **Permission prompts** are a rounded panel with **glass diff blocks**: added lines in mint, deleted in coral, and modified lines in aqua, with the changed characters glowing. Answer with a single key: `y` / `n` / `p` / `a`. `p` lets you edit the suggested prefix before saving it, and `n` asks for an optional reason.
 - **The model's words** appear in rounded `○ kyklos` boxes (with the gradient wordmark), shaped like the permission panel. Progress notes get a subtle deep-blue border; the final answer is rendered Markdown in a sky-blue box, with `ctx 9% · 4 tools · 14s` set into its bottom border.
 - **Full width:** everything spans the whole terminal and follows window resizes.
-- **A status bar** while you type shows the model, a context meter, a PLAN badge and the workspace.
+- **A status bar** shows the model, a context meter, the session's token use, a PLAN badge and the workspace. It stays put while the model works, not just while you type.
 - **Input:** history with ↑/↓ (kept per folder in `~/.kyklos/projects/<folder-slug>/history`), and Alt+Enter for a new line.
 
 Settings:

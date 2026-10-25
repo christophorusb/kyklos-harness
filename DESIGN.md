@@ -82,11 +82,11 @@ When terminal width is under 48 columns (e.g. narrow split panes), the banner co
 `❯` in sky blue, with `(plan) ❯` in plan mode. Your input stays in scrollback as typed, so it isn't echoed again.
 
 ### Status bar
-Shown only while you type (prompt_toolkit's bottom toolbar). A sky → deep gradient rule sits above it.
+Always present: while you type it's prompt_toolkit's bottom toolbar, with a sky → deep gradient rule above it; while the model works it is pinned to the foot of the live zone instead, below the spinner and any running tools. Both are drawn from one list of segments (`AeroUI.status_segments`), so they can't drift apart.
 ```
- kimi-k2.7-code · ctx 12% ▰▰▱▱▱ ·  PLAN  · kyklos-harness · /help
+ kimi-k2.7-code · ctx 12% ▰▰▱▱▱ · 48k used ·  PLAN  · kyklos-harness · /help
 ```
-The meter's filled cells are a glint → mint gradient. The `PLAN` badge is white bold text on `deep`, and appears only in plan mode.
+The meter's filled cells are a glint → mint gradient. `48k used` is the session's billed tokens, prompt plus completion over every API call, including compaction summaries and subagents; it is hidden until the first reply, and on providers that report no usage it stays hidden rather than showing a guess. The `PLAN` badge is white bold text on `deep`, and appears only in plan mode. `/help` is on the toolbar only — during a turn it would be noise.
 
 ### Spinner line
 `◯ thinking · 12s · ctrl+c to interrupt`, in frost with the bubble animating. It's replaced in place when output arrives, and it **stops before any permission prompt**.

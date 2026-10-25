@@ -20,9 +20,11 @@ def tool_call(call_id, name, **args):
     )
 
 
-def reply(content=None, tool_calls=None, prompt_tokens=None):
+def reply(content=None, tool_calls=None, prompt_tokens=None, completion_tokens=None):
     msg = SimpleNamespace(content=content, tool_calls=tool_calls)
-    usage = SimpleNamespace(prompt_tokens=prompt_tokens) if prompt_tokens else None
+    usage = None
+    if prompt_tokens or completion_tokens:
+        usage = SimpleNamespace(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
     return SimpleNamespace(choices=[SimpleNamespace(message=msg)], usage=usage)
 
 
@@ -785,6 +787,40 @@ class SessionAndUndoTests(unittest.TestCase):
         self.assertTrue(restored.plan_mode)
         self.assertEqual(restored.turn_log, [("what is in existing.py?", "existing.py has v = 1.")])
         self.assertEqual(restored.usage_mark, (321, 2))
+        self.assertEqual(restored.session_tokens, agent.session_tokens)  # spend survives a resume
+
+
+class SessionTokenTests(unittest.TestCase):
+    """The session's billed-token tally, shown next to the context meter in the status line."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def agent(self, replies, **kw):
+        return Agent(FakeClient(replies), "fake", self.ws, permission=allow_all,
+                     on_event=lambda *a, **k: None, **kw)
+
+    def test_tally_sums_prompt_and_completion_over_every_call(self):
+        agent = self.agent([reply("one", prompt_tokens=100, completion_tokens=20),
+                            reply("two", prompt_tokens=300, completion_tokens=50)])
+        agent.send("hi")
+        self.assertEqual(agent.session_tokens, 120)
+        agent.send("again")
+        self.assertEqual(agent.session_tokens, 470)  # cumulative, not per turn
+
+    def test_reset_clears_the_conversation_but_keeps_the_spend(self):
+        agent = self.agent([reply("one", prompt_tokens=100, completion_tokens=20)])
+        agent.send("hi")
+        agent.reset()
+        self.assertEqual([m for m in agent.messages if m["role"] != "system"], [])
+        self.assertEqual(agent.session_tokens, 120)
+
+    def test_a_provider_reporting_no_usage_is_skipped_not_estimated(self):
+        agent = self.agent([reply("no usage at all")])
+        agent.send("hi")
+        self.assertEqual(agent.session_tokens, 0)
 
 
 class TransientAPIError(Exception):

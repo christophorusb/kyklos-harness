@@ -350,6 +350,7 @@ class AeroUI:
         self._pending: dict[int, dict] = {}     # depth -> info about the call in progress
         self._subs: list[dict] = []             # running subagents, innermost last
         self._last_sub = None
+        self._turn_active = False  # True from the moment you send until the answer is printed
         self.turn_tools = 0
 
     # -- layout helpers --
@@ -408,7 +409,10 @@ class AeroUI:
     def _refresh(self) -> None:
         if not self.animate:
             return
-        needed = bool(self._thinking or self._subs or any(r[0] != "task" for r in self._running.values()))
+        # `_turn_active` keeps the zone up for the whole turn, so the status line doesn't blink out
+        # in the gaps between a tool finishing and the next model call.
+        needed = bool(self._turn_active or self._thinking or self._subs
+                      or any(r[0] != "task" for r in self._running.values()))
         if needed and self._live is None:
             self._live = Live(get_renderable=self._render_live, console=self.console,
                               refresh_per_second=12, transient=True)
@@ -423,6 +427,7 @@ class AeroUI:
             self._live = None
 
     def reset_transient(self) -> None:
+        self._turn_active = False
         self._pause_live()
         self._thinking.clear()
         self._running.clear()
@@ -465,6 +470,8 @@ class AeroUI:
             rows.append(Text("  ") + Text(glyph, style=color) +
                         Text(f" {what} {self.g['dot']} {int(time.monotonic() - start)}s "
                              f"{self.g['dot']} ctrl+c to interrupt", style="frost"))
+        if self._turn_active and self.agent:  # the status line the prompt's toolbar shows while idle
+            rows.append(self.status_text(self.agent))
         return Group(*rows)
 
     # -- events from the Agent --
@@ -928,6 +935,45 @@ class AeroUI:
         parts.append((f"fg:{self._pt_color('sky')} bold", f"{self.g['prompt']} "))
         return FormattedText(parts)
 
+    def status_segments(self, agent) -> list:
+        """What the status line says, as (token, text) pairs — the single source of truth for it.
+
+        `token` is a theme color name, a literal `#hex`, `""` for unstyled, or `"plan"` for the badge.
+        The line is drawn twice from this: into prompt_toolkit's bottom toolbar while you type, and
+        into the live zone while the model works, so it stays put across a whole turn.
+        """
+        dot = ("frost", f" {self.g['dot']} ")
+        segs = [("sky", agent.model if agent else "")]
+        if agent and getattr(agent, "effort", "default") != "default":
+            segs.append(("aqua", f" {agent.effort}"))
+        if agent:
+            pct = agent.context_tokens() / agent.context_window
+            filled = min(5, max(1 if pct > 0 else 0, round(pct * 5)))
+            segs += [dot, ("", f"ctx {pct:.0%} ")]
+            for i in range(5):
+                if i < filled:
+                    segs.append(("mint" if self.plain else mix(self._c("glint"), self._c("mint"), i / 4),
+                                 self.g["on"]))
+                else:
+                    segs.append(("frost", self.g["off"]))
+            used = getattr(agent, "session_tokens", 0)
+            if used:  # nothing to show before the first reply, or if the provider reports no usage
+                segs += [dot, ("frost", f"{short_tokens(used)} used")]
+            if agent.plan_mode:
+                segs += [dot, ("plan", " PLAN ")]
+        segs += [dot, ("frost", self.workspace.name)]
+        return segs
+
+    def status_text(self, agent) -> Text:
+        """The status line as Rich text, for the live zone."""
+        out = Text(" ")
+        for token, text in self.status_segments(agent):
+            if token == "plan":
+                out.append(text, style=f"bold white on {self._c('deep')}")
+            else:
+                out.append(text, style=token)
+        return out
+
     def toolbar(self):
         from prompt_toolkit.formatted_text import FormattedText
         cols = max(shutil.get_terminal_size((100, 30)).columns - 2, 10)
@@ -941,25 +987,14 @@ class AeroUI:
                 k = min(int(t), 1)
                 parts.append((f"fg:{mix(stops[k], stops[k + 1], t - k)}", self.g["rule"]))
         parts.append(("", "\n "))
-        agent = self.agent
-        frost = f"fg:{self._pt_color('frost')}"
-        dot = ("", f" {self.g['dot']} ")
-        parts.append((f"fg:{self._pt_color('sky')}", agent.model if agent else ""))
-        if agent and getattr(agent, "effort", "default") != "default":
-            parts.append((f"fg:{self._pt_color('aqua')}", f" {agent.effort}"))
-        if agent:
-            pct = agent.context_tokens() / agent.context_window
-            filled = min(5, max(1 if pct > 0 else 0, round(pct * 5)))
-            parts += [dot, ("", f"ctx {pct:.0%} ")]
-            for i in range(5):
-                if i < filled:
-                    color = self._pt_color("mint") if self.plain else mix(self._c("glint"), self._c("mint"), i / 4)
-                    parts.append((f"fg:{color}", self.g["on"]))
-                else:
-                    parts.append((frost, self.g["off"]))
-            if agent.plan_mode:
-                parts += [dot, (f"bg:{self._pt_color('deep')} fg:#FFFFFF bold", " PLAN ")]
-        parts += [dot, (frost, self.workspace.name), dot, (frost, "/help")]
+        for token, text in self.status_segments(self.agent):
+            if token == "plan":
+                parts.append((f"bg:{self._pt_color('deep')} fg:#FFFFFF bold", text))
+            elif not token:
+                parts.append(("", text))
+            else:
+                parts.append((f"fg:{token if token.startswith('#') else self._pt_color(token)}", text))
+        parts += [("fg:" + self._pt_color("frost"), f" {self.g['dot']} /help")]
         return FormattedText(parts)
 
     def _session(self, history_path: Path):
@@ -1000,6 +1035,8 @@ class AeroUI:
 
     def turn(self, agent, text: str, default_session: Path) -> None:
         self.turn_tools = 0
+        self._turn_active = True
+        self._refresh()  # bring the status line up now, before the first model call reports anything
         start = time.monotonic()
         try:
             answer = agent.send(text)
