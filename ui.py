@@ -60,6 +60,18 @@ ASCII = {"run": "o", "done": "*", "fail": "x", "denied": "-", "compact": "~", "r
 BUBBLE = [("·", "deep"), ("∘", "sky"), ("○", "sky"), ("◯", "aqua"), ("○", "sky"), ("∘", "sky")]
 ASCII_BUBBLE = [(".", "deep"), ("o", "sky"), ("O", "aqua"), ("o", "sky")]
 
+#   KYKLOS in slant Figlet. Each row is padded to the same width, so the block reads as a
+#   rectangle here and the gradient's x axis spans it evenly. Keep the one-column-per-row
+#   shear (4, 3, 2, 1, 0 leading spaces): it's what makes the letters sit on a diagonal.
+LARGE_WORDMARK_LINES = [
+    r"    __ ____  ____ __ __    ____  _____",
+    r"   / //_/\ \/ / //_// /   / __ \/ ___/",
+    r"  / ,<    \  / ,<  / /   / / / /\__ \ ",
+    r" / /| |   / / /| |/ /___/ /_/ /___/ / ",
+    r"/_/ |_|  /_/_/ |_/_____/\____//____/  ",
+]
+LARGE_WORDMARK_WIDTH = max(len(line) for line in LARGE_WORDMARK_LINES)
+
 
 def build_theme(colors: dict) -> Theme:
     styles = dict(colors)
@@ -797,6 +809,46 @@ class AeroUI:
             return Text("kyklos", style="bold sky")
         return gradient_text("kyklos", ["#E8FBFF", self._c("aqua"), self._c("sky"), self._c("deep")], bold=True)
 
+    def large_wordmark(self) -> Text:
+        """The large stylized wordmark rendered in Frutiger Aero gradient (white glint -> aqua -> sky -> deep)."""
+        if self.plain:
+            return Text("\n".join(LARGE_WORDMARK_LINES), style="bold sky")
+        stops = ["#FFFFFF", "#E8FBFF", self._c("aqua"), self._c("sky"), self._c("deep")]
+        max_w = max(len(l) for l in LARGE_WORDMARK_LINES)
+        height = len(LARGE_WORDMARK_LINES)
+        out = Text()
+        num_stops = len(stops)
+
+        for row_idx, line in enumerate(LARGE_WORDMARK_LINES):
+            for col_idx, ch in enumerate(line):
+                if ch == " ":
+                    out.append(" ")
+                    continue
+                x_t = col_idx / max(max_w - 1, 1)
+                y_t = row_idx / max(height - 1, 1)
+                t = max(0.0, min(1.0, 0.85 * x_t + 0.15 * y_t))
+                scaled = t * (num_stops - 1)
+                idx = min(int(scaled), num_stops - 2)
+                color = mix(stops[idx], stops[idx + 1], scaled - idx)
+                out.append(ch, style=f"bold {color}")
+            if row_idx < height - 1:
+                out.append("\n")
+        return out
+
+    def gradient_rule(self, length: int = LARGE_WORDMARK_WIDTH) -> Text:
+        """A sleek gradient rule shelf (aqua -> sky -> deep) to underline the large wordmark."""
+        if self.plain:
+            return Text(self.g["rule"] * length, style="sky")
+        stops = [self._c("aqua"), self._c("sky"), self._c("deep")]
+        out = Text()
+        num_stops = len(stops)
+        for i in range(length):
+            t = i / max(length - 1, 1) * (num_stops - 1)
+            idx = min(int(t), num_stops - 2)
+            color = mix(stops[idx], stops[idx + 1], t - idx)
+            out.append(self.g["rule"], style=color)
+        return out
+
     def kyklos_box(self, body, border: str = "sky", footer: Text = None) -> Panel:
         """A rounded box titled with the wordmark, for the model's words (progress notes and answers),
         shaped like the permission panel and as wide as the terminal."""
@@ -806,6 +858,11 @@ class AeroUI:
                      width=self.width - 2, padding=(0, 1))
 
     def banner(self, agent) -> None:
+        if self.width >= 48:
+            self.print()
+            self.print(self.large_wordmark(), indent=2)
+            self.print(self.gradient_rule(), indent=2)  # the shelf is exactly as wide as the wordmark
+            self.print()
         word = self.wordmark()
         dot = self.g["dot"]
         context = f"{short_tokens(agent.context_window)} context"

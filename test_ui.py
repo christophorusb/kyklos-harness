@@ -13,7 +13,10 @@ from rich.console import Console
 
 from kyklos import EXIT, Agent, CommandContext, run_command, wants_aero_ui
 from test_kyklos import FakeClient, TransientAPIError, reply, tool_call
-from ui import AeroUI, describe_call, diff_counts, diff_ops, summarize_result, trim_context
+from ui import (LARGE_WORDMARK_LINES, AeroUI, describe_call, diff_counts, diff_ops, summarize_result,
+                trim_context)
+
+WORDMARK_ROW = LARGE_WORDMARK_LINES[1].strip()  # asserted against the real art, so it can't drift
 
 
 def make_ui(ws, keys=(), lines=(), **kw):
@@ -293,7 +296,11 @@ class AeroTurnTests(unittest.TestCase):
         ui = make_ui(self.ws)
         agent = self.agent(ui, [], plan_mode=True)
         ui.banner(agent)
-        self.assertIn("○ kyklos  ·  fake-model  ·  128k context  ·", output(ui))
+        out = output(ui)
+        self.assertIn("○ kyklos  ·  fake-model  ·  128k context  ·", out)
+        # Large rich text wordmark and rule are rendered on startup when wide enough
+        self.assertIn(WORDMARK_ROW, out)
+        self.assertIn("────", out)
         agent.context_source = "default"
         ui.banner(agent)
         self.assertIn("128k context (default)", output(ui))
@@ -302,6 +309,37 @@ class AeroTurnTests(unittest.TestCase):
         self.assertIn(" PLAN ", bar)
         self.assertRegex(bar, r"ctx \d+% ")
         self.assertIn("(plan) ", "".join(text for _, text in ui.prompt_message()))
+
+    def test_banner_skips_large_wordmark_when_too_narrow(self):
+        console = Console(file=io.StringIO(), force_terminal=True, color_system="truecolor", width=40, record=True)
+        ui = AeroUI(self.ws, console=console, animate=False)
+        agent = self.agent(ui, [])
+        ui.banner(agent)
+        out = console.export_text()
+        self.assertNotIn(WORDMARK_ROW, out)
+        self.assertIn("○ kyklos", out)
+
+    def test_large_wordmark_and_rule_plain_and_ascii(self):
+        # Plain ANSI theme
+        console_plain = Console(file=io.StringIO(), force_terminal=True, color_system="standard", width=100, record=True)
+        ui_plain = AeroUI(self.ws, console=console_plain, theme="plain")
+        word = ui_plain.large_wordmark()
+        self.assertEqual(word.style, "bold sky")
+        rule = ui_plain.gradient_rule(20)
+        self.assertEqual(rule.style, "sky")
+        self.assertEqual(rule.plain, "─" * 20)
+
+        # ASCII mode
+        console_ascii = Console(file=io.StringIO(), force_terminal=True, width=100, record=True)
+        ui_ascii = AeroUI(self.ws, console=console_ascii, ascii_mode=True, theme="plain")
+        rule_ascii = ui_ascii.gradient_rule(20)
+        self.assertEqual(rule_ascii.plain, "-" * 20)
+
+    def test_large_wordmark_geometry(self):
+        """A padded rectangle with a one-column shear: what keeps the letters sitting on a diagonal."""
+        self.assertEqual(len({len(line) for line in LARGE_WORDMARK_LINES}), 1, "rows must be padded alike")
+        leading = [len(line) - len(line.lstrip()) for line in LARGE_WORDMARK_LINES]
+        self.assertEqual(leading, list(range(len(LARGE_WORDMARK_LINES) - 1, -1, -1)))
 
 
 class TrustPanelTests(unittest.TestCase):

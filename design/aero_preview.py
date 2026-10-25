@@ -161,8 +161,58 @@ def swatches():
         print(f"  {fg(name)}██████{RESET}  {fg(name)}{BOLD}{name:<7}{RESET} {c('frost', hex_color)}  {use}")
 
 
+def large_wordmark():
+    lines = [  # keep in step with LARGE_WORDMARK_LINES in ui.py
+        r"    __ ____  ____ __ __    ____  _____",
+        r"   / //_/\ \/ / //_// /   / __ \/ ___/",
+        r"  / ,<    \  / ,<  / /   / / / /\__ \ ",
+        r" / /| |   / / /| |/ /___/ /_/ /___/ / ",
+        r"/_/ |_|  /_/_/ |_/_____/\____//____/  ",
+    ]
+    stops = ["#FFFFFF", "#E8FBFF", "aqua", "sky", "deep"]
+    cols = [rgb(PALETTE[s][0] if s in PALETTE else s) for s in stops]
+    max_w = max(len(l) for l in lines)
+    h = len(lines)
+    out = []
+    for r, line in enumerate(lines):
+        out.append("  ")
+        for c_idx, ch in enumerate(line):
+            if ch == " ":
+                out.append(" ")
+                continue
+            x_t = c_idx / max(max_w - 1, 1)
+            y_t = r / max(h - 1, 1)
+            t = max(0.0, min(1.0, 0.85 * x_t + 0.15 * y_t))
+            scaled = t * (len(cols) - 1)
+            idx = min(int(scaled), len(cols) - 2)
+            frac = scaled - idx
+            c1, c2 = cols[idx], cols[idx + 1]
+            red, green, blue = (round(c1[k] + (c2[k] - c1[k]) * frac) for k in range(3))
+            out.append(f"\033[38;2;{red};{green};{blue}m{BOLD}{ch}")
+        out.append(f"{RESET}\n")
+    return "".join(out)
+
+
+def gradient_rule(length=38):  # as wide as the wordmark above it
+    stops = ["aqua", "sky", "deep"]
+    cols = [rgb(PALETTE[s][0] if s in PALETTE else s) for s in stops]
+    out = ["  "]
+    for i in range(length):
+        t = i / max(length - 1, 1) * (len(cols) - 1)
+        idx = min(int(t), len(cols) - 2)
+        frac = t - idx
+        c1, c2 = cols[idx], cols[idx + 1]
+        red, green, blue = (round(c1[k] + (c2[k] - c1[k]) * frac) for k in range(3))
+        out.append(f"\033[38;2;{red};{green};{blue}m─")
+    out.append(RESET)
+    return "".join(out)
+
+
 def banner():
     section("banner")
+    print(large_wordmark(), end="")
+    print(gradient_rule())
+    print()
     word = gradient("kyklos", ["#E8FBFF", "aqua", "sky", "deep"])  # first letter is the white glint
     meta = c("frost", "  ·  kimi-k2.7-code  ·  kyklos-harness  ·  AGENTS.md loaded")
     print(f" {c('aqua', '○')} {BOLD}{word}{meta}")

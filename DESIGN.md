@@ -62,11 +62,19 @@ Tuned for dark backgrounds. All are 24-bit; see §8 for the fallback.
 ## 4. Components
 
 ### Banner
-Three lines, with no ASCII-art logo. `kyklos` is drawn as a gradient (`#E8FBFF` → aqua → sky → deep), so the first letter is the white "specular" glint.
+Startup renders a large stylized rich-text wordmark in the Frutiger Aero gradient (`#FFFFFF` → `#E8FBFF` → aqua → sky → deep, with top-left specular sheen fading into deep ocean blue), underlined with an aqua → sky → deep gradient rule shelf. Directly underneath sits the metadata line and keyboard shortcuts:
 ```
+      __ ____  ____ __ __    ____  _____
+     / //_/\ \/ / //_// /   / __ \/ ___/
+    / ,<    \  / ,<  / /   / / / /\__ \
+   / /| |   / / /| |/ /___/ /_/ /___/ /
+  /_/ |_|  /_/_/ |_/_____/\____//____/
+  ──────────────────────────────────────
+
  ○ kyklos  ·  kimi-k2.7-code  ·  kyklos-harness  ·  AGENTS.md loaded
    /help for commands · ctrl+c to interrupt
 ```
+When terminal width is under 48 columns (e.g. narrow split panes), the banner collapses cleanly to the compact inline wordmark line.
 
 ### Input prompt
 `❯` in sky blue, with `(plan) ❯` in plan mode. Your input stays in scrollback as typed, so it isn't echoed again.
@@ -209,3 +217,4 @@ An inline rounded box (sky border) drawn below the prompt, erased when done, and
 - `frost` for muted text, the breathing-bubble spinner, and a PLAN badge with a solid background: all approved.
 - No prefix on answers, collapsing subagent blocks, a turn footer: approved from the preview.
 - Later the same day, after using it: the layout uses the full terminal width instead of capping at 100 columns, and the model's progress notes and answers go into `○ kyklos` boxes shaped like the permission panel, with the turn footer set into the answer box's border. `design/aero_preview.py` still shows the earlier, unboxed versions.
+- **2026-10-25:** Added the startup large rich-text wordmark in 2D Frutiger Aero gradient with an underlying aqua → sky → deep rule shelf (inspired by Antigravity CLI, Claude Code, and Hermes startup banners), with auto-collapse for narrow terminal viewports (<48 columns) and plain/ASCII fallbacks.

@@ -4,6 +4,18 @@ All notable changes to **Kyklos** since the repository was initialized on 2026-1
 
 ---
 
+## Startup UI: Large Rich Text Banner in Frutiger Aero Gradient (2026-10-25)
+
+Inspired by startup displays in Antigravity CLI, Claude Code, and Hermes, the Kyklos Aero startup screen now features a stylized 2D large rich-text wordmark with full Frutiger Aero gradient styling:
+
+- **Large stylized wordmark (`ui.py`, `design/aero_preview.py`):** `AeroUI.large_wordmark` renders `KYKLOS` in slant Figlet typography across a 2D specular Frutiger Aero gradient (`#FFFFFF` → `#E8FBFF` → `aqua` → `sky` → `deep`), capturing the glossy water and sky optimism of Aero with a top-left glint highlight that flows diagonally into deep ocean blue.
+- **Gradient rule shelf (`ui.py`):** an `aqua` → `sky` → `deep` rule underlines the wordmark before the metadata line.
+- **Narrow terminal auto-collapse:** if terminal width is less than 48 columns (e.g., small split panes or compact terminals), the banner automatically collapses to the compact inline wordmark line to prevent awkward wrapping.
+- **Fallbacks:** full support for `plain` ANSI themes (`bold sky` styling) and ASCII mode (`-` rules and ASCII-safe slant characters).
+- **Tests & Docs (`test_ui.py`, `DESIGN.md`):** added unit tests for large wordmark rendering, narrow-width collapse, and plain/ASCII fallbacks (36 tests passing in `test_ui.py`). Updated design documentation and reference mockup `design/aero_preview.py`.
+
+---
+
 ## `f23f9c5` — Repository Folder Renamed to kyklos-harness (2026-10-24)
 
 The repository folder moved from `Harness Playground` to `kyklos-harness`. The rename itself happened outside git (the user PATH entry, the venv's `activate` scripts and `pyvenv.cfg`, and `~/.kyklos/projects/` were updated by hand); this commit updates the docs that named the old folder.

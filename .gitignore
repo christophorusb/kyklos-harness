@@ -17,6 +17,9 @@ id_ecdsa*
 __pycache__/
 .sessions/
 
+# macOS Finder metadata
+.DS_Store
+
 # The agent's scratch workspace
 sandbox/
 
