@@ -26,7 +26,7 @@ from tools import (SAFE_TOOLS, SCHEMAS, SHELL_NAME, ToolError, Tools, command_to
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-__version__ = "0.1.0"  # semver, pre-1.0: breaking changes bump the minor. Cut a release by adding
+__version__ = "0.2.0"  # semver, pre-1.0: breaking changes bump the minor. Cut a release by adding
 #                        a `## v<x.y.z> — <title> (<date>)` section to CHANGELOG.md and bumping this.
 
 MAX_STEPS = 50  # hard stop so a confused model can't loop forever
@@ -1070,20 +1070,96 @@ def ask_trust_plain(folder: Path, broad: bool) -> str:
 # Slash commands: one registry shared by the plain REPL and the Aero UI, which also generates /help.
 # A handler takes (ctx, arg) and returns None, EXIT, or text to send to the agent as a request.
 EXIT = object()
+# ---- harness observability: what the window holds, what can run, what changed on disk ------------
+
+def context_breakdown(agent: "Agent") -> dict:
+    """What fills the context window right now.
+
+    The per-kind split is always an estimate (~4 chars per token). Providers report a single number
+    for the whole prompt and never a breakdown, so only the total can be exact, and only once the
+    API has reported usage at least once this conversation.
+    """
+    system = [m for m in agent.messages if m.get("role") == "system"]
+    results = [m for m in agent.messages if m.get("role") == "tool"]
+    talk = [m for m in agent.messages if m.get("role") not in ("system", "tool")]
+    return {
+        "window": agent.context_window,
+        "source": getattr(agent, "context_source", ""),
+        "total": agent.context_tokens(),
+        "exact": agent.usage_mark is not None,
+        "parts": [("System prompt", estimate_tokens(system)),
+                  ("Messages", estimate_tokens(talk)),
+                  ("Tool results", estimate_tokens(results))],
+        "session_tokens": agent.session_tokens,
+        "compact_at": int(agent.context_window * COMPACT_AT),
+    }
+
+
+def tool_overview(agent: "Agent") -> dict:
+    """The tools the model can call right now, and the rules that auto-approve them."""
+    rules = [("bash prefix", r[5:]) if r.startswith("bash:") else ("tool", r)
+             for r in sorted(agent.always_allowed)]
+    return {
+        "tools": sorted(agent.tool_names),
+        "safe": sorted(agent.tool_names & SAFE_TOOLS),
+        "plan_mode": agent.plan_mode,
+        "rules": rules,
+        "workspace": str(agent.tools.workspace),
+    }
+
+
+def _snapshot_text(data: bytes | None) -> str:
+    """Snapshot bytes as text. A file that didn't exist reads as empty, so it diffs as a whole add."""
+    return "" if data is None else data.decode("utf-8", errors="replace")
+
+
+def workspace_changes(agent: "Agent") -> list:
+    """(path, before, after) for every file Kyklos has changed this session.
+
+    Built from the undo stack's own snapshots rather than git, so it shows what the agent did and
+    not what you edited by hand, and it works in a folder that isn't a repository at all. Undoing a
+    turn pops its snapshots, so this follows /undo for free.
+    """
+    originals: dict[Path, bytes | None] = {}
+    for _, _, _, snapshots in agent.undo_stack:  # oldest turn first
+        for path, before in snapshots.items():
+            originals.setdefault(path, before)  # the first turn to touch a file holds its original
+    changes = []
+    for path in sorted(originals):
+        before = originals[path]
+        after = path.read_bytes() if path.is_file() else None
+        if before == after:
+            continue  # touched, then put back
+        changes.append((agent.tools._rel(path), _snapshot_text(before), _snapshot_text(after)))
+    return changes
+
+
 COMMANDS: dict[str, tuple] = {}  # name -> (handler, usage, summary)
 
 
 class CommandContext:
     def __init__(self, agent: "Agent", say, default_session: Path, pick=None, home: Path = None,
-                 load_models=None, context_override: bool = False):
+                 load_models=None, context_override: bool = False, render=None):
         self.agent = agent
         self.say = say  # say(kind, text) with kind in info / ok / warn / error
         self.default_session = default_session
         # pick(title, rows, cursor=0, marked=None, filterable=False) -> chosen index or None (cancelled)
         self.pick = pick
+        self.render = render  # render(view, data); None means this front end draws plain text instead
         self.home = home  # where /model saves settings; None means don't save
         self.load_models = load_models  # load_models(refresh=False) -> catalog list
         self.context_override = context_override  # CONTEXT_WINDOW is set: keep it when switching models
+
+    def show(self, view: str, data, fallback: str) -> None:
+        """Hand a view to the front end to draw, falling back to plain text where it can't.
+
+        Commands work out *what* to show (here, where they are testable); Kyklos Aero decides how it
+        looks. The plain REPL has no renderer, so it prints `fallback`.
+        """
+        if self.render:
+            self.render(view, data)
+        else:
+            self.say("info", fallback)
 
 
 def command(name: str, usage: str, summary: str):
@@ -1141,6 +1217,49 @@ def _cmd_resume(ctx, arg):
 def _cmd_compact(ctx, arg):
     if not ctx.agent.compact():
         ctx.say("info", "Nothing to compact yet.")
+
+
+@command("tokens", "/tokens", "Show the context budget and what fills it")
+def _cmd_tokens(ctx, arg):
+    data = context_breakdown(ctx.agent)
+    window = f"{data['window']:,}" + (f" ({data['source']})" if data["source"] else "")
+    total = f"{data['total']:,} ({data['total'] / data['window']:.0%})"
+    lines = [f"Window:         {window}",
+             f"Context:        {total}, {'reported' if data['exact'] else 'estimated'}",
+             "Where it goes (estimated at ~4 characters per token):"]
+    lines += [f"  {label + ':':<15}~{n:,}" for label, n in data["parts"]]
+    lines.append(f"  {'subtotal:':<15}~{sum(n for _, n in data['parts']):,}")
+    lines.append(f"Session billed: {data['session_tokens']:,}" if data["session_tokens"]
+                 else "Session billed: not reported by this provider")
+    lines.append(f"Compacts at:    {data['compact_at']:,}")
+    ctx.show("tokens", data, "\n".join(lines))
+
+
+@command("tools", "/tools", "List the live tools and what's auto-approved")
+def _cmd_tools(ctx, arg):
+    data = tool_overview(ctx.agent)
+    lines = [f"Mode:           {'plan (read-only)' if data['plan_mode'] else 'full'}",
+             f"Tools:          {', '.join(data['tools'])}",
+             f"No approval:    {', '.join(data['safe']) or 'none'}"]
+    if data["rules"]:
+        lines.append("Always allowed this session:")
+        lines += [f"  {kind}: {value}" for kind, value in data["rules"]]
+    else:
+        lines.append("Always allowed: nothing yet")
+    ctx.show("tools", data, "\n".join(lines))
+
+
+@command("diff", "/diff", "Show what Kyklos has changed in the workspace")
+def _cmd_diff(ctx, arg):
+    changes = workspace_changes(ctx.agent)
+    if not changes:
+        ctx.say("info", "Kyklos hasn't changed any files this session.")
+        return
+    lines = []
+    for path, before, after in changes:
+        lines.append(f"--- {path}")
+        lines += list(difflib.unified_diff(before.splitlines(), after.splitlines(), lineterm="", n=2))[2:]
+    ctx.show("diff", changes, "\n".join(lines))
 
 
 @command("reset", "/reset", "Clear the conversation")

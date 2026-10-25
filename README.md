@@ -78,6 +78,9 @@ Commands (type `/help` for the list, Tab completes them):
 | `/model [name]` | Pick the model, then its thinking effort (see below). `/model --refresh` reloads the list |
 | `/effort [level]` | Change the thinking effort for the current model |
 | `/compact` | Shrink the conversation now |
+| `/tokens` | What fills the context window, the session's billed tokens, and when compaction hits |
+| `/tools` | The tools the model can call now, and the rules that auto-approve them |
+| `/diff` | What Kyklos has changed in the workspace this session, as glass diff blocks |
 | `/reset` | Clear the conversation |
 | `/exit` | Quit (or Ctrl+C twice at an empty prompt) |
 

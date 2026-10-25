@@ -69,7 +69,7 @@ Startup renders a large stylized rich-text wordmark in the Frutiger Aero gradien
     / ,<    \  / ,<  / /   / / / /\__ \
    / /| |   / / /| |/ /___/ /_/ /___/ /
   /_/ |_|  /_/_/ |_/_____/\____//____/
-  ───────────────────────────── v0.1.0 ─
+  ───────────────────────────── v0.2.0 ─
 
  ○ kyklos  ·  kimi-k2.7-code  ·  kyklos-harness  ·  AGENTS.md loaded
    /help for commands · ctrl+c to interrupt
@@ -87,6 +87,24 @@ Always present: while you type it's prompt_toolkit's bottom toolbar, with a sky 
  kimi-k2.7-code · ctx 12% ▰▰▱▱▱ · 48k used ·  PLAN  · kyklos-harness · /help
 ```
 The meter's filled cells are a glint → mint gradient. `48k used` is the session's billed tokens, prompt plus completion over every API call, including compaction summaries and subagents; it is hidden until the first reply, and on providers that report no usage it stays hidden rather than showing a guess. The `PLAN` badge is white bold text on `deep`, and appears only in plan mode. `/help` is on the toolbar only — during a turn it would be noise.
+
+### Command views
+`/tokens` and `/tools` draw a rounded sky-bordered panel with a lowercase bold title; `/diff` prints a filename with its counts badge, then the same glass diff blocks the permission panel uses, trimmed to the changed regions.
+```
+ ╭─ context & token budget ──────────────────────────────────╮
+ │ window          128,000 tokens  · detected                │
+ │ context         4,311  · 3% of window  · reported by the API │
+ │                                                           │
+ │ where it goes  · estimated at ~4 characters per token      │
+ │   system prompt      ~324   77%                           │
+ │   messages            ~83   20%                           │
+ │   tool results        ~16    4%                           │
+ │   subtotal           ~423                                 │
+ ╰───────────────────────────────────────────────────────────╯
+```
+Commands decide *what* to show (`context_breakdown`, `tool_overview`, `workspace_changes` in `kyklos.py`, where they're testable without a terminal) and hand it to the front end through `ctx.show(view, data, fallback)`. Kyklos Aero draws it; the plain REPL has no renderer and prints the fallback text, so every command works in both.
+
+The split is labelled as an estimate because it is one: providers report a single number for the whole prompt, never a breakdown, so only the total can be exact — and only once the API has reported usage at least once. The subtotal is shown so the two figures can be compared rather than silently conflated.
 
 ### Spinner line
 `◯ thinking · 12s · ctrl+c to interrupt`, in frost with the bubble animating. It's replaced in place when output arrives, and it **stops before any permission prompt**.

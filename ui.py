@@ -612,6 +612,66 @@ class AeroUI:
         for row in self.diff_rows(info, self.width - indent - 2, max_rows):
             self.print(row, indent=indent)
 
+    # -- command views: /tokens, /tools, /diff --
+
+    def render_view(self, view: str, data) -> None:
+        """Draw a command's output. Commands work out what to show; how it looks lives here."""
+        {"tokens": self._view_tokens, "tools": self._view_tools, "diff": self._view_diff}[view](data)
+
+    def _view_panel(self, title: str, rows: list) -> None:
+        self.print(Panel(Group(*rows), title=Text(title, style="bold"), title_align="left",
+                         box=box.ROUNDED, border_style="sky", width=self.width - 2, padding=(0, 1)),
+                   indent=1)
+
+    def _view_row(self, label: str, value: str, style: str = "") -> Text:
+        return Text(f"{label:<16}", style="frost") + Text(value, style=style)
+
+    def _view_tokens(self, data: dict) -> None:
+        pct = data["total"] / data["window"]
+        source = f"  {self.g['dot']} {data['source']}" if data["source"] else ""
+        counted = "reported by the API" if data["exact"] else "estimated"
+        subtotal = sum(n for _, n in data["parts"])
+        rows = [self._view_row("window", f"{data['window']:,} tokens{source}"),
+                self._view_row("context", f"{data['total']:,}  {self.g['dot']} {pct:.0%} of window"
+                                          f"  {self.g['dot']} {counted}", style="aqua"),
+                Text(""),
+                Text(f"where it goes  {self.g['dot']} estimated at ~4 characters per token",
+                     style="frost")]
+        for label, n in data["parts"]:
+            share = n / subtotal if subtotal else 0
+            rows.append(self._view_row(f"  {label.lower()}", f"{'~' + f'{n:,}':>9}   {share:>3.0%}"))
+        rows.append(self._view_row("  subtotal", f"{'~' + f'{subtotal:,}':>9}"))
+        spend = f"{data['session_tokens']:,} tokens" if data["session_tokens"] else "not reported here"
+        rows += [Text(""),
+                 self._view_row("session billed", spend, style="mint"),
+                 self._view_row("compacts at", f"{data['compact_at']:,}")]
+        self._view_panel("context & token budget", rows)
+
+    def _view_tools(self, data: dict) -> None:
+        rows = [self._view_row("mode", "plan (read-only)" if data["plan_mode"] else "full",
+                               style="sun" if data["plan_mode"] else ""),
+                self._view_row("tools", ", ".join(data["tools"]), style="aqua"),
+                self._view_row("no approval", ", ".join(data["safe"]) or "none"),
+                Text("")]
+        if data["rules"]:
+            rows.append(Text("always allowed for the rest of this session", style="frost"))
+            for kind, value in data["rules"]:
+                rows.append(Text(f"  {self.g['done']} ", style="mint")
+                            + Text(f"{kind:<12}", style="frost") + Text(value, style="aqua"))
+        else:
+            rows.append(Text("Nothing is always-allowed yet; every call still asks.", style="frost"))
+        self._view_panel("tools & permissions", rows)
+
+    def _view_diff(self, changes: list) -> None:
+        self.print()
+        for path, before, after in changes:
+            counts = self._counts(*diff_counts(before, after))
+            self.print(Text(f"{self.g['done']} ", style="sky") + Text(path, style="bold")
+                       + Text("  ") + counts, indent=2)
+            self._print_diff({"old": before, "new": after, "first": 1, "trim": True},
+                             indent=2, max_rows=40)
+            self.print()
+
     # -- permission panel (DESIGN.md §4) --
 
     def permission(self, name: str, args: dict, always_allowed: set) -> tuple:
@@ -1064,7 +1124,8 @@ class AeroUI:
         if one_shot:
             self.turn(agent, one_shot, default_session)
             return
-        ctx = CommandContext(agent, self.say, default_session, pick=self.pick, **ctx_extras)
+        ctx = CommandContext(agent, self.say, default_session, pick=self.pick,
+                             render=self.render_view, **ctx_extras)
         session = self._session(default_session.parent / "history")
         last_interrupt = 0.0
         while True:

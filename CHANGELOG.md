@@ -9,7 +9,14 @@ titled by commit instead.
 
 ---
 
-## Unreleased
+## v0.2.0 — Harness Observability (2026-10-25)
+
+Kyklos stops being opaque about itself: what it's holding in the window, what it can run, what it has changed on disk, and what it has spent — all visible without leaving the REPL.
+
+- **Harness observability commands (`kyklos.py`, `ui.py`):** `/tokens` breaks the context window down by system prompt, messages and tool results, next to the session's billed tokens and the compaction threshold; `/tools` lists the tools the model can call right now and the rules auto-approving them, including saved `bash` prefixes; `/diff` shows what Kyklos has changed in the workspace as glass diff blocks.
+  - The breakdown is labelled as an estimate throughout, with its own subtotal beside the reported total, because providers report one number for the whole prompt and never a split. Showing the two figures side by side beats quietly presenting a guess as exact.
+  - `/diff` reads the undo stack's own file snapshots rather than shelling out to git, so it shows what the agent changed rather than what you edited by hand, works in a folder that isn't a repository, needs no access to `.git/`, and follows `/undo` for free.
+  - Commands compute data (`context_breakdown`, `tool_overview`, `workspace_changes`) and pass it to the front end via `CommandContext.show(view, data, fallback)`. Kyklos Aero renders the panels; the plain REPL prints the fallback. `/help` and tab completion pick the commands up from `COMMANDS` with no extra wiring.
 
 - **The status bar stays put (`ui.py`):** it used to vanish the moment you pressed Enter and return only after the answer, because it lives in prompt_toolkit's `bottom_toolbar`, which only exists while `PromptSession.prompt()` is running. It is now also pinned to the foot of the live zone for the duration of a turn. `AeroUI.status_segments` is the one list of segments both renderings draw from, so the toolbar and the live zone can't drift apart. A `_turn_active` flag keeps the live zone up across the gaps between a tool finishing and the next model call, so the line doesn't blink.
 - **Session token use in the status bar (`kyklos.py`, `ui.py`):** `Agent.session_tokens` sums prompt + completion tokens over every API call and shows beside the context meter as `48k used`. The tally is taken in `_complete`, the one place every call passes through, so compaction summaries count too; a subagent's tokens roll into its parent when it finishes. It survives `/reset` — that clears the conversation, not what you've already spent — and round-trips through a saved session. Providers that report no `usage` are skipped rather than estimated, so the figure is either real or absent.

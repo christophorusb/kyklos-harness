@@ -823,6 +823,120 @@ class SessionTokenTests(unittest.TestCase):
         self.assertEqual(agent.session_tokens, 0)
 
 
+class ObservabilityCommandTests(unittest.TestCase):
+    """/tokens, /diff and /tools: what the harness is holding, without leaving the REPL."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.said = []
+
+    def ctx(self, agent, render=None):
+        from kyklos import CommandContext
+        return CommandContext(agent, lambda kind, text: self.said.append((kind, text)),
+                              self.ws / "s.jsonl", render=render)
+
+    def agent(self, replies=()):
+        return Agent(FakeClient(list(replies)), "fake", self.ws, permission=allow_all,
+                     on_event=lambda *a, **k: None)
+
+    def edited_agent(self):
+        (self.ws / "app.py").write_text("a = 1\n")
+        agent = self.agent([
+            reply(tool_calls=[tool_call("1", "edit_file", path="app.py",
+                                        old_string="a = 1", new_string="a = 2")], prompt_tokens=900),
+            reply("done.", prompt_tokens=950, completion_tokens=10),
+        ])
+        agent.send("bump it")
+        return agent
+
+    def test_breakdown_splits_the_window_by_kind(self):
+        from kyklos import COMPACT_AT, context_breakdown
+        data = context_breakdown(self.edited_agent())
+        labels = [label for label, _ in data["parts"]]
+        self.assertEqual(labels, ["System prompt", "Messages", "Tool results"])
+        self.assertTrue(all(n > 0 for _, n in data["parts"]))
+        self.assertTrue(data["exact"])  # the API reported usage, so the total is not a guess
+        self.assertEqual(data["compact_at"], int(data["window"] * COMPACT_AT))
+
+    def test_breakdown_admits_when_the_total_is_only_estimated(self):
+        from kyklos import context_breakdown
+        agent = self.agent([reply("hi")])  # provider reports no usage at all
+        agent.send("hello")
+        self.assertFalse(context_breakdown(agent)["exact"])
+
+    def test_diff_reports_what_the_agent_changed_from_its_own_snapshots(self):
+        from kyklos import workspace_changes
+        agent = self.edited_agent()
+        changes = workspace_changes(agent)
+        self.assertEqual([path for path, _, _ in changes], ["app.py"])
+        _, before, after = changes[0]
+        self.assertEqual((before, after), ("a = 1\n", "a = 2\n"))
+
+    def test_diff_ignores_a_file_edited_back_to_its_original(self):
+        from kyklos import workspace_changes
+        agent = self.edited_agent()
+        (self.ws / "app.py").write_text("a = 1\n")  # put it back
+        self.assertEqual(workspace_changes(agent), [])
+
+    def test_diff_follows_undo(self):
+        from kyklos import workspace_changes
+        agent = self.edited_agent()
+        agent.undo()
+        self.assertEqual(workspace_changes(agent), [])
+
+    def test_tools_lists_live_tools_and_the_rules_that_skip_approval(self):
+        from kyklos import tool_overview
+        agent = self.edited_agent()
+        agent.always_allowed.update({"write_file", "bash:git status"})
+        data = tool_overview(agent)
+        self.assertIn("read_file", data["safe"])
+        self.assertIn(("bash prefix", "git status"), data["rules"])
+        self.assertIn(("tool", "write_file"), data["rules"])
+        self.assertFalse(data["plan_mode"])
+
+    def test_tools_narrows_in_plan_mode(self):
+        from kyklos import tool_overview
+        agent = self.agent()
+        agent.set_plan_mode(True)
+        data = tool_overview(agent)
+        self.assertTrue(data["plan_mode"])
+        self.assertNotIn("write_file", data["tools"])
+
+    def test_commands_fall_back_to_plain_text_without_a_renderer(self):
+        from kyklos import run_command
+        agent = self.edited_agent()
+        for name in ("/tokens", "/tools", "/diff"):
+            self.said.clear()
+            run_command(self.ctx(agent), name)
+            self.assertTrue(self.said, f"{name} said nothing")
+        self.assertIn("app.py", self.said[-1][1])
+
+    def test_commands_hand_their_data_to_a_renderer_when_there_is_one(self):
+        from kyklos import run_command
+        agent = self.edited_agent()
+        drawn = []
+        ctx = self.ctx(agent, render=lambda view, data: drawn.append((view, data)))
+        for name in ("/tokens", "/tools", "/diff"):
+            run_command(ctx, name)
+        self.assertEqual([view for view, _ in drawn], ["tokens", "tools", "diff"])
+        self.assertEqual(self.said, [])  # drawn, not printed as plain text
+
+    def test_diff_says_so_when_nothing_changed(self):
+        from kyklos import run_command
+        run_command(self.ctx(self.agent()), "/diff")
+        self.assertIn("hasn't changed any files", self.said[-1][1])
+
+    def test_the_new_commands_are_in_help_and_completion(self):
+        from kyklos import COMMANDS, run_command
+        for name in ("tokens", "tools", "diff"):
+            self.assertIn(name, COMMANDS)
+        self.said.clear()
+        run_command(self.ctx(self.agent()), "/help")
+        self.assertIn("/tokens", self.said[-1][1])
+
+
 class TransientAPIError(Exception):
     def __init__(self, status_code: int, message: str = "rate limited"):
         super().__init__(message)
