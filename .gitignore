@@ -25,3 +25,6 @@ sandbox/
 
 # Local log of audit findings (like CHANGELOG.md, but for audits); kept out of git
 /AUDIT_REPORT.md
+
+# Naming deliberation notes: working notes, kept local
+/NAMING.md
