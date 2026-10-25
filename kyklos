@@ -1,0 +1,13 @@
+#!/bin/sh
+# Launch Kyklos with this folder's venv, from any directory.
+# Resolves symlinks, so a symlink to this script in a bin dir works too.
+target=$0
+while [ -L "$target" ]; do
+  link=$(readlink "$target")
+  case $link in
+    /*) target=$link ;;
+    *) target=$(dirname -- "$target")/$link ;;
+  esac
+done
+dir=$(CDPATH= cd -- "$(dirname -- "$target")" && pwd -P)
+exec "$dir/.venv/bin/python" "$dir/kyklos.py" "$@"

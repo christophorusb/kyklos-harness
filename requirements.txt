@@ -1,3 +1,7 @@
 openai>=1.40
 rich>=13.7
 prompt_toolkit>=3.0.43
+
+# Pinned per the eMudhra/emSign CA incident (Oct 2026): this release drops the
+# distrusted emSign ECC Root CA - G3 from the bundle.
+certifi>=2026.10.19
