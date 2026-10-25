@@ -6,10 +6,22 @@ A small coding-agent harness (~2,950 lines of Python, plus ~1,870 lines of tests
 
 ## Setup
 
+Kyklos needs **Python 3.10 or newer** (it annotates with `X | None`).
+
+Windows:
+
 ```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 Copy-Item .env.example .env   # then fill in BASE_URL, API_KEY, MODEL
+```
+
+macOS / Linux:
+
+```bash
+python3 -m venv .venv         # macOS ships 3.9, too old: brew install python@3.13
+./.venv/bin/python -m pip install -r requirements.txt
+cp .env.example .env          # then fill in BASE_URL, API_KEY, MODEL
 ```
 
 ## Run
@@ -23,11 +35,23 @@ kyklos --trust "..."                     # trust this folder for one run, withou
 kyklos --model kimi-k3                   # use another model for one run (not remembered)
 ```
 
-**Using `kyklos` from any folder.** `kyklos.cmd` runs `kyklos.py` with this folder's venv, from wherever you are. Add this folder to your user PATH once, then open a new terminal:
+**Using `kyklos` from any folder.** `kyklos.cmd` (Windows) and `kyklos` (macOS / Linux) run `kyklos.py` with this folder's venv, from wherever you are. Set it up once, then open a new terminal.
+
+On Windows, add this folder to your user PATH:
 
 ```powershell
 [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";C:\path\to\kyklos-harness", "User")
 ```
+
+On macOS / Linux, symlink the launcher into a folder that's on your PATH, rather than putting this one there, so nothing here can shadow a system command:
+
+```bash
+mkdir -p ~/.local/bin
+ln -s "$PWD/kyklos" ~/.local/bin/kyklos
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zprofile   # if it isn't already
+```
+
+The launcher resolves symlinks, so it still finds this folder's venv when it's run through one.
 
 Kyklos works in the folder you launch it from. Setting `WORKSPACE` in `.env` pins it to one folder instead.
 
@@ -88,7 +112,7 @@ When input or output isn't a terminal (piped or scripted runs), Kyklos automatic
 | `kyklos.py` | The agent loop, the system prompt, the permission rules, the command registry, and the plain REPL |
 | `tools.py` | Tool schemas sent to the model, their implementations, and the environment probe |
 | `ui.py` | Kyklos Aero: renders the Agent's events, the permission panel, and the prompt with its status bar |
-| `kyklos.cmd` | Windows launcher |
+| `kyklos.cmd`, `kyklos` | Launchers: Windows, and macOS / Linux |
 | `test_kyklos.py`, `test_ui.py` | Offline tests: a scripted fake model drives the real loop (and the UI, through a recording console) |
 | `DESIGN.md`, `design/aero_preview.py` | The UI design system, and a dependency-free preview of it |
 
@@ -152,6 +176,10 @@ Errors such as a bad path, an ambiguous edit, a timeout, or invalid JSON go back
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest test_kyklos test_ui
+```
+
+```bash
+./.venv/bin/python -m unittest test_kyklos test_ui
 ```
 
 ## Ideas for next steps
