@@ -26,10 +26,10 @@ from tools import (SAFE_TOOLS, SCHEMAS, SHELL_NAME, ToolError, Tools, command_to
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-__version__ = "0.2.0"  # semver, pre-1.0: breaking changes bump the minor. Cut a release by adding
+__version__ = "0.3.0"  # semver, pre-1.0: breaking changes bump the minor. Cut a release by adding
 #                        a `## v<x.y.z> — <title> (<date>)` section to CHANGELOG.md and bumping this.
 
-MAX_STEPS = 50  # hard stop so a confused model can't loop forever
+DEFAULT_MAX_STEPS = 50  # hard stop so a confused model can't loop forever; MAX_STEPS in .env overrides
 MAX_INSTRUCTIONS_CHARS = 20_000
 MAX_API_RETRIES = 3
 RETRY_BASE_DELAY = 1.0
@@ -236,7 +236,8 @@ def format_diff(old_text: str, new_text: str, max_lines: int = 24) -> str:
 
 
 SHELL_KEYWORDS = {"if", "else", "elseif", "try", "catch", "finally", "for", "foreach", "while", "do", "switch",
-                  "function", "param", "begin", "process", "end", "return", "then", "fi", "case", "until"}
+                  "function", "param", "begin", "process", "end", "return", "then", "fi", "case", "until",
+                  "done", "esac", "elif", "in", "select"}
 COMMAND_WORD_RE = re.compile(r"^[A-Za-z0-9_.\\/:-]+$")
 
 
@@ -307,6 +308,274 @@ def command_matches_prefixes(command: str, prefixes: set[str]) -> bool:
     return all(any(sub == p or sub.startswith(p + " ") for p in clean) for sub in parts)
 
 
+# ---- explaining a command before you approve it -------------------------------------------------
+# A finding is (level, text) with level "danger", "warn" or "note". These are an aid to reading a
+# command, never a security boundary: this is a regex reading a string, not a shell, so quoting,
+# variables, aliases, `eval` and encoding can all hide intent from it. No findings means nothing was
+# recognised — it never means the command is safe, and nothing shown to the user may imply that.
+
+NETWORK_CMDS = {"curl", "wget", "scp", "rsync", "ssh", "ftp", "nc"}
+INSTALLERS = {"npm", "pnpm", "yarn", "pip", "pip3", "uv", "cargo", "go", "gem", "brew", "apt", "apt-get"}
+INSTALL_VERBS = {"install", "add", "ci"}
+SHELL_STEMS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "pwsh", "powershell"}
+RAW_DEVICE_CMDS = {"dd", "mkfs", "shred", "fdisk", "diskutil"}
+PROCESS_KILLERS = {"kill", "pkill", "killall"}
+PLAIN_CMDS = {"ls", "cat", "cd", "echo", "grep", "find", "rm", "mv", "cp", "mkdir", "touch", "chmod",
+              "chown", "head", "tail", "sed", "awk", "sort", "uniq", "wc", "diff", "tar", "zip",
+              "unzip", "make", "pytest", "sudo", "doas", "which", "env", "pwd", "date", "git",
+              # shell builtins and everyday tools; without these, `test -s x` reads as unknown
+              "test", "true", "false", "printf", "read", "set", "unset", "source", "exit", "sleep",
+              "xargs", "tee", "cut", "tr", "basename", "dirname", "realpath", "du", "df", "ps",
+              "stat", "ln", "rmdir", "seq", "time", "type", "command", "jq", "rg", "fd", "bat",
+              "less", "more", "man", "tree", "shasum", "column", "rev", "nl", "open", "code"}
+# Things that run another command. Without peeling these, `env X=1 rm -rf build` says nothing at all.
+WRAPPERS = {"env", "time", "nohup", "nice", "sudo", "doas", "command", "exec", "stdbuf", "timeout", "xargs"}
+KNOWN_COMMANDS = (NETWORK_CMDS | INSTALLERS | SHELL_STEMS | INTERPRETERS | RAW_DEVICE_CMDS
+                  | PROCESS_KILLERS | MULTIWORD_CMDS | PLAIN_CMDS | WRAPPERS)
+# `2>/dev/null` discards output; calling that an overwrite is noise, not information.
+NULL_SINKS = {"/dev/null", "/dev/stdout", "/dev/stderr", "nul"}
+# A redirect, but not the `>` of `=>`, `->` or `>=`: inline JavaScript is full of arrows, and
+# reading one as "overwrites (body" buries the real findings under nonsense.
+REDIRECT_RE = re.compile(r"(?<![=<>\-])(?:\d+|&)?(>>?)(?!=)\s*([^\s;|&<>=]+)")
+HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
+ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+URL_RE = re.compile(r"https?://([^/\s\"']+)")
+
+
+def _strip_heredocs(command: str) -> tuple[str, int]:
+    """Drop heredoc bodies, keeping the line that opens them.
+
+    `cat > server.mjs <<'EOF' … EOF` writes a document. Its contents are data the shell never runs,
+    so reading them as commands turns a file of JavaScript into a page of imaginary findings — while
+    the real ones (what it overwrites, where it reaches) get buried. Returns (command, how many).
+    """
+    lines, out, count, i = command.split("\n"), [], 0, 0
+    while i < len(lines):
+        out.append(lines[i])
+        match = HEREDOC_RE.search(lines[i])
+        i += 1
+        if not match:
+            continue
+        count += 1
+        delimiter = match.group(2)
+        while i < len(lines) and lines[i].strip() != delimiter:
+            i += 1
+        i += 1  # the closing delimiter is not a command either
+    return "\n".join(out), count
+
+
+def _unquoted(command: str) -> str:
+    """The command with the insides of quotes blanked out, so a `>` or `|` within a quoted argument
+    is not read as shell syntax. `grep "a\\|b" f > out` redirects once, and matches no pipeline."""
+    out, quote = [], ""
+    for ch in command:
+        if quote:
+            out.append(ch if ch == quote else " ")
+            if ch == quote:
+                quote = ""
+        else:
+            if ch in "\"'":
+                quote = ch
+            out.append(ch)
+    return "".join(out)
+
+
+def _split_top_level(command: str) -> list[tuple[str, str]]:
+    """[(operator before this piece, text)], splitting on `&&`, `||`, `;` and `|` only outside
+    quotes. A regex alternation like "hasKey\\|serverKeys" is an argument, not a pipeline."""
+    out, buf, op, quote, i = [], [], "", "", 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            buf.append(ch)
+            quote = "" if ch == quote else quote
+        elif ch == "\\" and i + 1 < len(command):
+            buf.append(ch + command[i + 1])
+            i += 2
+            continue
+        elif ch in "\"'":
+            quote = ch
+            buf.append(ch)
+        elif command[i:i + 2] in ("&&", "||"):
+            out.append((op, "".join(buf)))
+            op, buf, i = command[i:i + 2], [], i + 2
+            continue
+        elif ch in ";\n|":
+            out.append((op, "".join(buf)))
+            op, buf = ch, []
+        else:
+            buf.append(ch)
+        i += 1
+    out.append((op, "".join(buf)))
+    return out
+
+
+def _segments(command: str) -> list[tuple[str, list[str]]]:
+    """[(operator before this segment, tokens)], keeping pipeline shape: `curl x` differs from
+    `curl x | sh` only in the operator, and that difference is the whole finding."""
+    out = []
+    for op, piece in _split_top_level(command):
+        tokens = TOKEN_RE.findall(piece.strip())
+        if tokens:
+            out.append((op, tokens))
+    return out
+
+
+def _stem(token: str) -> str:
+    return Path(token.strip("\"'")).stem.lower()
+
+
+def _flags(tokens: list[str]) -> set[str]:
+    """Flags with short bundles expanded, so `-rf` answers to both `-r` and `-f`."""
+    out = set()
+    for t in tokens[1:]:
+        low = t.lower()
+        if low.startswith("--"):
+            out.add(low)
+        elif low.startswith("-") and len(low) > 1:
+            out.update("-" + c for c in low[1:])
+    return out
+
+
+def _operands(tokens: list[str]) -> list[str]:
+    return [t.strip("\"'") for t in tokens[1:] if not t.startswith("-")]
+
+
+def _outside_workspace(path: str) -> bool:
+    return path.startswith(("/", "~")) or ".." in Path(path).parts or bool(re.match(r"^[A-Za-z]:[\\/]", path))
+
+
+def explain_command(command: str) -> list[tuple[str, str]]:
+    """Plain-language findings about what a shell command would do, highest concern first.
+
+    Derived here in the harness, never from the model: the permission prompt exists because the
+    model may propose something you didn't intend, so letting it narrate its own command would put
+    the thing being checked in charge of the check.
+    """
+    command, heredocs = _strip_heredocs(command)
+    segments = _segments(command)
+    findings: list[tuple[str, str]] = []
+    if heredocs:
+        findings.append(("note", f"writes {heredocs} block{'' if heredocs == 1 else 's'} of inline "
+                                 f"text (heredoc); that text is data, not commands"))
+
+    for i, (op, tokens) in enumerate(segments):
+        if op == "|" and i and _stem(tokens[0]) in SHELL_STEMS | PYTHON_STEMS:
+            source = _stem(segments[i - 1][1][0])
+            if source in {"curl", "wget"}:
+                findings.append(("danger", f"pipes downloaded content straight into {_stem(tokens[0])}, "
+                                           f"which runs it immediately"))
+            else:  # base64 -d | sh, echo … | sh: still handing another command's output to a shell
+                findings.append(("warn", f"runs whatever {source} prints, through {_stem(tokens[0])}"))
+        # `sudo rm -rf /srv` is an escalation *and* a recursive delete; `env X=1 rm -rf build` is a
+        # delete wearing a disguise. Examine each layer, or a wrapper silences the real command.
+        layer = tokens
+        for _ in range(3):
+            findings += _command_findings(layer)
+            peeled = _peel(layer)
+            if not peeled or peeled == layer:
+                break
+            layer = peeled
+
+    for op, target in REDIRECT_RE.findall(_unquoted(command)):
+        target = target.strip("\"'")
+        if target.lower() in NULL_SINKS:
+            continue  # discarding output, not writing a file
+        findings.append(("warn", f"{'appends to' if op == '>>' else 'overwrites'} {target}"))
+    if command_touches_secret(command):
+        findings.append(("danger", "names a secret file, so it can only ever be allowed once"))
+    # Shell keywords aren't programs: "runs for, then do, then done" describes a loop, not commands.
+    chain = [s for s in dict.fromkeys(_stem(t[0]) for _, t in segments) if s not in SHELL_KEYWORDS]
+    if len(chain) > 1:  # "runs npm" for `npm ci && npm test` would be noise, not information
+        shown = ", then ".join(chain[:4])
+        extra = f", and {len(chain) - 4} more" if len(chain) > 4 else ""
+        findings.append(("note", f"runs {shown}{extra}"))
+
+    order = {"danger": 0, "warn": 1, "note": 2}
+    seen, unique = set(), []
+    for finding in findings:
+        if finding not in seen:
+            seen.add(finding)
+            unique.append(finding)
+    return sorted(unique, key=lambda f: order[f[0]])  # stable, so order within a level is kept
+
+
+def _peel(tokens: list[str]) -> list[str]:
+    """Look past leading `VAR=value` assignments and wrappers like `env`, `sudo` and `timeout`, so
+    the command that actually runs is the one examined rather than the thing in front of it."""
+    rest = list(tokens)
+    while rest and ASSIGNMENT_RE.match(rest[0].strip("\"'")):
+        rest.pop(0)
+    if rest and _stem(rest[0]) in WRAPPERS:
+        rest.pop(0)
+        while rest and (ASSIGNMENT_RE.match(rest[0].strip("\"'"))
+                        or rest[0].startswith("-") or rest[0].isdigit()):
+            rest.pop(0)
+    return rest
+
+
+def _command_findings(tokens: list[str]) -> list[tuple[str, str]]:
+    """Findings for one command, ignoring the pipeline it sits in."""
+    findings: list[tuple[str, str]] = []
+    stem, flags = _stem(tokens[0]), _flags(tokens)
+    operands, raw = _operands(tokens), [t.lower() for t in tokens[1:]]
+    if stem in {"sudo", "doas"}:
+        findings.append(("danger", "runs as administrator, outside the workspace's limits"))
+    if stem == "rm":
+        targets = ", ".join(operands) or "its arguments"
+        if {"-r", "-f"} <= flags or {"--recursive", "--force"} <= flags:
+            findings.append(("danger", f"deletes {targets} recursively, without confirmation"))
+        elif operands:
+            findings.append(("warn", f"deletes {targets}"))
+    if stem in RAW_DEVICE_CMDS:
+        findings.append(("danger", f"{stem} writes raw data and can destroy a disk or file"))
+    if stem == "chmod":
+        if any(o in {"777", "0777", "a+rwx"} for o in operands):
+            findings.append(("danger", "makes files writable by everyone"))
+        elif flags & {"-r", "--recursive"}:
+            findings.append(("warn", "changes permissions recursively"))
+    if stem == "git" and raw:
+        verb = raw[0]
+        if verb == "push" and flags & {"-f", "--force", "--force-with-lease"}:
+            findings.append(("danger", "force-pushes: rewrites history others may already have"))
+        elif verb == "reset" and "--hard" in flags:
+            findings.append(("danger", "discards every uncommitted change"))
+        elif verb == "clean" and "-f" in flags:
+            findings.append(("danger", "deletes untracked files"))
+        elif verb in {"push", "pull", "clone", "fetch"}:
+            findings.append(("warn", f"reaches the network: git {verb}"))
+    if stem in NETWORK_CMDS:
+        host = next((m.group(1) for t in tokens if (m := URL_RE.search(t))), "")
+        findings.append(("warn", f"reaches the network{': ' + host if host else ''}"))
+    if stem in INSTALLERS and any(v in raw for v in INSTALL_VERBS):
+        findings.append(("warn", f"installs packages with {stem}, which can run their own scripts"))
+    if stem == "find" and ("-delete" in raw or "-exec" in raw):
+        findings.append(("warn", "deletes or runs a command on every file it matches"))
+    if stem in PROCESS_KILLERS:
+        findings.append(("warn", "stops running processes"))
+    if stem == "ssh":
+        findings.append(("warn", "runs a command on another machine, where none of Kyklos's limits apply"))
+    if stem == "tee":
+        for target in operands:
+            findings.append(("warn", f"writes {target}"))
+    if stem in INTERPRETERS and _has_inline_code(tokens):
+        findings.append(("note", f"runs inline code through {stem}"))
+    outside = next((o for o in operands if _outside_workspace(o)), "")
+    if outside:
+        findings.append(("warn", f"touches {outside}, outside the workspace"))
+    first = tokens[0].strip("\"'")
+    script = first if ("/" in first or first.startswith(".")) and _looks_like_script(first) else ""
+    if not script and stem in INTERPRETERS and not _has_inline_code(tokens):
+        script = next((t.strip("\"'") for t in tokens[1:] if _looks_like_script(t)), "")
+    if script:  # the real behaviour lives in a file the panel isn't showing
+        findings.append(("note", f"runs the script {script}, whose contents aren't shown here"))
+    elif stem and stem not in KNOWN_COMMANDS and COMMAND_WORD_RE.match(tokens[0]) \
+            and stem not in SHELL_KEYWORDS:
+        findings.append(("note", f"runs {stem}, which Kyklos doesn't recognise"))
+    return findings
+
+
+
 def is_auto_allowed(name: str, args: dict, always_allowed: set[str]) -> bool:
     """True if a tool call may run without prompting the user."""
     if name in SAFE_TOOLS:
@@ -322,21 +591,31 @@ def is_auto_allowed(name: str, args: dict, always_allowed: set[str]) -> bool:
     return name in always_allowed
 
 
-def permission_options(name: str, args: dict) -> tuple[bool, str]:
-    """What a permission prompt may offer for this call: (touches_secret, suggested_bash_prefix).
-    Shared by the plain prompt and the UI so both apply the same rules."""
+def permission_options(name: str, args: dict) -> tuple[bool, str, list]:
+    """What a permission prompt may offer: (touches_secret, suggested_bash_prefix, findings).
+    Shared by the plain prompt and the UI so both apply the same rules and say the same things.
+
+    A danger finding withholds the prefix, the same way a secret reference does: saving a rule from
+    a destructive command would auto-approve every later command that matches it.
+    """
     cmd = str(args.get("command", "")) if name == "bash" else ""
+    findings = explain_command(cmd) if cmd else []
     touches_secret = name == "bash" and command_touches_secret(cmd)
-    prefix = suggest_prefix(cmd) if name == "bash" and not touches_secret else ""
-    return touches_secret, prefix
+    prefix = "" if (touches_secret or has_danger(findings)) else (suggest_prefix(cmd) if cmd else "")
+    return touches_secret, prefix, findings
+
+
+def has_danger(findings: list) -> bool:
+    return any(level == "danger" for level, _ in findings)
 
 
 def apply_permission_answer(name: str, answer: str, always_allowed: set, touches_secret: bool,
-                            prefix: str) -> bool:
+                            prefix: str, danger: bool = False) -> bool:
     """Apply the user's answer ('y', 'n', 'a', 'p' or 'p <custom prefix>'). Returns True if allowed.
-    'a' and 'p' save a rule in always_allowed; neither is offered for commands touching secrets."""
+    'a' and 'p' save a rule in always_allowed; neither is offered for a command that touches a
+    secret or carries a danger finding, which must be approved one run at a time."""
     low = answer.strip().lower()
-    if not touches_secret and low in ("a", "always"):
+    if not touches_secret and not danger and low in ("a", "always"):
         always_allowed.add(name)
         return True
     if prefix and (low in ("p", "prefix") or low.startswith("p ")):
@@ -370,9 +649,13 @@ def ask_permission(name: str, args: dict, always_allowed: set) -> tuple[bool, st
                 shown = shown[:600] + f"... ({len(shown)} chars)"
             print(f"  {key}: {shown}")
 
-    touches_secret, prefix = permission_options(name, args)
-    if touches_secret:
-        print("  \033[31m! This command references a secret file.\033[0m")
+    touches_secret, prefix, findings = permission_options(name, args)
+    for level, text in findings:  # what the command would do, before you answer
+        color = {"danger": "\033[31m", "warn": "\033[33m"}.get(level, "\033[2m")
+        mark = "! " if level in ("danger", "warn") else "  "
+        print(f"  {color}{mark}{text}\033[0m")
+    danger = has_danger(findings)
+    if danger:
         prompt = "  Allow once? [y]es / [n]o: "
     elif prefix:
         prompt = f"  Allow? [y]es / [n]o / [p]refix '{prefix}' / [a]lways for bash: "
@@ -384,7 +667,7 @@ def ask_permission(name: str, args: dict, always_allowed: set) -> tuple[bool, st
     except EOFError:  # no keyboard, e.g. piped or scripted run
         print("  (no input available: denied)")
         return False, NO_APPROVER_NOTE.format(name=name)
-    if apply_permission_answer(name, answer, always_allowed, touches_secret, prefix):
+    if apply_permission_answer(name, answer, always_allowed, touches_secret, prefix, danger):
         return True, ""
     reason = input("  Reason to tell the model (optional): ").strip()
     return False, denial_note(name, reason)
@@ -423,7 +706,8 @@ class Agent:
     def __init__(self, client, model: str, workspace: Path, permission=ask_permission,
                  context_window: int = DEFAULT_CONTEXT_WINDOW, tool_names: set = None,
                  depth: int = 0, always_allowed: set = None, plan_mode: bool = False,
-                 before_write=None, on_event=console_observer, sleep=time.sleep, effort: str = "default"):
+                 before_write=None, on_event=console_observer, sleep=time.sleep, effort: str = "default",
+                 max_steps: int = DEFAULT_MAX_STEPS):
         self.client = client
         self.model = model
         self.active_snapshots: dict[Path, bytes | None] | None = None
@@ -436,6 +720,7 @@ class Agent:
         self.on_event = on_event
         self.sleep = sleep
         self.effort = effort or "default"  # thinking effort label; see effort_request_value()
+        self.max_steps = max_steps
         all_schemas = SCHEMAS + [TASK_SCHEMA]
         if tool_names is None:
             tool_names = {s["function"]["name"] for s in all_schemas}
@@ -709,7 +994,7 @@ class Agent:
                     context_window=self.context_window, tool_names=SUBAGENT_TOOLS[mode],
                     depth=self.depth + 1, always_allowed=self.always_allowed,
                     before_write=self._before_write, on_event=self.on_event, sleep=self.sleep,
-                    effort=self.effort)
+                    effort=self.effort, max_steps=self.max_steps)
         sub._emit("subagent_start", description=description, mode=mode)
         answer = sub.send(prompt)
         self.session_tokens += sub.session_tokens  # a subagent's calls are billed to this session too
@@ -737,7 +1022,8 @@ class Agent:
         self.messages.append({"role": "user", "content": user_text})
         self.current_request = user_text
         compactions = 0
-        for step in range(1, MAX_STEPS + 1):
+        tools_run = 0
+        for step in range(1, self.max_steps + 1):
             self.last_steps = step
             if self.context_tokens() > self.context_window * COMPACT_AT:
                 if compactions >= MAX_COMPACTIONS_PER_TURN:
@@ -774,6 +1060,7 @@ class Agent:
             if msg.content:
                 self._emit("thought", text=msg.content)
             for tc in msg.tool_calls:
+                tools_run += 1
                 self._emit("tool_call", name=tc.function.name, arguments=tc.function.arguments)
                 result = self.run_tool(tc.function.name, tc.function.arguments)
                 # SEC-04: secrets never reach the model (or the screen) through tool output.
@@ -784,7 +1071,18 @@ class Agent:
                 self._emit("tool_result", name=tc.function.name, result=result)
                 self.messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
-        return f"(Stopped after {MAX_STEPS} steps without a final answer.)"
+        return self._step_limit_note(tools_run)
+
+    def _step_limit_note(self, tools_run: int) -> str:
+        """What the turn managed and how to carry on. The step cap is a budget, not a failure: the
+        conversation is untouched, so "continue" picks up exactly where this left off."""
+        done = f"{tools_run} tool call{'' if tools_run == 1 else 's'}"
+        touched = sorted(self.tools._rel(p) for p in (self.active_snapshots or {}))
+        if touched:
+            shown = ", ".join(touched[:3]) + (f" and {len(touched) - 3} more" if len(touched) > 3 else "")
+            done += f", {len(touched)} file{'' if len(touched) == 1 else 's'} changed ({shown})"
+        return (f"(Stopped after {self.max_steps} steps: {done}. The conversation is kept — send "
+                f'"continue" to carry on, /undo to revert this turn, or raise MAX_STEPS in .env.)')
 
 
 # Context window: CONTEXT_WINDOW wins if set; otherwise ask Ollama cloud's /api/show for the model's
@@ -815,6 +1113,20 @@ def detect_context_window(base_url: str, api_key: str, model: str, timeout: floa
         return None
     lengths = [v for k, v in info.items() if k.endswith("context_length") and isinstance(v, int)]
     return lengths[0] if lengths and lengths[0] >= MIN_DETECTED_CONTEXT else None
+
+
+def choose_max_steps(env) -> int:
+    """How many model turns one request may take. A big refactor legitimately needs more than the
+    default; a flaky model you're experimenting with wants fewer."""
+    if not env.get("MAX_STEPS"):
+        return DEFAULT_MAX_STEPS
+    try:
+        steps = int(str(env["MAX_STEPS"]).replace("_", "").replace(",", ""))
+    except ValueError:
+        raise ValueError(f"MAX_STEPS must be a whole number of steps, like 50 (got {env['MAX_STEPS']!r})")
+    if steps < 1:
+        raise ValueError(f"MAX_STEPS must be at least 1 (got {steps})")
+    return steps
 
 
 def choose_context_window(env, detected: int | None) -> tuple[int, str]:
@@ -1522,6 +1834,7 @@ def main() -> None:
         sys.exit(f"Kyklos isn't trusted to work in {workspace}. Run kyklos there in a terminal to decide, "
                  "or pass --trust to allow it for one run.")
     agent = Agent(client, model, workspace, context_window=window, plan_mode=plan_mode, effort=effort,
+                  max_steps=choose_max_steps(os.environ),
                   **({"permission": ui.permission, "on_event": ui.observer} if ui else {}))
     agent.context_source = window_source
     agent.model_source = model_source

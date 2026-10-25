@@ -217,7 +217,7 @@ def gradient_rule(length=38, label=None):  # as wide as the wordmark above it
 def banner():
     section("banner")
     print(large_wordmark(), end="")
-    print(gradient_rule(label="v0.2.0"))  # keep in step with __version__ in kyklos.py
+    print(gradient_rule(label="v0.3.0"))  # keep in step with __version__ in kyklos.py
     print()
     word = gradient("kyklos", ["#E8FBFF", "aqua", "sky", "deep"])  # first letter is the white glint
     meta = c("frost", "  ·  kimi-k2.7-code  ·  kyklos-harness  ·  AGENTS.md loaded")

@@ -26,8 +26,8 @@ from rich.text import Text
 from rich.theme import Theme
 
 from kyklos import (BROAD_WARNING, EXIT, NO_APPROVER_NOTE, COMMANDS, TRUST_EXPLANATION, CommandContext,
-                    __version__, apply_permission_answer, denial_note, permission_options, run_command,
-                    short_tokens)
+                    __version__, apply_permission_answer, denial_note, has_danger, permission_options,
+                    run_command, short_tokens)
 
 BASH_FULL_OUTPUT_LINES = 8  # bash output up to this many lines is shown in full; longer shows the last 3
 
@@ -678,7 +678,8 @@ class AeroUI:
         self._pause_live()
         depth = max(self._running) if self._running else 0
         indent = 2 + 4 * depth
-        touches_secret, prefix = permission_options(name, args)
+        touches_secret, prefix, findings = permission_options(name, args)
+        danger = has_danger(findings)
         width = self.width - indent
         body = []
         title = Text(f"Allow {name}?", style="bold")
@@ -691,9 +692,12 @@ class AeroUI:
             info["panel_shown"] = True
         elif name == "bash":
             body.append(Text("$ ", style="frost") + Text(str(args.get("command", "")), style="bold"))
-            if touches_secret:
-                body.append(Text(f"! This command references a secret file. It can only be allowed once.",
-                                 style="coral"))
+            if findings:  # what it would do, in words, before you answer
+                body.append(Text(""))
+                for level, text in findings:
+                    style = {"danger": "coral", "warn": "sun"}.get(level, "frost")
+                    mark = "! " if level in ("danger", "warn") else "  "
+                    body.append(Text(f"{mark}{text}", style=style))
         else:
             for key, value in args.items():
                 shown = str(value)
@@ -701,7 +705,7 @@ class AeroUI:
         keys = [("y", "yes"), ("n", "no")]
         if prefix:
             keys.append(("p", f"prefix '{prefix}'"))
-        if not touches_secret:
+        if not touches_secret and not danger:
             keys.append(("a", f"always {name}"))
         choices = Text()
         for i, (k, label) in enumerate(keys):
@@ -710,7 +714,7 @@ class AeroUI:
             choices += Text(k, style="bold sun") + Text(f" {label}")
         panel = Panel(Group(*body, Text(""), choices), title=title, title_align="left",
                       box=box.ASCII if self.ascii else box.ROUNDED,
-                      border_style="coral" if touches_secret else "sun", width=width, padding=(0, 1))
+                      border_style="coral" if danger else "sun", width=width, padding=(0, 1))
         self.print(panel, indent=indent)
 
         valid = {k for k, _ in keys}
@@ -730,7 +734,7 @@ class AeroUI:
         if key == "p":
             custom = self.edit_line("  prefix: ", default=prefix).strip()
             answer = f"p {custom}" if custom else "p"
-        if apply_permission_answer(name, answer, always_allowed, touches_secret, prefix):
+        if apply_permission_answer(name, answer, always_allowed, touches_secret, prefix, danger):
             how = {"y": "allowed once", "a": f"allowed {name} for this session",
                    "p": f"allowed commands starting with '{answer[2:].strip() or prefix}'"}[key]
             self.print(Text(f"{self.g['arrow']} {how}", style="frost"), indent=indent + 2)

@@ -9,6 +9,31 @@ titled by commit instead.
 
 ---
 
+## v0.3.0 — Readable Permissions (2026-10-25)
+
+You shouldn't have to parse a shell command in your head to answer `y` or `n`. Kyklos now says what a command would do before you decide, and when a turn runs out of steps it says what it managed and how to carry on.
+
+- **The step cap is configurable and explains itself (`kyklos.py`):** `MAX_STEPS` can be set in `.env` (default 50, validated like `CONTEXT_WINDOW`), carried on the `Agent` and inherited by subagents. Reaching it used to print `(Stopped after 50 steps without a final answer.)` and nothing else, which reads like a failure and gives you nowhere to go. It now reports what the turn managed and how to carry on:
+  ```
+  (Stopped after 50 steps: 55 tool calls, 2 files changed (a.ts, b.ts). The conversation is
+   kept — send "continue" to carry on, /undo to revert this turn, or raise MAX_STEPS in .env.)
+  ```
+  The cap is a budget, not an error: the conversation is untouched, so `continue` resumes mid-task. Worth knowing that a capped turn ends with no final answer and so adds no `turn_log` entry, though its messages remain.
+
+- **Permission prompts explain the command (`kyklos.py`, `ui.py`):** `explain_command` turns a shell command into plain-language findings at three levels — `danger`, `warn`, `note` — shown in the panel under the `$ command`, worst first, so you aren't choosing `y` or `n` from the raw text alone. It recognises piping a download into a shell, recursive deletes, `sudo`, force-pushes, `reset --hard`, raw-device writes, world-writable `chmod`, redirects, network calls, package installs, `find -delete`, process kills, paths outside the workspace, interpreters running inline code, and programs it doesn't know (which it says plainly).
+  - **The harness derives the explanation; the model is never asked.** The permission prompt exists because the model may propose something you didn't intend, so letting it narrate its own command would put the thing being checked in charge of the check — and a model steered by injected text would describe exactly the command you should refuse as routine. It also costs no API call at the moment you're waiting.
+  - **Findings gate the options, not just the text.** Any `danger` finding now withholds `p` and `a` and turns the border coral, extending to all destructive commands the rule that previously applied only to secret files. `apply_permission_answer` takes a `danger` flag; `permission_options` returns the findings so both front ends show and enforce the same thing.
+  - **Quote-aware parsing**, from a real command that broke all of it: `_split_top_level` splits on `&&`, `||`, `;` and `|` only outside quotes, so `grep -n "hasKey\|serverKeys\|verify" f.ts` is one command with one argument, not a four-stage pipeline running a program called `serverKeys`. `_unquoted` blanks quoted spans before the redirect scan, so `echo "a > b"` writes nothing.
+  - **A wrapper can no longer silence the command it runs.** `env X=1 rm -rf build` produced *no findings at all*, and `sudo rm -rf /srv` reported the escalation but never the delete — silence being far worse than noise, since an empty panel reads as "nothing to see". `_peel` now looks past leading `VAR=value` assignments and wrappers (`env`, `sudo`, `time`, `timeout`, `nohup`, `nice`, `xargs`, `exec`, …), and each layer is examined, so `sudo rm -rf /srv` reports both.
+  - Running a script says so — `./scripts/deploy.sh --prod` and `node server.js` note that the behaviour lives in a file the panel isn't showing, instead of the misleading "runs deploy, which Kyklos doesn't recognise". `ssh` says the command runs on another machine where none of Kyklos's limits apply; `tee` is reported as a write; shell keywords (`done`, `esac`, `elif`, …) are no longer listed as programs.
+  - **Heredoc bodies are data, not commands.** `cat > server.mjs <<'EOF' … EOF` writes a document; reading its contents as shell turned one file of JavaScript into thirteen findings, eight of them invented (`runs import`, `overwrites {`, a path from a URL string), burying the five real ones. `_strip_heredocs` removes the body and notes that it was written, leaving the findings that matter: what it overwrites and where it reaches.
+  - **`=>` is no longer read as a redirect.** Inline JavaScript is full of arrows, and `(c) => (body += c)` was reporting "overwrites (body". `->` and `>=` are excluded too; `2>>log.txt` still appends.
+  - Redirects understand `2>` and `&>`, and discarding output to `/dev/null` is no longer reported as overwriting a file. Shell builtins and everyday tools (`test`, `printf`, `xargs`, `jq`, `rg`, …) are recognised rather than reported as unknown programs. A chain longer than four names is summarised.
+  - Piping *any* command into a shell is flagged, not just `curl`/`wget`: `base64 -d payload | sh` earns a warning for the same reason.
+  - Documented in `DESIGN.md` and `README.md` as an aid to reading and **not a security boundary**: a regex over a string is not a shell, so an empty finding list means nothing was recognised, never that a command is safe — and the panel never claims otherwise.
+
+---
+
 ## v0.2.0 — Harness Observability (2026-10-25)
 
 Kyklos stops being opaque about itself: what it's holding in the window, what it can run, what it has changed on disk, and what it has spent — all visible without leaving the REPL.

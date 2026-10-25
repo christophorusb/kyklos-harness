@@ -69,7 +69,7 @@ Startup renders a large stylized rich-text wordmark in the Frutiger Aero gradien
     / ,<    \  / ,<  / /   / / / /\__ \
    / /| |   / / /| |/ /___/ /_/ /___/ /
   /_/ |_|  /_/_/ |_/_____/\____//____/
-  ───────────────────────────── v0.2.0 ─
+  ───────────────────────────── v0.3.0 ─
 
  ○ kyklos  ·  kimi-k2.7-code  ·  kyklos-harness  ·  AGENTS.md loaded
    /help for commands · ctrl+c to interrupt
@@ -134,7 +134,23 @@ Everything the model says to you appears in a rounded box shaped like the permis
 | any failure | — | a coral `✗` line with the reason |
 
 ### Permission panel
-A rounded box (`╭╮╰╯`) with a sun-colored border. The title reads `Allow <tool>?` plus the target. For edits the body is the diff (§4, "Diff blocks"); for `bash` it's the `$ command`. The last line holds single-key choices, accepted without pressing Enter: `y yes · n no · p prefix '<prefix>' · a always <tool>`. For commands that touch secret files, the border turns coral and the only choices are `y` and `n`.
+A rounded box (`╭╮╰╯`) with a sun-colored border. The title reads `Allow <tool>?` plus the target. For edits the body is the diff (§4, "Diff blocks"); for `bash` it's the `$ command` followed by what that command would do, in words. The last line holds single-key choices, accepted without pressing Enter: `y yes · n no · p prefix '<prefix>' · a always <tool>`.
+
+Findings come from `explain_command` in `kyklos.py` and read at three levels: **danger** in coral with `!`, **warn** in sun with `!`, **note** in frost, indented. They sort worst first. Any danger finding turns the border coral and withholds `p` and `a`, so a destructive command can only ever be approved one run at a time — the rule that used to apply to secret files alone.
+```
+ ╭─ Allow bash? ─────────────────────────────────────────────────────────╮
+ │ $ curl -sL https://get.example.sh/install | sh                        │
+ │                                                                       │
+ │ ! pipes downloaded content straight into sh, which runs it immediately │
+ │ ! reaches the network: get.example.sh                                 │
+ │   runs curl, then sh                                                  │
+ │                                                                       │
+ │ y yes  ·  n no                                                        │
+ ╰───────────────────────────────────────────────────────────────────────╯
+```
+The explanation is derived in the harness and never asked of the model. The prompt exists because the model may propose something you didn't intend, so letting it narrate its own command would hand the check to the thing being checked — and a model steered by injected text would write a reassuring description of exactly the command you should refuse.
+
+It is an aid to reading, **not a security boundary**: a regex over a string is not a shell, and quoting, variables, aliases, `eval` and encoding can all hide intent from it. An empty finding list means nothing was recognised. It never means the command is safe, and the panel never says it is.
 
 ### Diff blocks
 Each changed line is a **glass sheet**:
