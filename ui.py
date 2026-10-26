@@ -644,7 +644,9 @@ class AeroUI:
         spend = f"{data['session_tokens']:,} tokens" if data["session_tokens"] else "not reported here"
         rows += [Text(""),
                  self._view_row("session billed", spend, style="mint"),
-                 self._view_row("compacts at", f"{data['compact_at']:,}")]
+                 self._view_row("compacts at", f"{data['compact_at']:,}"
+                                + (f"  {self.g['dot']} COMPACT_ABOVE, not the window"
+                                   if data.get("compact_capped") else ""))]
         self._view_panel("context & token budget", rows)
 
     def _view_tools(self, data: dict) -> None:

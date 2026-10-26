@@ -40,7 +40,13 @@ RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 #   1. clear old tool results (they're bulky and can be re-fetched); keep all user and assistant text;
 #   2. only if still above PRUNE_TARGET, replace the old part with a model-written summary, plus a
 #      verbatim log of earlier requests and answers (summaries can't be trusted to keep those).
+# COMPACT_AT alone is a fraction of the window, so a 1M-token model wouldn't prune until 750k — and
+# every step until then re-sends the whole conversation. What a turn costs is set by how much context
+# each step carries, not by how much window is left over: a 178k conversation costs 178k per step
+# whether the ceiling is 128k or 1M. COMPACT_ABOVE caps that in absolute tokens, so a large window
+# buys headroom without buying a large running cost. Set COMPACT_ABOVE in .env to change it.
 DEFAULT_CONTEXT_WINDOW = 128_000
+DEFAULT_COMPACT_ABOVE = 100_000
 COMPACT_AT = 0.75
 KEEP_RECENT = 0.2
 PRUNE_TARGET = 0.6
@@ -707,7 +713,7 @@ class Agent:
                  context_window: int = DEFAULT_CONTEXT_WINDOW, tool_names: set = None,
                  depth: int = 0, always_allowed: set = None, plan_mode: bool = False,
                  before_write=None, on_event=console_observer, sleep=time.sleep, effort: str = "default",
-                 max_steps: int = DEFAULT_MAX_STEPS):
+                 max_steps: int = DEFAULT_MAX_STEPS, compact_above: int = DEFAULT_COMPACT_ABOVE):
         self.client = client
         self.model = model
         self.active_snapshots: dict[Path, bytes | None] | None = None
@@ -721,6 +727,7 @@ class Agent:
         self.sleep = sleep
         self.effort = effort or "default"  # thinking effort label; see effort_request_value()
         self.max_steps = max_steps
+        self.compact_above = compact_above
         all_schemas = SCHEMAS + [TASK_SCHEMA]
         if tool_names is None:
             tool_names = {s["function"]["name"] for s in all_schemas}
@@ -868,11 +875,25 @@ class Agent:
             return tokens + estimate_tokens(self.messages[count:])
         return estimate_tokens(self.messages)
 
+    def compaction_trigger(self) -> int:
+        """Compact at COMPACT_AT of the window, or COMPACT_ABOVE, whichever comes first."""
+        return min(int(self.context_window * COMPACT_AT), self.compact_above)
+
+    def compaction_budget(self) -> int:
+        """The size KEEP_RECENT and PRUNE_TARGET are measured against.
+
+        Derived from the trigger rather than the window, so capping the trigger also tightens what
+        compaction keeps. Otherwise compaction fires and then keeps everything, because 20% of a
+        1M-token window is larger than the whole conversation that set it off.
+        """
+        return int(self.compaction_trigger() / COMPACT_AT)
+
     def compact(self) -> bool:
         """Shrink the older part of the conversation; keep recent turns verbatim.
         Returns False if there was nothing to compact."""
         body = self.messages[1:]
-        keep_budget = int(self.context_window * KEEP_RECENT)
+        budget = self.compaction_budget()
+        keep_budget = int(budget * KEEP_RECENT)
         cut, kept = len(body), 0
         while cut > 0 and kept + estimate_tokens(body[cut - 1:cut]) <= keep_budget:
             cut -= 1
@@ -900,12 +921,12 @@ class Agent:
         if pruned:
             self.messages = [self.messages[0]] + pruned_body
             self.usage_mark = None
-            if self.context_tokens() <= self.context_window * PRUNE_TARGET:
+            if self.context_tokens() <= budget * PRUNE_TARGET:
                 self._emit("compact", stage="pruned", pruned=pruned, before=before, after=self.context_tokens())
                 return True
 
         # Stage 2: summarize the old part (from the original messages, so nothing is lost to stage 1).
-        transcript = render_transcript(body[:cut], max_chars=int(self.context_window * 0.5) * 4)
+        transcript = render_transcript(body[:cut], max_chars=int(budget * 0.5) * 4)
         response = self._complete(
             purpose="summary",
             model=self.model,
@@ -994,7 +1015,7 @@ class Agent:
                     context_window=self.context_window, tool_names=SUBAGENT_TOOLS[mode],
                     depth=self.depth + 1, always_allowed=self.always_allowed,
                     before_write=self._before_write, on_event=self.on_event, sleep=self.sleep,
-                    effort=self.effort, max_steps=self.max_steps)
+                    effort=self.effort, max_steps=self.max_steps, compact_above=self.compact_above)
         sub._emit("subagent_start", description=description, mode=mode)
         answer = sub.send(prompt)
         self.session_tokens += sub.session_tokens  # a subagent's calls are billed to this session too
@@ -1025,11 +1046,12 @@ class Agent:
         tools_run = 0
         for step in range(1, self.max_steps + 1):
             self.last_steps = step
-            if self.context_tokens() > self.context_window * COMPACT_AT:
+            if self.context_tokens() > self.compaction_trigger():
                 if compactions >= MAX_COMPACTIONS_PER_TURN:
                     return (f"(Stopped: compacted {compactions} times in one turn and the conversation keeps "
-                            f"outgrowing the {self.context_window:,}-token context window. Raise CONTEXT_WINDOW "
-                            f"if your model supports more, or split the task into smaller steps.)")
+                            f"outgrowing its {self.compaction_trigger():,}-token working limit. Raise "
+                            f"COMPACT_ABOVE (or CONTEXT_WINDOW, if that's what's binding) to carry more "
+                            f"context per step, or split the task into smaller steps.)")
                 if self.compact():
                     compactions += 1
             response = self._complete(
@@ -1113,6 +1135,20 @@ def detect_context_window(base_url: str, api_key: str, model: str, timeout: floa
         return None
     lengths = [v for k, v in info.items() if k.endswith("context_length") and isinstance(v, int)]
     return lengths[0] if lengths and lengths[0] >= MIN_DETECTED_CONTEXT else None
+
+
+def choose_compact_above(env) -> int:
+    """The absolute size a conversation may reach before Kyklos compacts it, whatever the window."""
+    if not env.get("COMPACT_ABOVE"):
+        return DEFAULT_COMPACT_ABOVE
+    try:
+        tokens = int(str(env["COMPACT_ABOVE"]).replace("_", "").replace(",", ""))
+    except ValueError:
+        raise ValueError(f"COMPACT_ABOVE must be a number of tokens, like 100000 "
+                         f"(got {env['COMPACT_ABOVE']!r})")
+    if tokens < 1_000:
+        raise ValueError(f"COMPACT_ABOVE must be at least 1000 tokens (got {tokens})")
+    return tokens
 
 
 def choose_max_steps(env) -> int:
@@ -1403,7 +1439,8 @@ def context_breakdown(agent: "Agent") -> dict:
                   ("Messages", estimate_tokens(talk)),
                   ("Tool results", estimate_tokens(results))],
         "session_tokens": agent.session_tokens,
-        "compact_at": int(agent.context_window * COMPACT_AT),
+        "compact_at": agent.compaction_trigger(),
+        "compact_capped": agent.compaction_trigger() < int(agent.context_window * COMPACT_AT),
     }
 
 
@@ -1834,7 +1871,7 @@ def main() -> None:
         sys.exit(f"Kyklos isn't trusted to work in {workspace}. Run kyklos there in a terminal to decide, "
                  "or pass --trust to allow it for one run.")
     agent = Agent(client, model, workspace, context_window=window, plan_mode=plan_mode, effort=effort,
-                  max_steps=choose_max_steps(os.environ),
+                  max_steps=choose_max_steps(os.environ), compact_above=choose_compact_above(os.environ),
                   **({"permission": ui.permission, "on_event": ui.observer} if ui else {}))
     agent.context_source = window_source
     agent.model_source = model_source

@@ -823,6 +823,70 @@ class SessionTokenTests(unittest.TestCase):
         self.assertEqual(agent.session_tokens, 0)
 
 
+class CompactionCeilingTests(unittest.TestCase):
+    """COMPACT_AT is a fraction of the window, so a 1M-token model never pruned and every step
+    re-sent the lot. COMPACT_ABOVE caps the conversation in absolute tokens instead."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def agent(self, window, **kw):
+        return Agent(FakeClient([]), "fake", self.ws, context_window=window,
+                     on_event=lambda *a, **k: None, **kw)
+
+    def test_small_windows_are_unchanged(self):
+        from kyklos import COMPACT_AT
+        for window in (32_000, 128_000):
+            with self.subTest(window=window):
+                agent = self.agent(window)
+                self.assertEqual(agent.compaction_trigger(), int(window * COMPACT_AT))
+                self.assertEqual(agent.compaction_budget(), window)
+
+    def test_a_big_window_is_capped(self):
+        from kyklos import DEFAULT_COMPACT_ABOVE
+        agent = self.agent(1_017_000)
+        self.assertEqual(agent.compaction_trigger(), DEFAULT_COMPACT_ABOVE)
+        self.assertLess(agent.compaction_trigger(), int(1_017_000 * 0.75))
+
+    def test_the_budget_follows_the_trigger_so_compaction_actually_keeps_less(self):
+        """20% of a 1M window is bigger than the conversation that set compaction off, so deriving
+        the budget from the window would compact and then keep everything."""
+        from kyklos import KEEP_RECENT
+        agent = self.agent(1_017_000)
+        self.assertLess(int(agent.compaction_budget() * KEEP_RECENT), agent.compaction_trigger())
+
+    def test_a_long_conversation_on_a_huge_window_now_compacts(self):
+        agent = self.agent(1_017_000)
+        agent.messages = [{"role": "system", "content": "s"}]
+        for i in range(60):
+            agent.messages.append({"role": "assistant", "content": "",
+                                   "tool_calls": [{"id": str(i), "type": "function",
+                                                   "function": {"name": "read_file", "arguments": "{}"}}]})
+            agent.messages.append({"role": "tool", "tool_call_id": str(i), "content": "x" * 40_000})
+        before = agent.context_tokens()
+        self.assertGreater(before, agent.compaction_trigger())
+        self.assertTrue(agent.compact())
+        self.assertLess(agent.context_tokens(), before)
+
+    def test_choose_compact_above_defaults_and_validates(self):
+        from kyklos import DEFAULT_COMPACT_ABOVE, choose_compact_above
+        self.assertEqual(choose_compact_above({}), DEFAULT_COMPACT_ABOVE)
+        self.assertEqual(choose_compact_above({"COMPACT_ABOVE": "250_000"}), 250_000)
+        for bad in ("plenty", "500"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    choose_compact_above({"COMPACT_ABOVE": bad})
+
+    def test_tokens_command_reports_the_real_trigger(self):
+        from kyklos import context_breakdown
+        data = context_breakdown(self.agent(1_017_000))
+        self.assertEqual(data["compact_at"], 100_000)
+        self.assertTrue(data["compact_capped"])
+        self.assertFalse(context_breakdown(self.agent(128_000))["compact_capped"])
+
+
 class StepLimitTests(unittest.TestCase):
     """The per-turn step budget: configurable, and it says how to carry on when it runs out."""
 

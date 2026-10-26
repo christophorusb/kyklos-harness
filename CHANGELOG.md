@@ -9,6 +9,16 @@ titled by commit instead.
 
 ---
 
+## Unreleased
+
+- **Compaction has an absolute ceiling (`kyklos.py`, `ui.py`):** `COMPACT_ABOVE` (100k by default, settable in `.env`) caps how large a conversation may grow before Kyklos prunes it, whatever the context window. `COMPACT_AT` alone is a *fraction of the window*, so a 1M-token model wouldn't compact until 750k — and a real session diagnosed from its saved JSONL compacted **zero times across 30.8M billed tokens**, because its conversation peaked at 178k, only 17% of the window.
+  - Every step re-sends the whole conversation, so cost is set by how much context each step carries, not by how much window is spare: that session's 234 calls averaged 118k tokens each, and prompt re-sending alone accounts for 90% of the bill. The perverse consequence was that declaring a *larger* window made the session more expensive, because it pushed the pruning threshold further away.
+  - `compaction_trigger()` is `min(window × COMPACT_AT, COMPACT_ABOVE)`, and `compaction_budget()` is derived from the trigger rather than the window — otherwise compaction fires and then keeps everything, since 20% of a 1M window is larger than the conversation that set it off.
+  - Replaying that real session: capping at 100k would have cut prompt tokens **39%** (27.7M → 16.8M) with three compactions; 60k saves 51%, 150k saves 17%. Windows of 128k and below behave exactly as before.
+  - `/tokens` reports the real trigger and says when it's `COMPACT_ABOVE` rather than the window doing the limiting.
+
+---
+
 ## v0.3.0 — Readable Permissions (2026-10-25)
 
 You shouldn't have to parse a shell command in your head to answer `y` or `n`. Kyklos now says what a command would do before you decide, and when a turn runs out of steps it says what it managed and how to carry on.

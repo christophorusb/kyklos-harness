@@ -152,11 +152,13 @@ In a live test, a subagent took 12 steps and read five whole files, while the ma
 
 Local Ollama isn't asked: it reports the model's trained maximum, but the server runs with a smaller limit unless you configure it (`OLLAMA_CONTEXT_LENGTH`), and silently cuts off what doesn't fit. Set `CONTEXT_WINDOW` to that value instead.
 
-**Context compaction:** Kyklos tracks token use from the API's `usage` field, or estimates it at ~4 characters per token. When the conversation passes 75% of the context window, it shrinks everything older than the most recent ~20%:
+**Context compaction:** Kyklos tracks token use from the API's `usage` field, or estimates it at ~4 characters per token. When the conversation passes 75% of the context window **or `COMPACT_ABOVE` tokens (100k by default), whichever comes first**, it shrinks everything older than the most recent ~20%:
 1. **Clear old tool results.** File contents and command output make up most of the context and can be fetched again. All user and assistant messages stay word for word, and no API call is needed. Usually this is enough.
 2. **Summarize, only if that's not enough.** The same model summarizes the older turns. Kyklos then attaches the current request and a log of earlier requests and answers, both word for word, so facts the user was already told can't be lost in a weak summary.
 
-The step the model is working on is always kept whole, and a tool call is never separated from its result. If one turn needs more than 3 compactions, Kyklos stops with a message instead of looping: the task doesn't fit the window.
+The step the model is working on is always kept whole, and a tool call is never separated from its result. If one turn needs more than 3 compactions, Kyklos stops with a message instead of looping: the task doesn't fit the working limit.
+
+**Why the absolute cap.** Every step re-sends the whole conversation, so what a turn costs is set by how much context each step carries, not by how much window is left over — a 178k conversation costs 178k per step whether the ceiling is 128k or 1M. With only a window fraction, a 1M-token model wouldn't prune until 750k, so a big window quietly becomes a big running cost. Replaying a real 234-call session, capping at 100k would have cut its prompt tokens by **39%** (27.7M → 16.8M), compacting three times. Raise `COMPACT_ABOVE` to carry more context per step, lower it to spend less and re-fetch more; below the cap, nothing changes.
 
 **Environment awareness:** at startup Kyklos runs `--version` on common commands (`py`, `python`, `node`, `git`…). It tells the model which ones work and which don't, so the model doesn't waste calls finding out. On Windows it also names the Unix tools PowerShell lacks (`grep`, `sed`, `awk`, `head`, `tail`) and what to use instead.
 
