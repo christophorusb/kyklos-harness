@@ -790,8 +790,12 @@ class Agent:
             commands=describe_commands(),
         )
         if "task" in self.tool_names:
-            prompt += ("\n- For broad searches or investigations that would take many steps, "
-                       "delegate them to a subagent with the task tool.")
+            # "Broad searches" was too vague to act on: a real session made 134 exploratory calls,
+            # 87% of its tool output, without delegating once. Give a threshold it can apply.
+            prompt += ("\n- Every step re-sends this whole conversation, so each file you read here "
+                       "is paid for again on every step that follows. If answering something will "
+                       "take more than two or three reads or searches, delegate it with the task "
+                       "tool (mode 'explore'): only its answer comes back, not every file it read.")
         if self.plan_mode:
             prompt += PLAN_PROMPT
         if self.depth > 0:
@@ -1044,6 +1048,7 @@ class Agent:
         self.current_request = user_text
         compactions = 0
         tools_run = 0
+        hinted = False  # the delegation nudge is once per turn, not once per tool call
         for step in range(1, self.max_steps + 1):
             self.last_steps = step
             if self.context_tokens() > self.compaction_trigger():
@@ -1090,10 +1095,27 @@ class Agent:
                 if redacted:
                     result += (f"\n\n[Kyklos redacted {redacted} secret value{'s' if redacted > 1 else ''} "
                                "from this output. Don't try to recover them.]")
+                if not hinted and self._should_hint_delegation():
+                    result += f"\n\n{self._delegation_hint()}"
+                    hinted = True
                 self._emit("tool_result", name=tc.function.name, result=result)
                 self.messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
         return self._step_limit_note(tools_run)
+
+    def _should_hint_delegation(self) -> bool:
+        """Once the conversation is half way to compaction, further reading here is expensive.
+
+        The model has no way to know that: it sees the files it read, not the cost of carrying them
+        on every step that follows. A session that read 134 files without delegating once wasn't
+        ignoring the instruction so much as missing the signal.
+        """
+        return "task" in self.tool_names and self.context_tokens() > self.compaction_trigger() // 2
+
+    def _delegation_hint(self) -> str:
+        return (f"[Kyklos: this conversation is about {self.context_tokens():,} tokens, and every "
+                f"further step re-sends all of it. For more reading or searching, use the task tool "
+                f"with mode 'explore' — only its answer comes back, not every file it reads.]")
 
     def _step_limit_note(self, tools_run: int) -> str:
         """What the turn managed and how to carry on. The step cap is a budget, not a failure: the

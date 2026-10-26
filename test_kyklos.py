@@ -352,7 +352,9 @@ class CompactionTests(unittest.TestCase):
         self.assertEqual(final_call[1]["content"], "inspect the files")
         self.assertTrue(final_call[3]["content"].startswith(PRUNED_MARK))
         self.assertNotIn("x" * 1000, json.dumps(final_call))
-        self.assertEqual(final_call[5]["content"].split("\t")[1], "hello")  # recent result kept verbatim
+        # Recent result kept verbatim. It may carry a trailing Kyklos note (redaction, delegation),
+        # the same way the redaction note has always been appended, so check the output itself.
+        self.assertTrue(final_call[5]["content"].split("\t")[1].startswith("hello"))
         assert_tool_results_paired(self, final_call)
 
     def test_earlier_answers_survive_compaction(self):
@@ -885,6 +887,54 @@ class CompactionCeilingTests(unittest.TestCase):
         self.assertEqual(data["compact_at"], 100_000)
         self.assertTrue(data["compact_capped"])
         self.assertFalse(context_breakdown(self.agent(128_000))["compact_capped"])
+
+
+class DelegationHintTests(unittest.TestCase):
+    """A real session made 134 exploratory calls — 87% of its tool output — without delegating once.
+    The model can see the files it read, but not the cost of re-sending them on every later step."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        (self.ws / "a.txt").write_text("hello\n" * 500)
+        self.addCleanup(self.tmp.cleanup)
+
+    def run_turn(self, preload=0, **kw):
+        calls = [reply(tool_calls=[tool_call(str(i), "read_file", path="a.txt")]) for i in range(3)]
+        calls.append(reply("done"))
+        agent = Agent(FakeClient(calls), "fake", self.ws, context_window=1_017_000,
+                      permission=allow_all, on_event=lambda *a, **k: None, **kw)
+        if preload:
+            agent.messages.append({"role": "user", "content": "x" * preload})
+        agent.send("look around")
+        return agent, [m for m in agent.messages if "use the task tool" in (m.get("content") or "")]
+
+    def test_quiet_while_the_conversation_is_small(self):
+        _, hints = self.run_turn()
+        self.assertEqual(hints, [])
+
+    def test_hints_once_a_turn_when_the_context_is_getting_expensive(self):
+        agent, hints = self.run_turn(preload=300_000)
+        self.assertEqual(len(hints), 1, "the nudge is per turn, not per tool call")
+        self.assertIn("mode 'explore'", hints[0]["content"])
+        self.assertIn("tokens", hints[0]["content"])
+
+    def test_silent_when_there_is_no_subagent_to_delegate_to(self):
+        _, hints = self.run_turn(preload=300_000, tool_names={"read_file", "grep", "glob"})
+        self.assertEqual(hints, [], "suggesting `task` where it isn't offered would be noise")
+
+    def test_the_threshold_tracks_the_compaction_trigger(self):
+        agent = Agent(FakeClient([]), "fake", self.ws, context_window=1_017_000)
+        agent.messages.append({"role": "user", "content": "x" * 10})
+        self.assertFalse(agent._should_hint_delegation())
+        agent.messages.append({"role": "user", "content": "x" * (agent.compaction_trigger() * 3)})
+        self.assertTrue(agent._should_hint_delegation())
+
+    def test_the_system_prompt_gives_a_threshold_not_a_vague_nudge(self):
+        agent = Agent(FakeClient([]), "fake", self.ws)
+        prompt = agent.messages[0]["content"]
+        self.assertIn("task", prompt)
+        self.assertIn("re-sends this whole conversation", prompt)
 
 
 class StepLimitTests(unittest.TestCase):
