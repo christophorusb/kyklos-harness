@@ -25,7 +25,8 @@ from rich.panel import Panel
 from rich.text import Text
 from rich.theme import Theme
 
-from kyklos import (BROAD_WARNING, EXIT, NO_APPROVER_NOTE, COMMANDS, TRUST_EXPLANATION, CommandContext,
+from kyklos import (BASH_MODE_CAVEAT, BASH_MODE_EXPLANATION, BROAD_WARNING, EXIT, NO_APPROVER_NOTE,
+                    COMMANDS, TRUST_EXPLANATION, CommandContext,
                     __version__, apply_permission_answer, denial_note, has_danger, permission_options,
                     run_command, short_tokens)
 
@@ -845,6 +846,34 @@ class AeroUI:
 
     # -- folder trust (shown once per folder, before anything is read from it) --
 
+    def ask_bash_mode(self) -> bool:
+        """Returns True to run unflagged bash unprompted for this session."""
+        keys = [("a", "ask every time"), ("u", "run unflagged, ask on the rest")]
+        choices = Text()
+        for i, (k, label) in enumerate(keys):
+            if i:
+                choices += Text(f"  {self.g['dot']}  ", style="frost")
+            choices += Text(k, style="bold sun") + Text(f" {label}")
+        body = [Text(BASH_MODE_EXPLANATION, style="frost"), Text(""),
+                Text(f"! {BASH_MODE_CAVEAT}", style="sun")]
+        self.print()
+        self.print(Panel(Group(*body, Text(""), choices),
+                         title=Text("How should bash commands be approved?", style="bold"),
+                         title_align="left", box=box.ASCII if self.ascii else box.ROUNDED,
+                         border_style="sun", width=self.width - 2, padding=(0, 1)), indent=2)
+        while True:
+            key = (self.read_key() or "a").lower()
+            if key in ("\x03", "\x1b"):
+                key = "a"
+            if key in {k for k, _ in keys}:
+                break
+        auto = key == "u"
+        note = (f"{self.g['arrow']} unflagged commands will run unprompted this session"
+                if auto else f"{self.g['arrow']} every bash command will ask")
+        self.print(Text(note, style="frost"), indent=4)
+        self.print()
+        return auto
+
     def ask_trust(self, folder: Path, broad: bool) -> str:
         """Returns "yes" (trust and remember), "once" (this session) or "no"."""
         keys = ([] if broad else [("y", "yes, trust it")]) + [("o", "once, this session"), ("n", "no, quit")]
@@ -1027,6 +1056,8 @@ class AeroUI:
                 segs += [dot, ("frost", f"{short_tokens(used)} used")]
             if agent.plan_mode:
                 segs += [dot, ("plan", " PLAN ")]
+            if getattr(agent, "auto_bash", False):  # a relaxed rule should never be out of sight
+                segs += [dot, ("sun", "bash: unflagged runs")]
         segs += [dot, ("frost", self.workspace.name)]
         return segs
 

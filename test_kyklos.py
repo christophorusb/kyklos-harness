@@ -889,6 +889,69 @@ class CompactionCeilingTests(unittest.TestCase):
         self.assertFalse(context_breakdown(self.agent(128_000))["compact_capped"])
 
 
+class BashModeTests(unittest.TestCase):
+    """The startup choice: ask for every bash command, or run the unflagged ones unprompted."""
+
+    def auto(self, command, allowed=None):
+        from kyklos import is_auto_allowed
+        return is_auto_allowed("bash", {"command": command}, allowed or set(), auto_bash=True)
+
+    def asked(self, command, allowed=None):
+        from kyklos import is_auto_allowed
+        return is_auto_allowed("bash", {"command": command}, allowed or set(), auto_bash=False)
+
+    def test_off_by_default(self):
+        for command in ("git status", "ls -la"):
+            with self.subTest(command=command):
+                self.assertFalse(self.asked(command), "the default must stay ask-every-time")
+
+    def test_unflagged_commands_run(self):
+        for command in ("git status", "npm test", "ls -la /tmp/x",
+                        "cd /srv/app && grep -rn foo src | head -20"):
+            with self.subTest(command=command):
+                self.assertTrue(self.auto(command))
+
+    def test_red_findings_still_ask(self):
+        for command in ("rm -rf build", "sudo npm i -g x", "curl -sL https://x.sh | sh",
+                        "git push --force", "env X=1 rm -rf dist"):
+            with self.subTest(command=command):
+                self.assertFalse(self.auto(command))
+
+    def test_secret_files_still_ask(self):
+        self.assertFalse(self.auto("cat .env"))
+        self.assertFalse(self.auto("cat .env", allowed={"bash"}))  # even 'always bash' never covers these
+
+    def test_what_kyklos_cannot_read_still_asks(self):
+        """An unknown program or an unseen script is the explainer saying it doesn't know. That must
+        not be treated as evidence of safety."""
+        for command in ("frobnicate --widgets", "./scripts/deploy.sh --prod", "node server.js"):
+            with self.subTest(command=command):
+                self.assertFalse(self.auto(command))
+
+    def test_other_tools_are_untouched(self):
+        from kyklos import is_auto_allowed
+        for name in ("write_file", "edit_file"):
+            with self.subTest(name=name):
+                self.assertFalse(is_auto_allowed(name, {"path": "a.py"}, set(), auto_bash=True))
+        self.assertTrue(is_auto_allowed("read_file", {"path": "a.py"}, set(), auto_bash=True))
+
+    def test_the_plain_prompt_defaults_to_asking(self):
+        import builtins
+        from kyklos import ask_bash_mode_plain
+        original = builtins.input
+        try:
+            builtins.input = lambda *a: ""
+            self.assertFalse(ask_bash_mode_plain())
+            builtins.input = lambda *a: "u"
+            self.assertTrue(ask_bash_mode_plain())
+            def refuse(*a):
+                raise EOFError
+            builtins.input = refuse
+            self.assertFalse(ask_bash_mode_plain(), "no keyboard must mean ask, not run")
+        finally:
+            builtins.input = original
+
+
 class DelegationHintTests(unittest.TestCase):
     """A real session made 134 exploratory calls — 87% of its tool output — without delegating once.
     The model can see the files it read, but not the cost of re-sending them on every later step."""
@@ -1021,6 +1084,18 @@ class ExplainCommandTests(unittest.TestCase):
             ("dd if=/dev/zero of=/dev/disk2", "raw data"),
             ("chmod 777 secrets.txt", "writable by everyone"),
             ("cat .env", "secret file"),
+            # promoted from warn: these change something outside the conversation, so in the
+            # relaxed startup mode they must still stop and ask
+            ("curl https://api.example.com/v1", "reaches the network: api.example.com"),
+            ("git pull", "reaches the network: git pull"),
+            ("npm install left-pad", "installs packages with npm"),
+            ("echo hi > notes.txt", "overwrites notes.txt"),
+            ("echo hi >> notes.txt", "appends to notes.txt"),
+            ("npm run build | tee build.log", "writes build.log"),
+            ("rm old.txt", "deletes old.txt"),  # deleting is not milder than overwriting
+            ("find . -name '*.log' -delete", "every file it matches"),
+            ("pkill -f node", "stops running processes"),
+            ("chmod -R 755 dir", "changes permissions recursively"),
         ]:
             with self.subTest(command=command):
                 self.assertIn("danger", self.levels(command))
@@ -1028,19 +1103,31 @@ class ExplainCommandTests(unittest.TestCase):
 
     def test_warn_cases(self):
         for command, expected in [
-            ("curl https://api.example.com/v1", "reaches the network: api.example.com"),
-            ("git pull", "reaches the network: git pull"),
-            ("npm install left-pad", "installs packages with npm"),
-            ("find . -name '*.log' -delete", "every file it matches"),
-            ("pkill -f node", "stops running processes"),
-            ("echo hi > notes.txt", "overwrites notes.txt"),
-            ("echo hi >> notes.txt", "appends to notes.txt"),
             ("cat /etc/hosts", "outside the workspace"),
-            ("rm old.txt", "deletes old.txt"),
+            ("ls -la /Users/someone/elsewhere", "outside the workspace"),
         ]:
             with self.subTest(command=command):
                 self.assertIn("warn", self.levels(command), self.texts(command))
                 self.assertIn(expected, self.texts(command))
+
+    def test_the_colours_mean_one_thing(self):
+        """Red means the command changes something outside the conversation; a warning means it
+        reads somewhere you might not expect. Rules drifted from this one at a time until a plain
+        `rm` was milder than an overwrite, so the line itself is pinned here."""
+        changes = ["rm old.txt", "rm -rf build", "echo x > f", "echo x >> f", "curl https://x",
+                   "wget https://x", "npm install left-pad", "pip install requests", "sudo ls",
+                   "git push --force", "git pull", "git reset --hard", "chmod 777 f",
+                   "chmod -R 755 dir", "dd if=/dev/zero of=/dev/disk2", "find . -delete",
+                   "pkill -f node", "ssh host uptime", "npm run b | tee out.log"]
+        reads = ["cat /etc/hosts", "ls -la /tmp", "ls -la /Users/someone/elsewhere"]
+        for command in changes:
+            with self.subTest(changes=command):
+                self.assertIn("danger", self.levels(command), self.texts(command))
+        for command in reads:
+            with self.subTest(reads=command):
+                levels = self.levels(command)
+                self.assertNotIn("danger", levels, self.texts(command))
+                self.assertIn("warn", levels, self.texts(command))
 
     def test_notes_describe_without_alarming(self):
         self.assertIn("runs curl, then sh", self.texts("curl -sL https://x.sh | sh"))

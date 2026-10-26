@@ -487,7 +487,7 @@ def explain_command(command: str) -> list[tuple[str, str]]:
         target = target.strip("\"'")
         if target.lower() in NULL_SINKS:
             continue  # discarding output, not writing a file
-        findings.append(("warn", f"{'appends to' if op == '>>' else 'overwrites'} {target}"))
+        findings.append(("danger", f"{'appends to' if op == '>>' else 'overwrites'} {target}"))
     if command_touches_secret(command):
         findings.append(("danger", "names a secret file, so it can only ever be allowed once"))
     # Shell keywords aren't programs: "runs for, then do, then done" describes a loop, not commands.
@@ -497,7 +497,7 @@ def explain_command(command: str) -> list[tuple[str, str]]:
         extra = f", and {len(chain) - 4} more" if len(chain) > 4 else ""
         findings.append(("note", f"runs {shown}{extra}"))
 
-    order = {"danger": 0, "warn": 1, "note": 2}
+    order = {"danger": 0, "warn": 1, "opaque": 2, "note": 3}
     seen, unique = set(), []
     for finding in findings:
         if finding not in seen:
@@ -532,14 +532,14 @@ def _command_findings(tokens: list[str]) -> list[tuple[str, str]]:
         if {"-r", "-f"} <= flags or {"--recursive", "--force"} <= flags:
             findings.append(("danger", f"deletes {targets} recursively, without confirmation"))
         elif operands:
-            findings.append(("warn", f"deletes {targets}"))
+            findings.append(("danger", f"deletes {targets}"))
     if stem in RAW_DEVICE_CMDS:
         findings.append(("danger", f"{stem} writes raw data and can destroy a disk or file"))
     if stem == "chmod":
         if any(o in {"777", "0777", "a+rwx"} for o in operands):
             findings.append(("danger", "makes files writable by everyone"))
         elif flags & {"-r", "--recursive"}:
-            findings.append(("warn", "changes permissions recursively"))
+            findings.append(("danger", "changes permissions recursively"))
     if stem == "git" and raw:
         verb = raw[0]
         if verb == "push" and flags & {"-f", "--force", "--force-with-lease"}:
@@ -549,21 +549,21 @@ def _command_findings(tokens: list[str]) -> list[tuple[str, str]]:
         elif verb == "clean" and "-f" in flags:
             findings.append(("danger", "deletes untracked files"))
         elif verb in {"push", "pull", "clone", "fetch"}:
-            findings.append(("warn", f"reaches the network: git {verb}"))
+            findings.append(("danger", f"reaches the network: git {verb}"))
     if stem in NETWORK_CMDS:
         host = next((m.group(1) for t in tokens if (m := URL_RE.search(t))), "")
-        findings.append(("warn", f"reaches the network{': ' + host if host else ''}"))
+        findings.append(("danger", f"reaches the network{': ' + host if host else ''}"))
     if stem in INSTALLERS and any(v in raw for v in INSTALL_VERBS):
-        findings.append(("warn", f"installs packages with {stem}, which can run their own scripts"))
+        findings.append(("danger", f"installs packages with {stem}, which can run their own scripts"))
     if stem == "find" and ("-delete" in raw or "-exec" in raw):
-        findings.append(("warn", "deletes or runs a command on every file it matches"))
+        findings.append(("danger", "deletes or runs a command on every file it matches"))
     if stem in PROCESS_KILLERS:
-        findings.append(("warn", "stops running processes"))
+        findings.append(("danger", "stops running processes"))
     if stem == "ssh":
         findings.append(("warn", "runs a command on another machine, where none of Kyklos's limits apply"))
     if stem == "tee":
         for target in operands:
-            findings.append(("warn", f"writes {target}"))
+            findings.append(("danger", f"writes {target}"))
     if stem in INTERPRETERS and _has_inline_code(tokens):
         findings.append(("note", f"runs inline code through {stem}"))
     outside = next((o for o in operands if _outside_workspace(o)), "")
@@ -573,17 +573,23 @@ def _command_findings(tokens: list[str]) -> list[tuple[str, str]]:
     script = first if ("/" in first or first.startswith(".")) and _looks_like_script(first) else ""
     if not script and stem in INTERPRETERS and not _has_inline_code(tokens):
         script = next((t.strip("\"'") for t in tokens[1:] if _looks_like_script(t)), "")
+    # "opaque" reads like a note but means something sharper: Kyklos cannot say what this does.
+    # It is never auto-approved, because "I can't tell" must not come to mean "go ahead".
     if script:  # the real behaviour lives in a file the panel isn't showing
-        findings.append(("note", f"runs the script {script}, whose contents aren't shown here"))
+        findings.append(("opaque", f"runs the script {script}, whose contents aren't shown here"))
     elif stem and stem not in KNOWN_COMMANDS and COMMAND_WORD_RE.match(tokens[0]) \
             and stem not in SHELL_KEYWORDS:
-        findings.append(("note", f"runs {stem}, which Kyklos doesn't recognise"))
+        findings.append(("opaque", f"runs {stem}, which Kyklos doesn't recognise"))
     return findings
 
 
 
-def is_auto_allowed(name: str, args: dict, always_allowed: set[str]) -> bool:
-    """True if a tool call may run without prompting the user."""
+def is_auto_allowed(name: str, args: dict, always_allowed: set[str], auto_bash: bool = False) -> bool:
+    """True if a tool call may run without prompting the user.
+
+    `auto_bash` is the session mode chosen at startup: run bash commands unprompted unless the
+    explainer flags them. Secret files still always ask, as they always have.
+    """
     if name in SAFE_TOOLS:
         return True
     if name == "bash":
@@ -591,6 +597,8 @@ def is_auto_allowed(name: str, args: dict, always_allowed: set[str]) -> bool:
         if command_touches_secret(cmd):
             return False
         if "bash" in always_allowed:
+            return True
+        if auto_bash and not must_be_asked(cmd):
             return True
         prefixes = {r[5:] for r in always_allowed if r.startswith("bash:")}
         return bool(prefixes) and command_matches_prefixes(cmd, prefixes)
@@ -613,6 +621,17 @@ def permission_options(name: str, args: dict) -> tuple[bool, str, list]:
 
 def has_danger(findings: list) -> bool:
     return any(level == "danger" for level, _ in findings)
+
+
+def must_be_asked(command: str) -> bool:
+    """Whether a bash command still needs a prompt when bash is otherwise auto-approved.
+
+    Red findings, obviously. But also anything `opaque` — a program Kyklos has no rules for, or a
+    script whose contents it can't see. Those are the explainer admitting it doesn't know, and a
+    mode that ran them unasked would be relying on ignorance as evidence of safety.
+    """
+    findings = explain_command(command)
+    return has_danger(findings) or any(level == "opaque" for level, _ in findings)
 
 
 def apply_permission_answer(name: str, answer: str, always_allowed: set, touches_secret: bool,
@@ -728,6 +747,9 @@ class Agent:
         self.effort = effort or "default"  # thinking effort label; see effort_request_value()
         self.max_steps = max_steps
         self.compact_above = compact_above
+        # Chosen at startup, for this session only: a relaxation of the permission rules should
+        # never outlive the run it was agreed for, the way folder trust deliberately does.
+        self.auto_bash = False
         all_schemas = SCHEMAS + [TASK_SCHEMA]
         if tool_names is None:
             tool_names = {s["function"]["name"] for s in all_schemas}
@@ -977,7 +999,7 @@ class Agent:
             return f"Error: {e}"
         except (KeyError, TypeError) as e:
             return f"Error: bad arguments for {name}: {e}"
-        if not is_auto_allowed(name, args, self.always_allowed):
+        if not is_auto_allowed(name, args, self.always_allowed, self.auto_bash):
             allowed, note = self.permission(name, args, self.always_allowed)
             if not allowed:
                 return note
@@ -1020,6 +1042,7 @@ class Agent:
                     depth=self.depth + 1, always_allowed=self.always_allowed,
                     before_write=self._before_write, on_event=self.on_event, sleep=self.sleep,
                     effort=self.effort, max_steps=self.max_steps, compact_above=self.compact_above)
+        sub.auto_bash = self.auto_bash
         sub._emit("subagent_start", description=description, mode=mode)
         answer = sub.send(prompt)
         self.session_tokens += sub.session_tokens  # a subagent's calls are billed to this session too
@@ -1435,6 +1458,26 @@ def ask_trust_plain(folder: Path, broad: bool) -> str:
     except (EOFError, KeyboardInterrupt):
         return "no"
     return {"y": "yes", "yes": "yes", "o": "once", "once": "once"}.get(answer, "no")
+
+
+BASH_MODE_EXPLANATION = (
+    "Kyklos can run bash commands without asking, except the ones it flags: anything destructive, "
+    "anything naming a secret file, and anything it can't read — a program it has no rules for, or "
+    "a script whose contents it can't see. Those still stop for you. This lasts for this run only."
+)
+BASH_MODE_CAVEAT = ("Judging a command is a best effort, not a guarantee: quoting, variables and "
+                    "`eval` can hide what one does. Unflagged does not mean proven safe.")
+
+
+def ask_bash_mode_plain() -> bool:
+    """True to run unflagged bash unprompted. The plain REPL's version of the startup choice."""
+    print(f"\nHow should bash commands be approved?\n  {BASH_MODE_EXPLANATION}")
+    print(f"  \033[33m! {BASH_MODE_CAVEAT}\033[0m")
+    try:
+        answer = input("  [a]sk every time / [u]nflagged run unprompted: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer in ("u", "unflagged")
 
 
 # Slash commands: one registry shared by the plain REPL and the Aero UI, which also generates /help.
@@ -1895,6 +1938,10 @@ def main() -> None:
     agent = Agent(client, model, workspace, context_window=window, plan_mode=plan_mode, effort=effort,
                   max_steps=choose_max_steps(os.environ), compact_above=choose_compact_above(os.environ),
                   **({"permission": ui.permission, "on_event": ui.observer} if ui else {}))
+    # Asked after trust, and never remembered: unlike trusting a folder, this relaxes the rules that
+    # protect every run, so it is agreed once per session or not at all.
+    if sys.stdin.isatty() and not preapproved:
+        agent.auto_bash = (ui.ask_bash_mode() if ui else ask_bash_mode_plain())
     agent.context_source = window_source
     agent.model_source = model_source
     resume_note = None

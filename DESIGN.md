@@ -136,7 +136,7 @@ Everything the model says to you appears in a rounded box shaped like the permis
 ### Permission panel
 A rounded box (`╭╮╰╯`) with a sun-colored border. The title reads `Allow <tool>?` plus the target. For edits the body is the diff (§4, "Diff blocks"); for `bash` it's the `$ command` followed by what that command would do, in words. The last line holds single-key choices, accepted without pressing Enter: `y yes · n no · p prefix '<prefix>' · a always <tool>`.
 
-Findings come from `explain_command` in `kyklos.py` and read at three levels: **danger** in coral with `!`, **warn** in sun with `!`, **note** in frost, indented. They sort worst first. Any danger finding turns the border coral and withholds `p` and `a`, so a destructive command can only ever be approved one run at a time — the rule that used to apply to secret files alone.
+Findings come from `explain_command` in `kyklos.py` and read at four levels: **danger** in coral with `!`, **warn** in sun with `!`, and **opaque** and **note** in frost, indented. `opaque` looks like a note but means something sharper — Kyklos cannot say what this does (an unknown program, or a script it can't see) — and it is never auto-approved by the startup bash mode. They sort worst first. Any danger finding turns the border coral and withholds `p` and `a`, so a destructive command can only ever be approved one run at a time — the rule that used to apply to secret files alone.
 ```
  ╭─ Allow bash? ─────────────────────────────────────────────────────────╮
  │ $ curl -sL https://get.example.sh/install | sh                        │

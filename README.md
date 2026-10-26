@@ -60,6 +60,16 @@ Kyklos works in the folder you launch it from. Setting `WORKSPACE` in `.env` pin
 - `o` trusts it for this session only.
 - `n` quits.
 
+**Bash approval.** Right after the trust question, Kyklos asks how bash commands should be approved for this run:
+- `a` — **ask every time**, the default and what happens if you just press Enter, pipe input, or have no keyboard.
+- `u` — **run unflagged commands unprompted**, stopping only for the ones the explainer flags.
+
+In `u` mode a command still asks if it carries a red finding, names a secret file, runs a program Kyklos has no rules for, or runs a script whose contents it can't see. That last pair matters: "Kyklos can't tell what this does" must not come to mean "go ahead", so ignorance is never treated as evidence of safety.
+
+The line is: **red means it changes something outside the conversation** — deleting (recursively or not), overwriting, escalating, rewriting history, reaching the network, installing packages. **A warning means it reads somewhere you might not expect** — a path outside the workspace, for instance. Warnings don't stop a command in `u` mode. `write_file` and `edit_file` are unaffected and still ask in both modes.
+
+The choice is never remembered. Trusting a folder is a judgement about the folder and persists; this relaxes the rules that protect every run, so it's agreed once per session or not at all. While it's on, the status bar carries `bash: unflagged runs` so it can't be forgotten. And it rests on the explainer, which is a best effort at reading a command, not a guarantee — see the safety notes below.
+
 Your home folder and drive roots can only be trusted for one session. Piped or scripted runs can't answer the question, so they exit unless the folder is already trusted, or you pass `--trust` (or set `KYKLOS_TRUST=1`) for that run.
 
 **Where Kyklos keeps its data:** `~/.kyklos` (or `KYKLOS_HOME`), so projects stay clean:
