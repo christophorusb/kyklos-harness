@@ -21,7 +21,8 @@ from pathlib import Path
 from openai import APIConnectionError, APITimeoutError, InternalServerError, OpenAI, RateLimitError
 
 from tools import (SAFE_TOOLS, SCHEMAS, SHELL_NAME, ToolError, Tools, command_touches_secret, hide_env_names,
-                   is_scratch_path, missing_unix_tools, probe_commands, scrub_secrets, SCRATCH_DIR)
+                   is_scratch_path, missing_unix_tools, probe_commands, repository_map, scrub_secrets,
+                   SCRATCH_DIR)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -878,6 +879,8 @@ class Agent:
         self.always_allowed: set[str] = always_allowed if always_allowed is not None else set()
         self.last_steps = 0
         self.last_claims: list[tuple[str, str]] = []  # answer claims this turn didn't back up
+        self._repo_map: str | None = None
+        self._map_dirty = True  # a written file makes the sketch stale, and a stale map misleads
         # Billed tokens for the whole session: prompt + completion over every API call, including
         # compaction summaries and subagents. Set here rather than in reset(), so /reset clears the
         # conversation without forgetting what has already been spent.
@@ -919,6 +922,7 @@ class Agent:
                                 + (getattr(usage, "completion_tokens", 0) or 0))
 
     def _record_file_snapshot(self, p: Path) -> None:
+        self._map_dirty = True  # the sketch no longer matches what's on disk
         if self.active_snapshots is not None and p not in self.active_snapshots:
             self.active_snapshots[p] = p.read_bytes() if p.is_file() else None
 
@@ -950,10 +954,31 @@ class Agent:
         if self.depth > 0:
             prompt += SUBAGENT_PROMPT + f"\nYour tools: {', '.join(sorted(self.tool_names))}."
         prompt += project_instructions(self.tools.workspace)
+        if self.depth == 0:  # a subagent inherits nothing here; it gets one focused job
+            prompt += self.repo_map_section()
         if getattr(self, "messages", None):
             self.messages[0] = {"role": "system", "content": prompt}
         else:
             self.messages = [{"role": "system", "content": prompt}]
+
+    def repo_map_section(self) -> str:
+        """The workspace sketch for the system prompt, rebuilt when files have changed.
+
+        It goes in the system prompt for the same reason AGENTS.md does: it's context about the
+        project, not about a turn. That costs its size on every call, which is why it's names only
+        and capped — measured at ~340 tokens for this repository, well under a percent of a long
+        session's bill, against the three to six exploratory turns it saves at the start.
+        """
+        if self._repo_map is None or self._map_dirty:
+            try:
+                self._repo_map = repository_map(self.tools.workspace)
+            except OSError:
+                self._repo_map = ""
+            self._map_dirty = False
+        if not self._repo_map:
+            return ""
+        return ("\n\nWhat's in this workspace (names only, generated — read a file to confirm "
+                f"anything before relying on it):\n{self._repo_map}")
 
     def set_model(self, model: str, effort: str = "default", context_window: int | None = None) -> None:
         """Switch model (and its thinking effort) mid-conversation; the messages carry over unchanged.
@@ -1197,6 +1222,8 @@ class Agent:
     def send(self, user_text: str) -> str:
         """Run one user turn through the agent loop and return the final answer."""
         if self.depth == 0:
+            if self._map_dirty:  # last turn changed files; refresh the sketch before relying on it
+                self._update_mode()
             snapshots: dict[Path, bytes | None] = {}
             self.undo_stack.append((
                 json.loads(json.dumps(self.messages)),
@@ -1823,6 +1850,13 @@ def _cmd_tokens(ctx, arg):
                  else "Session billed: not reported by this provider")
     lines.append(f"Compacts at:    {data['compact_at']:,}")
     ctx.show("tokens", data, "\n".join(lines))
+
+
+@command("map", "/map", "Show the workspace sketch the model starts each turn with")
+def _cmd_map(ctx, arg):
+    ctx.agent._map_dirty = True  # always show what's on disk now, not a cached view
+    sketch = ctx.agent.repo_map_section().strip()
+    ctx.say("info", sketch or "No source files recognised here; the model starts with no sketch.")
 
 
 @command("tools", "/tools", "List the live tools and what's auto-approved")

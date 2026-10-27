@@ -929,6 +929,108 @@ class CompactionCeilingTests(unittest.TestCase):
         self.assertFalse(context_breakdown(self.agent(128_000))["compact_capped"])
 
 
+class RepositoryMapTests(unittest.TestCase):
+    """A names-only sketch of the workspace, so turn one doesn't start blind.
+
+    Names, never signatures, and never line numbers: a regex reading code gets a name right and a
+    parameter list wrong, and a map that misstates a signature is worse than no map, because the
+    model believes it. Line numbers are the first thing to go stale after an edit.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name).resolve()
+        self.addCleanup(self.tmp.cleanup)
+
+    def write(self, rel, text):
+        p = self.ws / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+
+    def map(self, **kw):
+        from tools import repository_map
+        return repository_map(self.ws, **kw)
+
+    def test_python_names_come_from_the_real_parser(self):
+        self.write("app.py", "def alpha():\n    pass\n\nclass Beta:\n    def gamma(self): pass\n")
+        sketch = self.map()
+        self.assertIn("app.py: alpha, Beta(gamma)", sketch)
+
+    def test_unparseable_python_yields_nothing_rather_than_guesses(self):
+        self.write("broken.py", "def (((\n")
+        self.assertNotIn("broken.py", self.map())
+
+    def test_exported_names_in_other_languages(self):
+        self.write("a.ts", "export function alpha() {}\nexport const beta = 1;\nexport interface Gamma {}\n")
+        self.write("b.go", "func Delta() {}\ntype Epsilon struct{}\n")
+        self.write("c.rs", "pub fn zeta() {}\npub struct Eta;\n")
+        sketch = self.map()
+        for name in ("alpha", "beta", "Gamma", "Delta", "Epsilon", "zeta", "Eta"):
+            self.assertIn(name, sketch, name)
+
+    def test_no_signatures_and_no_line_numbers(self):
+        self.write("app.py", "def alpha(first, second, third=3):\n    pass\n")
+        sketch = self.map()
+        self.assertIn("alpha", sketch)
+        self.assertNotIn("first", sketch)      # parameters are where a regex would lie
+        self.assertNotIn("app.py:1", sketch)   # line numbers go stale on the first edit
+
+    def test_noise_directories_are_skipped(self):
+        self.write("node_modules/dep/index.js", "export function nope() {}\n")
+        self.write(".venv/lib/thing.py", "def nope(): pass\n")
+        self.write(".kyklos/scratch/probe.mjs", "export function nope() {}\n")
+        self.assertEqual(self.map(), "")
+
+    def test_one_huge_file_cannot_spend_the_whole_budget(self):
+        self.write("huge.py", "".join(f"def fn_{i}_with_quite_a_long_name():\n    pass\n" for i in range(200)))
+        self.write("small.py", "def alpha():\n    pass\n")
+        sketch = self.map()
+        self.assertIn("small.py: alpha", sketch)  # not crowded out
+        self.assertIn("+", sketch)                 # huge.py was truncated
+
+    def test_shallow_paths_come_first(self):
+        self.write("top.py", "def alpha(): pass\n")
+        self.write("a/b/c/deep.py", "def beta(): pass\n")
+        rows = self.map().splitlines()
+        self.assertTrue(rows[0].startswith("top.py"), rows)
+
+    def test_it_stays_within_its_budget(self):
+        for i in range(60):
+            self.write(f"mod{i}.py", "".join(f"def fn_{i}_{j}(): pass\n" for j in range(30)))
+        self.assertLessEqual(len(self.map()) // 4, 1400)
+
+    def test_the_sketch_reaches_the_model_and_refreshes_after_edits(self):
+        self.write("src/lib.py", "def alpha():\n    pass\n")
+        agent = Agent(FakeClient([
+            reply(tool_calls=[tool_call("1", "write_file", path="src/lib.py",
+                                        content="def alpha(): pass\ndef beta(): pass\n")]),
+            reply("added beta"),
+            reply("nothing else"),
+        ]), "fake", self.ws, permission=allow_all, on_event=lambda *a, **k: None)
+        self.assertIn("src/lib.py: alpha", agent.messages[0]["content"])
+        agent.send("add beta")
+        agent.send("anything else?")   # refreshed at the start of the turn, before the model sees it
+        self.assertIn("src/lib.py: alpha, beta", agent.messages[0]["content"])
+
+    def test_a_subagent_gets_no_map(self):
+        self.write("app.py", "def alpha(): pass\n")
+        sub = Agent(FakeClient([]), "fake", self.ws, depth=1)
+        self.assertNotIn("What's in this workspace", sub.messages[0]["content"])
+
+    def test_the_sketch_says_it_is_generated(self):
+        self.write("app.py", "def alpha(): pass\n")
+        agent = Agent(FakeClient([]), "fake", self.ws)
+        self.assertIn("read a file to confirm", agent.messages[0]["content"])
+
+    def test_map_command_shows_it(self):
+        from kyklos import CommandContext, run_command
+        self.write("app.py", "def alpha(): pass\n")
+        said = []
+        agent = Agent(FakeClient([]), "fake", self.ws)
+        run_command(CommandContext(agent, lambda k, t: said.append(t), self.ws / "s.jsonl"), "/map")
+        self.assertIn("app.py: alpha", said[-1])
+
+
 class ScratchDirTests(unittest.TestCase):
     """A disposable corner of the workspace for one-off diagnostic scripts.
 

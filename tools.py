@@ -7,6 +7,7 @@ may not escape it.
 
 import os
 import platform
+import ast
 import re
 import shutil
 import subprocess
@@ -324,6 +325,92 @@ def is_scratch_path(workspace: Path, path: str) -> bool:
         return False
     root = scratch_dir(workspace)
     return resolved == root or root in resolved.parents
+
+
+# ---- repository map ---------------------------------------------------------------------------
+# What each file defines, so turn one doesn't start blind and spend itself on glob and grep.
+#
+# Names only — never signatures, never line numbers. A regex reading code gets a name right and a
+# parameter list wrong, and a map that misstates a signature is worse than no map, because the model
+# believes it. Line numbers are the first thing to go stale after an edit. A file path and a symbol
+# name are cheap to state correctly and cheap for the model to verify by reading.
+MAP_TOKEN_BUDGET = 1200
+MAP_CHARS_PER_FILE = 260
+MAP_SUFFIXES = {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".go", ".rs"}
+MAP_NAME_RES = [
+    re.compile(r"^\s*export\s+(?:default\s+)?(?:async\s+)?function\s+(\w+)", re.M),
+    re.compile(r"^\s*export\s+(?:abstract\s+)?class\s+(\w+)", re.M),
+    re.compile(r"^\s*export\s+(?:const|let|var)\s+(\w+)", re.M),
+    re.compile(r"^\s*export\s+(?:type|interface|enum)\s+(\w+)", re.M),
+    re.compile(r"^\s*func\s+(?:\([^)]*\)\s*)?([A-Z]\w*)", re.M),   # Go, exported
+    re.compile(r"^\s*type\s+([A-Z]\w*)\s", re.M),                  # Go
+    re.compile(r"^\s*pub\s+(?:async\s+)?fn\s+(\w+)", re.M),        # Rust
+    re.compile(r"^\s*pub\s+(?:struct|enum|trait)\s+(\w+)", re.M),  # Rust
+]
+
+
+def _python_names(source: str) -> list[str]:
+    """Top-level definitions, via the real parser rather than a regex."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return []
+    names = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not node.name.startswith("_"):
+            names.append(node.name)
+        elif isinstance(node, ast.ClassDef):
+            methods = [n.name for n in node.body
+                       if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                       and not n.name.startswith("_")]
+            names.append(f"{node.name}({', '.join(methods[:10])})" if methods else node.name)
+    return names
+
+
+def _declared_names(source: str) -> list[str]:
+    return [m for pattern in MAP_NAME_RES for m in pattern.findall(source)]
+
+
+def repository_map(workspace: Path, budget_tokens: int = MAP_TOKEN_BUDGET) -> str:
+    """A sketch of the workspace: which source files exist and what each one defines."""
+    rows = []
+    # Shallow paths first: when the budget runs out, top-level modules are likelier to be the
+    # entry points than something eight directories down, and alphabetical order would be arbitrary.
+    for path in sorted(workspace.rglob("*"), key=lambda p: (len(p.relative_to(workspace).parts), p)):
+        if path.suffix not in MAP_SUFFIXES or not path.is_file():
+            continue
+        parts = path.relative_to(workspace).parts
+        if SKIP_DIRS.intersection(parts) or any(p.startswith(".") for p in parts[:-1]):
+            continue
+        try:
+            source = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        names = _python_names(source) if path.suffix == ".py" else _declared_names(source)
+        names = list(dict.fromkeys(names))
+        if not names:
+            continue
+        # Cap by rendered length, not by count: one entry can be a class that expands to ten method
+        # names, so counting entries lets a file of classes spend the whole budget on its own.
+        # Knowing which file to open matters more than knowing everything inside one of them.
+        shown, used = [], 0
+        for name in names:
+            if used + len(name) + 2 > MAP_CHARS_PER_FILE:
+                break
+            shown.append(name)
+            used += len(name) + 2
+        extra = f", +{len(names) - len(shown)} more" if len(names) > len(shown) else ""
+        rows.append(f"{path.relative_to(workspace).as_posix()}: {', '.join(shown) or '…'}{extra}")
+    if not rows:
+        return ""
+    kept, used = [], 0
+    for i, row in enumerate(rows):
+        if used + len(row) // 4 > budget_tokens:
+            kept.append(f"... and {len(rows) - i} more files")
+            break
+        kept.append(row)
+        used += len(row) // 4
+    return "\n".join(kept)
 
 
 class Tools:
