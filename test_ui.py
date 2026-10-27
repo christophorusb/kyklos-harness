@@ -21,7 +21,8 @@ WORDMARK_ROW = LARGE_WORDMARK_LINES[1].strip()  # asserted against the real art,
 
 def make_ui(ws, keys=(), lines=(), **kw):
     """A UI that records its output; `keys` are the single keypresses, `lines` the typed lines."""
-    console = Console(file=io.StringIO(), force_terminal=True, color_system="truecolor", width=100, record=True)
+    console = Console(file=io.StringIO(), force_terminal=True, color_system="truecolor", width=100, record=True,
+                      _environ={})
     keys, lines = list(keys), list(lines)
     ui = AeroUI(ws, console=console, animate=False, ascii_mode=kw.pop("ascii_mode", False),
                 read_key=lambda: keys.pop(0) if keys else None,
@@ -164,7 +165,7 @@ class AeroTurnTests(unittest.TestCase):
         self.assertTrue(self.session.is_file())  # the session is saved after each turn
 
     def test_everything_uses_the_full_terminal_width(self):
-        console = Console(file=io.StringIO(), force_terminal=True, width=160, record=True)
+        console = Console(file=io.StringIO(), force_terminal=True, width=160, record=True, _environ={})
         ui = AeroUI(self.ws, console=console, animate=False, ascii_mode=False)
         agent = self.agent(ui, [reply(tool_calls=[tool_call("1", "read_file", path="app.py")]),
                                 reply(content="Done.")])
@@ -188,6 +189,18 @@ class AeroTurnTests(unittest.TestCase):
         self.assertEqual(out.count("return 43"), 1)  # shown in the panel, not repeated after applying
         self.assertRegex(out, r"● edit_file  app\.py  ~1 +✓ applied")
         self.assertIn("return 43", (self.ws / "app.py").read_text())
+
+    def test_diff_source_resolves_indent_shifted_and_whitespace_tolerant_edits(self):
+        (self.ws / "cls.py").write_text("# header\nclass C:\n    def m(self):   \n        return 1\n")
+        ui = make_ui(self.ws)
+        info = ui._diff_source("edit_file", {
+            "path": "cls.py",
+            "old_string": "def m(self):\n    return 1",
+            "new_string": "def m(self):\n    return 2",
+        })
+        self.assertEqual(info["first"], 3)
+        self.assertEqual(info["old"], "    def m(self):   \n        return 1")
+        self.assertEqual(info["new"], "    def m(self):\n        return 2")
 
     def test_auto_approved_edit_still_shows_its_diff(self):
         ui = make_ui(self.ws)
@@ -333,7 +346,8 @@ class AeroTurnTests(unittest.TestCase):
         self.assertIn("(plan) ", "".join(text for _, text in ui.prompt_message()))
 
     def test_banner_skips_large_wordmark_when_too_narrow(self):
-        console = Console(file=io.StringIO(), force_terminal=True, color_system="truecolor", width=40, record=True)
+        console = Console(file=io.StringIO(), force_terminal=True, color_system="truecolor", width=40, record=True,
+                          _environ={})
         ui = AeroUI(self.ws, console=console, animate=False)
         agent = self.agent(ui, [])
         ui.banner(agent)
@@ -343,7 +357,8 @@ class AeroTurnTests(unittest.TestCase):
 
     def test_large_wordmark_and_rule_plain_and_ascii(self):
         # Plain ANSI theme
-        console_plain = Console(file=io.StringIO(), force_terminal=True, color_system="standard", width=100, record=True)
+        console_plain = Console(file=io.StringIO(), force_terminal=True, color_system="standard", width=100,
+                                record=True, _environ={})
         ui_plain = AeroUI(self.ws, console=console_plain, theme="plain")
         word = ui_plain.large_wordmark()
         self.assertEqual(word.style, "bold sky")
@@ -352,7 +367,7 @@ class AeroTurnTests(unittest.TestCase):
         self.assertEqual(rule.plain, "─" * 20)
 
         # ASCII mode
-        console_ascii = Console(file=io.StringIO(), force_terminal=True, width=100, record=True)
+        console_ascii = Console(file=io.StringIO(), force_terminal=True, width=100, record=True, _environ={})
         ui_ascii = AeroUI(self.ws, console=console_ascii, ascii_mode=True, theme="plain")
         rule_ascii = ui_ascii.gradient_rule(20)
         self.assertEqual(rule_ascii.plain, "-" * 20)

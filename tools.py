@@ -146,12 +146,29 @@ def is_secret_file(p: Path) -> bool:
     return p.suffix.lower() in {".pem", ".key", ".p12", ".pfx"} or name.startswith(("id_rsa", "id_ed25519", "id_ecdsa"))
 
 
+SECRET_GLOB_TARGETS = (".env", ".env.local", "id_rsa", "id_ed25519", "id_ecdsa",
+                       "secret.pem", "secret.key", "secret.p12", "secret.pfx")
+
+
 def command_touches_secret(command: str) -> bool:
-    """True if any token in a shell command looks like a secret file path (e.g. .env, *.pem, id_rsa)."""
+    """True if any token in a shell command looks like a secret file path or a glob matching one
+    (e.g. .env, *.env, *env, .e?v, *.pem, *id_rsa*)."""
+    import fnmatch
     for token in re.split(r'[\s;|&><=,"\'()`]+', command):
+        if not token:
+            continue
         cleaned = token.rstrip("*?")
         if cleaned and is_secret_file(Path(cleaned)):
             return True
+        name = Path(token).name.lower()
+        stripped = name.strip("*?")
+        if stripped and is_secret_file(Path(stripped)):
+            return True
+        if any(c in name for c in "*?[") and not name.endswith(SAFE_ENV_SUFFIXES):
+            alnum = sum(c.isalnum() for c in re.sub(r"\[[^\]]*\]", lambda m: m.group(0)[1:2], name))
+            if (alnum >= 3 or ("." in name and alnum >= 2)) and \
+                    any(fnmatch.fnmatchcase(t, name) for t in SECRET_GLOB_TARGETS):
+                return True
     return False
 
 

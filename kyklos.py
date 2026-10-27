@@ -476,7 +476,7 @@ def explain_command(command: str) -> list[tuple[str, str]]:
         # `sudo rm -rf /srv` is an escalation *and* a recursive delete; `env X=1 rm -rf build` is a
         # delete wearing a disguise. Examine each layer, or a wrapper silences the real command.
         layer = tokens
-        for _ in range(3):
+        for _ in range(6):
             findings += _command_findings(layer)
             peeled = _peel(layer)
             if not peeled or peeled == layer:
@@ -506,6 +506,23 @@ def explain_command(command: str) -> list[tuple[str, str]]:
     return sorted(unique, key=lambda f: order[f[0]])  # stable, so order within a level is kept
 
 
+# Wrapper options that consume the next token as their value (e.g. `sudo -u root`, `env -C /tmp`,
+# `xargs -I {}`). Without skipping the value, `_peel` mistakes `root` or `/tmp` for the program.
+WRAPPER_ARG_FLAGS = {
+    "sudo": {"-u", "-g", "-C", "-D", "-R", "-T", "-h", "-p", "-r", "-t", "--user", "--group", "--chdir",
+             "--chroot", "--command-timeout", "--host", "--prompt", "--role", "--type", "--other-user", "--close-from"},
+    "doas": {"-u", "-C"},
+    "env": {"-u", "-C", "-S", "--unset", "--chdir", "--split-string"},
+    "nice": {"-n", "--adjustment"},
+    "timeout": {"-k", "-s", "--kill-after", "--signal"},
+    "xargs": {"-I", "-J", "-L", "-n", "-P", "-s", "-d", "-a", "-E", "--replace", "--max-lines", "--max-args",
+              "--max-procs", "--max-chars", "--delimiter", "--arg-file", "--eof"},
+    "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
+    "exec": {"-a"},
+    "time": {"-f", "-o", "--format", "--output"},
+}
+
+
 def _peel(tokens: list[str]) -> list[str]:
     """Look past leading `VAR=value` assignments and wrappers like `env`, `sudo` and `timeout`, so
     the command that actually runs is the one examined rather than the thing in front of it."""
@@ -513,9 +530,25 @@ def _peel(tokens: list[str]) -> list[str]:
     while rest and ASSIGNMENT_RE.match(rest[0].strip("\"'")):
         rest.pop(0)
     if rest and _stem(rest[0]) in WRAPPERS:
-        rest.pop(0)
-        while rest and (ASSIGNMENT_RE.match(rest[0].strip("\"'"))
-                        or rest[0].startswith("-") or rest[0].isdigit()):
+        wrapper = _stem(rest.pop(0))
+        arg_flags = WRAPPER_ARG_FLAGS.get(wrapper, set())
+        long_arg_flags = {f.lower() for f in arg_flags if f.startswith("--")}
+        while rest:
+            tok = rest[0].strip("\"'")
+            if ASSIGNMENT_RE.match(tok):
+                rest.pop(0)
+            elif tok == "--":
+                rest.pop(0)
+                break
+            elif tok.startswith("-"):
+                rest.pop(0)
+                if (tok in arg_flags or tok.lower() in long_arg_flags) and rest:
+                    rest.pop(0)
+            else:
+                break
+        if wrapper == "timeout" and rest:  # duration token: 30, 30s, 5m, 1.5h...
+            rest.pop(0)
+        while rest and ASSIGNMENT_RE.match(rest[0].strip("\"'")):
             rest.pop(0)
     return rest
 
@@ -601,7 +634,7 @@ def is_auto_allowed(name: str, args: dict, always_allowed: set[str], auto_bash: 
         if auto_bash and not must_be_asked(cmd):
             return True
         prefixes = {r[5:] for r in always_allowed if r.startswith("bash:")}
-        return bool(prefixes) and command_matches_prefixes(cmd, prefixes)
+        return bool(prefixes) and not has_danger(explain_command(cmd)) and command_matches_prefixes(cmd, prefixes)
     return name in always_allowed
 
 

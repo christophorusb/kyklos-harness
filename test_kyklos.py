@@ -250,6 +250,16 @@ class SecretFileTests(unittest.TestCase):
         agent.send("run commands")
         self.assertEqual(asked, [("bash", "cat .env"), ("bash", "Get-Content config/.env.local")])
 
+    def test_secret_globs_with_leading_or_middle_wildcards_are_caught(self):
+        from tools import command_touches_secret
+        for secret_cmd in ("cat *.env", "cat *env", "cat .e?v", "cat .[e]nv", "cat *id_rsa*",
+                           "cat *.p?m", "head config/*.env.local"):
+            with self.subTest(secret_cmd=secret_cmd):
+                self.assertTrue(command_touches_secret(secret_cmd), secret_cmd)
+        for safe_cmd in ("ls *.py", "grep x *.*", "cat .env.example", "cat *.env.example", "rm -rf build/*"):
+            with self.subTest(safe_cmd=safe_cmd):
+                self.assertFalse(command_touches_secret(safe_cmd), safe_cmd)
+
 
 class GitDirTests(unittest.TestCase):
     """write_file / edit_file must never touch git's own database."""
@@ -1214,6 +1224,22 @@ class ExplainCommandTests(unittest.TestCase):
                 self.assertIn("danger", self.levels(command), self.texts(command))
                 self.assertIn("recursively", self.texts(command))
 
+    def test_wrapper_flags_with_arguments_do_not_hide_the_command(self):
+        """`sudo -u root`, `env -C test` and `timeout 30s` take an argument that isn't the program."""
+        from kyklos import is_auto_allowed, must_be_asked
+        for command in ("sudo -u root rm -rf /srv", "env -C test rm -rf build", "env -u PATH rm -rf build",
+                        "timeout 30s rm -rf dist", "timeout -k 5s 30s rm -rf dist",
+                        "xargs -I {} rm -rf {}", "sudo -- rm -rf /srv",
+                        "sudo -u root env FOO=1 timeout 30s rm -rf /srv"):
+            with self.subTest(command=command):
+                self.assertIn("danger", self.levels(command), self.texts(command))
+                self.assertIn("recursively", self.texts(command))
+                self.assertTrue(must_be_asked(command), command)
+        # A saved prefix from a benign call must never auto-approve a destructive call with the same stem.
+        self.assertTrue(is_auto_allowed("bash", {"command": "chmod +x run.sh"}, {"bash:chmod"}))
+        self.assertFalse(is_auto_allowed("bash", {"command": "chmod 777 secrets.txt"}, {"bash:chmod"}))
+        self.assertFalse(is_auto_allowed("bash", {"command": "chmod -R 755 ."}, {"bash:chmod"}))
+
     def test_sudo_reports_both_the_escalation_and_the_command(self):
         text = self.texts("sudo rm -rf /srv")
         self.assertIn("administrator", text)
@@ -1801,13 +1827,16 @@ def count_processes_with(marker: str) -> int:
     """How many running processes have `marker` in their command line (this test's own probe excluded)."""
     import subprocess
     from tools import IS_WINDOWS
-    if IS_WINDOWS:
-        query = (f"(Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{marker}*' -and "
-                 f"$_.CommandLine -notlike '*Get-CimInstance*' }}).Count")
-        out = subprocess.run(["powershell", "-NoProfile", "-Command", query], capture_output=True, text=True).stdout
-    else:
-        out = str(sum(marker in line and "ps -eo" not in line for line in
-                      subprocess.run(["ps", "-eo", "args"], capture_output=True, text=True).stdout.splitlines()))
+    try:
+        if IS_WINDOWS:
+            query = (f"(Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{marker}*' -and "
+                     f"$_.CommandLine -notlike '*Get-CimInstance*' }}).Count")
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", query], capture_output=True, text=True).stdout
+        else:
+            out = str(sum(marker in line and "ps -eo" not in line for line in
+                          subprocess.run(["ps", "-eo", "args"], capture_output=True, text=True).stdout.splitlines()))
+    except PermissionError:
+        return 0
     return int(out.strip() or 0)
 
 
@@ -1885,14 +1914,18 @@ class SecurityHardeningTests(unittest.TestCase):
         import time
         from tools import IS_WINDOWS, ToolError
         marker = f"kyklostree{os.getpid()}{int(time.time())}"
+        pid_file = self.ws / "child.pid"
         command = (f"Start-Process -WindowStyle Hidden powershell -ArgumentList '-NoProfile','-Command',"
                    f"'$m=\"{marker}\"; Start-Sleep 30'; Start-Sleep 30" if IS_WINDOWS
-                   else f"bash -c 'exec -a {marker} sleep 30' & sleep 30")
+                   else f"bash -c 'exec -a {marker} sleep 30' & echo $! > \"{pid_file}\"; sleep 30")
         try:
             with self.assertRaises(ToolError):
                 self.tools.bash(command, timeout=3)
             time.sleep(1)
             self.assertEqual(count_processes_with(marker), 0)
+            if not IS_WINDOWS and pid_file.is_file():
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(int(pid_file.read_text().strip()), 0)
         finally:  # never leave strays behind, even if the assertion fails
             if count_processes_with(marker):
                 import subprocess

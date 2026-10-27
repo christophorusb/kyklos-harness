@@ -29,6 +29,7 @@ from kyklos import (BASH_MODE_CAVEAT, BASH_MODE_EXPLANATION, BROAD_WARNING, EXIT
                     COMMANDS, TRUST_EXPLANATION, CommandContext,
                     __version__, apply_permission_answer, denial_note, has_danger, permission_options,
                     run_command, short_tokens)
+from tools import ToolError, _match_edit
 
 BASH_FULL_OUTPUT_LINES = 8  # bash output up to this many lines is shown in full; longer shows the last 3
 
@@ -577,6 +578,11 @@ class AeroUI:
         if name == "write_file":
             return {"old": current, "new": str(args.get("content", "")), "first": 1, "trim": True}
         old, new = str(args.get("old_string", "")), str(args.get("new_string", ""))
+        if current and old:
+            try:
+                old, new = _match_edit(current, old, new)
+            except ToolError:
+                pass
         at = current.find(old) if old else -1
         return {"old": old, "new": new, "first": current.count("\n", 0, at) + 1 if at >= 0 else 1, "trim": False}
 
