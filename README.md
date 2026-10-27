@@ -2,21 +2,37 @@
 
 *κύκλος: "circle, cycle." At its core, a harness is one loop: ask the model, run its tools, feed back the results, repeat.*
 
-A small coding-agent harness (~2,950 lines of Python, plus ~1,870 lines of tests) that works with any OpenAI-compatible API: Ollama cloud, DeepSeek, OpenRouter, OpenAI, Gemini, local Ollama, LM Studio. It has an inline terminal UI, **Kyklos Aero**, in a Frutiger Aero style (see [DESIGN.md](DESIGN.md)).
+A small coding-agent harness (~4,200 lines of Python, plus ~2,900 lines of tests) for any OpenAI-compatible API — Ollama cloud, DeepSeek, OpenRouter, OpenAI, Gemini, local Ollama, LM Studio — with an inline terminal UI, **Kyklos Aero**, in a Frutiger Aero style ([DESIGN.md](DESIGN.md)).
+
+## Features
+
+**The loop**
+- Six tools: `read_file`, `grep`, `glob`, `write_file`, `edit_file`, `bash` — plus `task` for subagents.
+- **Subagents** with their own empty context, so a long search costs the main conversation one result instead of every file read. Routable to a cheaper model with `/submodel`.
+- **Plan mode** (`/plan`) — read-only, for working out an approach before touching anything.
+- **Undo** (`/undo`) reverts a turn's conversation *and* its file edits.
+- Sessions save and resume per folder; `continue` picks up a turn that hit the step cap.
+
+**Keeping turns cheap**
+- **Context compaction** in two stages: clear old tool results, then summarise — triggered at 75% of the window *or* `COMPACT_ABOVE` tokens, whichever comes first.
+- **A workspace sketch** in the system prompt, so turn one doesn't start blind.
+- **Token accounting** per session, shown live in the status bar.
+
+**Knowing what's happening**
+- **Every `bash` prompt explains the command** in plain language before you answer `y` or `n`.
+- **Answer claims are checked** against what the turn actually ran.
+- `/tokens`, `/tools`, `/diff` — what fills the window, what can run, what changed on disk.
+- **A scratch directory** for throwaway scripts, inside the workspace so imports resolve.
+
+**Safety**
+- Folder trust, asked before anything in the folder is read.
+- Secret files can't be read, written, or reached through `bash`; secrets are stripped from command environments and redacted from output.
+- Paths can't leave the workspace; `.git/` is never written directly.
+- Ctrl+C or a timeout kills the whole process tree.
 
 ## Setup
 
 Kyklos needs **Python 3.10 or newer** (it annotates with `X | None`).
-
-Windows:
-
-```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-Copy-Item .env.example .env   # then fill in BASE_URL, API_KEY, MODEL
-```
-
-macOS / Linux:
 
 ```bash
 python3 -m venv .venv         # macOS ships 3.9, too old: brew install python@3.13
@@ -24,27 +40,19 @@ python3 -m venv .venv         # macOS ships 3.9, too old: brew install python@3.
 cp .env.example .env          # then fill in BASE_URL, API_KEY, MODEL
 ```
 
-## Run
+<details>
+<summary>Windows (PowerShell)</summary>
 
 ```powershell
-kyklos                                   # interactive
-kyklos --plan                            # start in read-only plan mode
-kyklos --resume                          # resume this folder's last session
-kyklos "create fizzbuzz.py and run it"   # one task, then exit
-kyklos --trust "..."                     # trust this folder for one run, without asking (for scripts)
-kyklos --model kimi-k3                   # use another model for one run (not remembered)
-kyklos --submodel minimax-m3.1-flash     # use another subagent model for one run (or 'same')
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+Copy-Item .env.example .env   # then fill in BASE_URL, API_KEY, MODEL
 ```
+</details>
 
-**Using `kyklos` from any folder.** `kyklos.cmd` (Windows) and `kyklos` (macOS / Linux) run `kyklos.py` with this folder's venv, from wherever you are. Set it up once, then open a new terminal.
+### Running it from any folder
 
-On Windows, add this folder to your user PATH:
-
-```powershell
-[Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";C:\path\to\kyklos-harness", "User")
-```
-
-On macOS / Linux, symlink the launcher into a folder that's on your PATH, rather than putting this one there, so nothing here can shadow a system command:
+`kyklos` (macOS / Linux) and `kyklos.cmd` (Windows) run `kyklos.py` with this folder's venv, from wherever you are. Set it up once, then open a new terminal.
 
 ```bash
 mkdir -p ~/.local/bin
@@ -52,158 +60,151 @@ ln -s "$PWD/kyklos" ~/.local/bin/kyklos
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zprofile   # if it isn't already
 ```
 
-The launcher resolves symlinks, so it still finds this folder's venv when it's run through one.
+Symlink rather than putting this folder on your PATH, so nothing here can shadow a system command; the launcher resolves symlinks and still finds this folder's venv.
 
-Kyklos works in the folder you launch it from. Setting `WORKSPACE` in `.env` pins it to one folder instead.
+<details>
+<summary>Windows PATH</summary>
 
-**Folder trust.** The first time you run Kyklos in a folder, it asks whether you trust it. This happens before it reads anything there, including `AGENTS.md`, which goes straight into the model's instructions.
-- `y` trusts the folder and everything inside it, and remembers that.
-- `o` trusts it for this session only.
-- `n` quits.
+```powershell
+[Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";C:\path\to\kyklos-harness", "User")
+```
+</details>
 
-**Bash approval.** Right after the trust question, Kyklos asks how bash commands should be approved for this run:
-- `a` — **ask every time**, the default and what happens if you just press Enter, pipe input, or have no keyboard.
-- `u` — **run unflagged commands unprompted**, stopping only for the ones the explainer flags.
+Kyklos works in the folder you launch it from. Set `WORKSPACE` in `.env` to pin it to one folder instead.
 
-In `u` mode a command still asks if it carries a red finding, names a secret file, runs a program Kyklos has no rules for, or runs a script whose contents it can't see. That last pair matters: "Kyklos can't tell what this does" must not come to mean "go ahead", so ignorance is never treated as evidence of safety.
+### Settings in `.env`
 
-The line is: **red means it changes something outside the conversation** — deleting (recursively or not), overwriting, escalating, rewriting history, reaching the network, installing packages. **A warning means it reads somewhere you might not expect** — a path outside the workspace, for instance. Warnings don't stop a command in `u` mode. `write_file` and `edit_file` are unaffected and still ask in both modes.
+| Variable | Effect |
+|---|---|
+| `BASE_URL`, `API_KEY`, `MODEL` | The provider. One of each; see `.env.example` for seven worked examples |
+| `CONTEXT_WINDOW` | Override the detected window. Lower is faster and cheaper |
+| `COMPACT_ABOVE` | Compact once the conversation passes this many tokens (default 100000) |
+| `MAX_STEPS` | Model turns one request may take (default 50) |
+| `SUBAGENT_MODEL`, `SUBAGENT_EFFORT` | Route subagents to a faster or cheaper model |
+| `KYKLOS_PASS_ENV` | Secret-named variables to let through to commands anyway |
 
-The choice is never remembered. Trusting a folder is a judgement about the folder and persists; this relaxes the rules that protect every run, so it's agreed once per session or not at all. While it's on, the status bar carries `bash: unflagged runs` so it can't be forgotten. And it rests on the explainer, which is a best effort at reading a command, not a guarantee — see the safety notes below.
+## Run
 
-Your home folder and drive roots can only be trusted for one session. Piped or scripted runs can't answer the question, so they exit unless the folder is already trusted, or you pass `--trust` (or set `KYKLOS_TRUST=1`) for that run.
+```bash
+kyklos                                   # interactive
+kyklos --plan                            # start in read-only plan mode
+kyklos --resume                          # resume this folder's last session
+kyklos "create fizzbuzz.py and run it"   # one task, then exit
+kyklos --trust "..."                     # trust this folder for one run (for scripts)
+kyklos --model kimi-k3                   # another model for one run (not remembered)
+kyklos --submodel minimax-m3.1-flash     # another subagent model for one run (or 'same')
+```
 
-**Where Kyklos keeps its data:** `~/.kyklos` (or `KYKLOS_HOME`), so projects stay clean:
-- `trusted.json`: the folders you've trusted. Delete an entry to be asked again.
-- `projects/<folder-slug>/last.jsonl` and `history`: each folder's own session and input history.
-- `settings.json`: the model you last picked with `/model` (and `/submodel`), and each model's thinking effort.
-- `models.json`: the provider's model list, cached for a day.
-
-Commands (type `/help` for the list, Tab completes them):
+Type `/help` for the commands; Tab completes them.
 
 | Command | What it does |
 |---|---|
 | `/plan [task]` | Toggle read-only plan mode, or plan one task in it |
 | `/undo` | Revert the last turn's conversation and file edits |
-| `/save [file]`, `/resume [file]` | Save or load a JSONL session. Each folder's latest session is also saved automatically to `~/.kyklos/projects/<folder-slug>/last.jsonl` |
-| `/model [name]` | Pick the model, then its thinking effort (see below). `/model --refresh` reloads the list |
+| `/save [file]`, `/resume [file]` | Save or load a JSONL session |
+| `/model [name]` | Pick the model, then its thinking effort. `--refresh` reloads the list |
 | `/effort [level]` | Change the thinking effort for the current model |
-| `/submodel [name\|same]` | Pick a separate model (and effort) for subagents, or `same` to match the main model |
+| `/submodel [name\|same]` | Pick a separate model and effort for subagents |
 | `/compact` | Shrink the conversation now |
-| `/tokens` | What fills the context window, the session's billed tokens, and when compaction hits |
+| `/tokens` | What fills the context window, the session's billed tokens, when compaction hits |
 | `/tools` | The tools the model can call now, and the rules that auto-approve them |
-| `/diff` | What Kyklos has changed in the workspace this session, as glass diff blocks |
+| `/diff` | What Kyklos has changed in the workspace this session |
+| `/map` | The workspace sketch the model starts each turn with |
 | `/reset` | Clear the conversation |
 | `/exit` | Quit (or Ctrl+C twice at an empty prompt) |
 
+## The first run in a folder
+
+**Folder trust**, asked before Kyklos reads anything there — including `AGENTS.md`, which goes straight into the model's instructions. `y` trusts and remembers, `o` is this session only, `n` quits. Your home folder and drive roots can only ever be `o`. Piped runs can't answer, so they exit unless the folder is already trusted or you pass `--trust`.
+
+**Bash approval**, asked next, for this run only:
+
+- `a` — **ask every time.** The default, and what happens with no keyboard.
+- `u` — **run unflagged commands unprompted**, stopping for the rest.
+
+In `u` mode a command still asks if it carries a red finding, names a secret file, runs a program Kyklos has no rules for, or runs a script whose contents it can't see — "Kyklos can't tell what this does" must never come to mean "go ahead". The line is **red = changes something outside the conversation** (deleting, overwriting, escalating, installing, reaching the network) and **warning = reads somewhere you might not expect**. Warnings don't stop a command in `u` mode. `write_file` and `edit_file` always ask.
+
+The choice is never remembered, and the status bar carries `bash: unflagged runs` while it's on.
+
+**Where Kyklos keeps its data:** `~/.kyklos` (or `KYKLOS_HOME`) — `trusted.json`, `settings.json`, a day-cached `models.json`, and `projects/<folder-slug>/` holding each folder's last session and input history.
+
 ## The interface: Kyklos Aero
 
-In a real terminal, Kyklos uses an inline UI built with [Rich](https://github.com/Textualize/rich) and [prompt_toolkit](https://github.com/prompt-toolkit/python-prompt-toolkit). Output scrolls normally and the input line sits at the bottom:
+An inline UI built with [Rich](https://github.com/Textualize/rich) and [prompt_toolkit](https://github.com/prompt-toolkit/python-prompt-toolkit): output scrolls normally and the input line sits at the bottom.
 
-- **Tool calls** show as one line each, `● read_file  kyklos.py  24–31 … 8 lines`, with human-readable arguments and a short summary. `bash` also shows its exit code and last 3 output lines.
-- **A breathing-bubble spinner** shows while the model thinks. Running steps are shown live and disappear once they finish, so the scrollback stays clean.
-- **Subagents** show a live tree of their latest steps, which collapses to one line when they finish.
-- **Permission prompts** are a rounded panel with **glass diff blocks**: added lines in mint, deleted in coral, and modified lines in aqua, with the changed characters glowing. Answer with a single key: `y` / `n` / `p` / `a`. `p` lets you edit the suggested prefix before saving it, and `n` asks for an optional reason.
-- **The model's words** appear in rounded `○ kyklos` boxes (with the gradient wordmark), shaped like the permission panel. Progress notes get a subtle deep-blue border; the final answer is rendered Markdown in a sky-blue box, with `ctx 9% · 4 tools · 14s` set into its bottom border.
-- **Full width:** everything spans the whole terminal and follows window resizes.
-- **A status bar** shows the model, a context meter, the session's token use, a PLAN badge and the workspace. It stays put while the model works, not just while you type.
-- **Input:** history with ↑/↓ (kept per folder in `~/.kyklos/projects/<folder-slug>/history`), and Alt+Enter for a new line.
-
-Settings:
+- **Tool calls** are one line each — `● read_file  kyklos.py  24–31 … 8 lines` — with a short summary; `bash` also shows its exit code and last 3 lines.
+- **A breathing-bubble spinner** while the model thinks. Running steps show live and vanish when done, so scrollback stays clean.
+- **Subagents** show a live tree that collapses to one line when they finish.
+- **Permission prompts** are a rounded panel with **glass diff blocks** — added lines mint, deleted coral, modified aqua, changed characters glowing. Single key: `y` / `n` / `p` / `a`.
+- **The model's words** go in rounded `○ kyklos` boxes, the final answer as Markdown with `ctx 9% · 4 tools · 14s` set into the border.
+- **A status bar** with the model, a context meter, session tokens, a PLAN badge and the workspace — present while the model works, not just while you type.
 
 | Variable | Effect |
 |---|---|
-| `KYKLOS_UI=plain` | Use the plain, dependency-free REPL instead |
-| `KYKLOS_THEME=plain` | Use the 16 named ANSI colors instead of the Aero truecolor palette |
-| `KYKLOS_ASCII=1` | ASCII glyphs (`o * x`) instead of Unicode (also used automatically when output isn't UTF-8) |
-| `NO_COLOR=1` | No colors at all; glyphs and words still carry every meaning |
+| `KYKLOS_UI=plain` | The plain, dependency-free REPL instead |
+| `KYKLOS_THEME=plain` | 16 named ANSI colors instead of the Aero truecolor palette |
+| `KYKLOS_ASCII=1` | ASCII glyphs (`o * x`) instead of Unicode |
+| `NO_COLOR=1` | No colors; glyphs and words still carry every meaning |
 
-When input or output isn't a terminal (piped or scripted runs), Kyklos automatically uses the plain REPL.
+Piped or scripted runs use the plain REPL automatically.
 
 ## How it works
 
 | File | Role |
 |---|---|
-| `kyklos.py` | The agent loop, the system prompt, the permission rules, the command registry, and the plain REPL |
-| `tools.py` | Tool schemas sent to the model, their implementations, and the environment probe |
-| `ui.py` | Kyklos Aero: renders the Agent's events, the permission panel, and the prompt with its status bar |
-| `kyklos.cmd`, `kyklos` | Launchers: Windows, and macOS / Linux |
-| `test_kyklos.py`, `test_ui.py` | Offline tests: a scripted fake model drives the real loop (and the UI, through a recording console) |
+| `kyklos.py` | The agent loop, system prompt, permission rules, command registry, plain REPL |
+| `tools.py` | Tool schemas, their implementations, the repository map, the environment probe |
+| `ui.py` | Kyklos Aero: renders the Agent's events, the permission panel, the prompt and status bar |
+| `kyklos`, `kyklos.cmd` | Launchers for macOS / Linux and Windows |
+| `test_kyklos.py`, `test_ui.py` | Offline tests: a scripted fake model drives the real loop and UI |
 | `DESIGN.md`, `design/aero_preview.py` | The UI design system, and a dependency-free preview of it |
 
-The `Agent` never prints anything itself: it emits events (`model_start`, `thought`, `tool_call`, `tool_result`, `subagent_start`, …), and a front end renders them. The plain REPL and Kyklos Aero both use the same permission rules (`permission_options` / `apply_permission_answer`) and the same command registry.
+The `Agent` never prints: it emits events (`model_start`, `tool_call`, `tool_result`, `subagent_start`, …) and a front end renders them. The plain REPL and Kyklos Aero share one set of permission rules and one command registry.
 
-The loop in `Agent.send` sends the conversation to the model, runs any tool calls it returns, appends the results, and repeats. It stops when the model answers without calling a tool, or after `MAX_STEPS` steps (50 by default, set `MAX_STEPS` in `.env` to change it). Reaching the cap isn't a failure: Kyklos says what the turn managed and which files it changed, and the conversation is kept, so `continue` resumes from exactly where it stopped — or `/undo` reverts the turn.
+`Agent.send` sends the conversation, runs the tool calls that come back, appends the results, and repeats — until the model answers without calling a tool, or `MAX_STEPS` (50) is reached. Hitting the cap isn't a failure: Kyklos reports what the turn managed and which files changed, and `continue` resumes from there.
 
-**Tools:** `read_file` (with line numbers), `grep` (regex search across files), `glob` (find files by pattern), `write_file`, `edit_file` (unique string replacement with trailing-whitespace and indentation-offset tolerance), and `bash` (PowerShell on Windows, bash elsewhere). Search skips `.git`, `.venv`, `node_modules` and binary files. Each result appears as a short dimmed preview under its call.
+**Tools.** `read_file` (with line numbers), `grep`, `glob`, `write_file`, `edit_file` (unique string replacement, tolerant of trailing whitespace and indentation shifts), `bash` (PowerShell on Windows). Search skips `.git`, `.venv`, `node_modules` and binary files.
 
-**Subagents:** the `task` tool hands a self-contained job to a fresh `Agent` with an empty context. Only its final answer comes back, so a long search costs the main conversation one tool result instead of every file read. Subagent output is indented under the `task` call.
-- `explore` mode (default) has only `read_file`, `grep` and `glob`, so it never asks for permission.
-- `general` mode can also edit files and run commands. Its permission prompts come to you like the main agent's, and "always" carries over between them.
-- Subagents can't start subagents of their own, and they run one at a time.
-- **Subagent model routing:** by default subagents use the main model and effort, or you can route them to a faster/cheaper model with `/submodel` (remembered in `~/.kyklos/settings.json`), `SUBAGENT_MODEL` in `.env`, or `--submodel` for one run. `/submodel same` resets subagents back to following the main model. When a subagent runs on a different model or effort, the `task` line shows it (`● task  explore · minimax-m3.1-flash · Find compaction constants`).
+**Subagents.** `task` hands a self-contained job to a fresh `Agent` with an empty context; only its answer comes back. `explore` mode is read-only and never asks permission; `general` can also edit and run commands. Subagents can't nest and run one at a time. Route them elsewhere with `/submodel`, `SUBAGENT_MODEL`, or `--submodel`; the `task` line names the model when it differs. In a live test a subagent took 12 steps and read five files while the main context stayed at 6%.
 
-In a live test, a subagent took 12 steps and read five whole files, while the main agent's context stayed at 6%.
+**Workspace sketch.** The system prompt carries a generated list of source files and what each defines — names only, no signatures or line numbers, since a regex reading code gets names right and parameter lists wrong. Python names come from the real `ast`. Capped per file and overall (~340 tokens here), regenerated after any turn that wrote files. `/map` shows it.
 
-**Getting it used.** Having the tool isn't enough: a real session made 134 exploratory calls — 87% of all its tool output — and delegated none of them. The model can see the files it read, but not what it costs to re-send them on every later step. So the system prompt gives a threshold rather than a vague suggestion ("more than two or three reads or searches"), and once the conversation passes half the compaction trigger, Kyklos appends a one-off note to a tool result naming the current size and pointing at `task`. It fires once per turn, and not at all when `task` isn't available or the turn is short.
+**Scratch space.** `.kyklos/scratch/` is for throwaway scripts; it's inside the workspace so relative imports and dependencies resolve. Writing there needs no approval; *running* a script still asks. It keeps itself out of git without touching your `.gitignore`.
 
-**Workspace sketch:** the system prompt carries a generated list of the project's source files and what each one defines, so turn one doesn't begin blind and spend three to six steps on `glob` and `grep` just to learn the filenames. `/map` shows it.
+**Project instructions.** An `AGENTS.md` in the workspace is added to the system prompt, like CLAUDE.md or GEMINI.md elsewhere.
 
-It is **names only — no signatures, no line numbers**, deliberately. A regex reading code gets a name right and a parameter list wrong, and a map that misstates a signature is worse than none because the model believes it; line numbers are the first thing to go stale after an edit. Python names come from the real `ast` parser, so a file that doesn't parse contributes nothing rather than guesses. Each file is capped so one large module can't crowd out the rest of the tree, shallow paths come first, and the whole thing is capped (~340 tokens for this repository). It goes in the system prompt for the same reason `AGENTS.md` does — it's context about the project, not about a turn — and is regenerated at the start of any turn following one that wrote files. The sketch says it's generated and tells the model to read a file before relying on it.
-
-**Scratch space:** `.kyklos/scratch/` inside the workspace is for throwaway scripts — checking a runtime value, reproducing a bug, drafting a test. It exists because a script in `/tmp` can't resolve `./src/...` or the project's dependencies, and `write_file` refuses paths outside the workspace anyway, so the only route left was `cat > /tmp/x.mjs <<'EOF'` through bash: two permission prompts and a heredoc to run five lines.
-
-Writing there needs no approval and the explainer doesn't flag it, since the directory exists to be written over. **Running** a script from it still asks: `bash` isn't confined to a directory, and a script the model wrote moments ago is exactly what you want to read before it executes. The directory keeps itself out of git with a `.kyklos/.gitignore` containing `*`, so your own `.gitignore` is never touched.
-
-**Project instructions:** if the workspace has an `AGENTS.md`, it's added to the system prompt, like CLAUDE.md or GEMINI.md in other harnesses. Put project conventions there, such as "use tabs" or "run `npm test` after changes".
-
-**Models and thinking effort:** `/model` opens an arrow-key picker of the provider's models: ↑/↓ to move, type to filter, Enter to pick, Esc to cancel. Each model shows its context size and thinking levels. Then a second picker offers *that model's own* effort levels:
+**Models and thinking effort.** `/model` opens an arrow-key picker — ↑/↓, type to filter, Enter, Esc — then a second picker offers *that model's own* effort levels:
 
 | Model kind | Levels offered | Example |
 |---|---|---|
 | Lists its levels (Ollama `/api/show`) | `default` + its levels | kimi-k3: off · low · high · max |
 | Thinking on/off only | `default` · off · on | kimi-k2.7-code, gemma4 |
-| Thinks, but lists no levels | `default` + low · medium · high · max, marked "best effort" | minimax-m3.1-flash |
+| Thinks, but lists no levels | `default` + low · medium · high · max | minimax-m3.1-flash |
 | Can't think | no effort picker | mistral-large-3 |
 
-`default` sends nothing, so the model decides. Other levels are sent as `reasoning_effort` (`off` as `"none"`, `on` as `"high"`). Kyklos remembers the picked model (it's used on the next start, ahead of `MODEL` in `.env`) and **each model's own effort**, so switching back to a model restores its level. The conversation carries over when you switch models, and the context window follows the new model, unless `CONTEXT_WINDOW` is set. Models that can't use tools are left out. The banner and status bar show the active effort, e.g. `kimi-k3 high`. On other providers, the list comes from `/v1/models`, with the generic levels.
+`default` sends nothing. Kyklos remembers the picked model and **each model's own effort**. The conversation carries over when you switch; models that can't use tools are left out.
 
-**Context window:** Kyklos needs to know how big the model's context window is, so it can compact in time. It's chosen at startup and shown in the banner (e.g. `1M context`):
-1. `CONTEXT_WINDOW`, if you set it (in `.env` or the environment), always wins. Setting it lower than the model's maximum keeps turns faster and cheaper.
-2. Otherwise, on **Ollama cloud**, Kyklos asks `/api/show` for the model's `context_length`. For example, `minimax-m3.1-flash` gives 1M and `kimi-k2.7-code` gives 262k, so switching models adjusts the window automatically. This adds about a second to startup and gives up after 5 s.
-3. Otherwise it uses 128k, shown as `128k context (default)`.
+**Context window.** `CONTEXT_WINDOW` wins if set; otherwise Ollama cloud is asked via `/api/show`; otherwise 128k. Local Ollama isn't asked — it reports the model's trained maximum while the server runs with a smaller limit, so set `CONTEXT_WINDOW` to `OLLAMA_CONTEXT_LENGTH`.
 
-Local Ollama isn't asked: it reports the model's trained maximum, but the server runs with a smaller limit unless you configure it (`OLLAMA_CONTEXT_LENGTH`), and silently cuts off what doesn't fit. Set `CONTEXT_WINDOW` to that value instead.
+**Compaction.** At 75% of the window *or* `COMPACT_ABOVE` tokens (100k), whichever is first, everything older than the most recent ~20% is shrunk: first by clearing old tool results (no API call, and usually enough), then by summarising — with the current request and a verbatim log of earlier requests and answers attached, so facts can't be lost to a weak summary. The current step is always kept whole and a tool call is never split from its result.
 
-**Context compaction:** Kyklos tracks token use from the API's `usage` field, or estimates it at ~4 characters per token. When the conversation passes 75% of the context window **or `COMPACT_ABOVE` tokens (100k by default), whichever comes first**, it shrinks everything older than the most recent ~20%:
-1. **Clear old tool results.** File contents and command output make up most of the context and can be fetched again. All user and assistant messages stay word for word, and no API call is needed. Usually this is enough.
-2. **Summarize, only if that's not enough.** The same model summarizes the older turns. Kyklos then attaches the current request and a log of earlier requests and answers, both word for word, so facts the user was already told can't be lost in a weak summary.
+The absolute cap matters because every step re-sends the whole conversation: a 178k conversation costs 178k per step whether the ceiling is 128k or 1M. On a real 234-call session, capping at 100k would have cut prompt tokens **39%** (27.7M → 16.8M).
 
-The step the model is working on is always kept whole, and a tool call is never separated from its result. If one turn needs more than 3 compactions, Kyklos stops with a message instead of looping: the task doesn't fit the working limit.
+**Environment awareness.** At startup Kyklos runs `--version` on common commands and tells the model which work, so it doesn't waste calls finding out. On Windows it also names the Unix tools PowerShell lacks.
 
-**Why the absolute cap.** Every step re-sends the whole conversation, so what a turn costs is set by how much context each step carries, not by how much window is left over — a 178k conversation costs 178k per step whether the ceiling is 128k or 1M. With only a window fraction, a 1M-token model wouldn't prune until 750k, so a big window quietly becomes a big running cost. Replaying a real 234-call session, capping at 100k would have cut its prompt tokens by **39%** (27.7M → 16.8M), compacting three times. Raise `COMPACT_ABOVE` to carry more context per step, lower it to spend less and re-fetch more; below the cap, nothing changes.
+## Safety
 
-**Environment awareness:** at startup Kyklos runs `--version` on common commands (`py`, `python`, `node`, `git`…). It tells the model which ones work and which don't, so the model doesn't waste calls finding out. On Windows it also names the Unix tools PowerShell lacks (`grep`, `sed`, `awk`, `head`, `tail`) and what to use instead.
+- `read_file`, `grep` and `glob` run without asking. Everything else asks first, after validating paths and edits and showing a diff: `y` once, `p` for a `bash` prefix rule, `a` for the session, `n` denies and sends your reason back to the model.
+- **Every `bash` prompt says what the command would do** — what it deletes or overwrites, whether it reaches the network, leaves the workspace, runs as administrator, or pipes a download into a shell. A red finding turns the panel coral and removes `p` and `a`. Kyklos works this out itself and never asks the model, since a model steered by text planted in a file would describe a destructive command as routine. It's an aid to reading, **not a security boundary**: a regex is not a shell, so no findings means nothing was recognised, never that a command is safe.
+- Prefix rules for interpreters name what they run (`py -3 tools/build.py`, never bare `py`), and inline code (`py -c`, `node -e`, `bash -c`) never gets one.
+- Paths can't leave the workspace; `write_file` / `edit_file` refuse anything inside `.git/`.
+- **Secret files** — `.env`, `.env.*` (bar `.example`/`.sample`/`.template`), `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa*` — can't be read, written or edited, `grep` skips them, and a `bash` command naming one always asks, even with `bash` allowed for the session.
+- **Commands can't see secrets**, in the environment or in output: Kyklos's `.env` and anything named like a secret (`*_KEY`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*CREDENTIAL*`) is stripped from every command's environment (`KYKLOS_PASS_ENV` lets specific ones through), and values are redacted from tool output before the model or screen see them — secret-named values whatever their format, plus `sk-…`, `ghp_…`, `AKIA…`, `xox…`, `AIza…` and private-key blocks.
+- The system prompt tells the model that file contents and command output are data, not instructions — planted directions get reported to you, not followed.
+- Ctrl+C or a timeout stops **the whole process tree**. `bash` gets no keyboard, so a command that would stop to ask something fails immediately instead of hanging; mid-turn, unfinished calls are marked "Interrupted" so the conversation stays valid.
+- Errors — bad path, ambiguous edit, timeout, invalid JSON — go back to the model as tool results, so it can correct itself.
 
-**Safety:**
-- `read_file`, `grep` and `glob` run without asking. Every other tool asks first (after validating paths and edits, and showing a colored unified diff for `edit_file` / `write_file`): `y` allows once, `p` (or `p <prefix>`) allows safe `bash` commands matching that prefix (`git status`, `py -m unittest`), `a` allows that tool for the rest of the session, and `n` denies it and sends your reason back to the model.
-- **Every `bash` prompt says what the command would do**, in plain language: what it deletes or overwrites, whether it reaches the network, leaves the workspace, runs as administrator, or pipes a download into a shell. A `danger` finding turns the panel coral and removes `p` and `a`, so it can only be approved one run at a time. The explanation is worked out by Kyklos, never asked of the model — the prompt exists because the model might propose something you didn't want, and a model steered by text planted in a file would happily describe a destructive command as routine. It's an aid to reading, not a security boundary: a regex is not a shell, so no findings means nothing was recognised, never that a command is safe.
-- Prefix suggestions for interpreters always name what they run: `py -3 tools/build.py` or `node scripts/dev.mjs`, never just `py` or `node`, which would allow any code. The script must look like one (an extension or a folder in its path), so an option's value (`python -W error …`) is never mistaken for it. Inline code (`py -c`, `node -e`, `powershell -Command`, `bash -c`) gets no prefix, and no saved rule ever auto-approves it.
-- Paths can't leave the workspace, and `write_file` / `edit_file` refuse anything inside a `.git/` folder (git's own database). Git changes go through git commands.
-- Secret files can't be read, written or edited: `.env` and `.env.*` (except `.env.example`, `.sample`, `.template`), `*.pem`, `*.key`, `*.p12`, `*.pfx` and `id_rsa*`-style SSH keys. `grep` skips them too. `bash` commands that reference a secret file always ask for one-time approval, even if `bash` or a prefix was allowed for the session.
-- **Commands can't see secrets in the environment.** Everything from Kyklos's `.env` (including `API_KEY`) and any variable named like a secret (`*_KEY`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*CREDENTIAL*`) is removed from every command's environment. To pass specific ones through on purpose, list them in `KYKLOS_PASS_ENV`, e.g. `KYKLOS_PASS_ENV=GITHUB_TOKEN,NPM_TOKEN`.
-- **Secrets are redacted from tool output** before the model or the screen see it: the exact values of secret-named variables (whatever their format), plus common token formats (OpenAI/Anthropic `sk-…`, GitHub `ghp_…` / `github_pat_…`, AWS `AKIA…`, Slack `xox…`, Google `AIza…`, private-key blocks). The model is told when something was redacted.
-- The system prompt tells the model that file contents and command output are data, not instructions, so directions planted in a file are reported to you rather than followed.
-- When a command times out, or you press Ctrl+C, Kyklos stops **the whole process tree**, including anything the command started (dev servers, `Start-Process`), not just the shell.
-- `bash` commands get no keyboard (PowerShell runs with `-NonInteractive`, and git with `GIT_TERMINAL_PROMPT=0`). A command that would stop to ask something (a "Confirm" prompt, `Read-Host`, `npx`'s "Ok to proceed?", a git password) fails at once with an error the model can read, instead of hanging invisibly until the 120-second timeout.
-- Tool output is truncated to 20k characters, and each turn is capped at 50 steps.
-- Ctrl+C during a turn gives any unfinished tool call an "Interrupted" result, so the conversation stays valid for the next request.
-
-Errors such as a bad path, an ambiguous edit, a timeout, or invalid JSON go back to the model as tool results, so it can correct itself.
-
-**Checking the answer's story.** A harness can't make a model truthful, but in a coding agent the untruths are about checkable things, and it can make them fail rather than pass quietly. `edit_file` already does the strongest version of this: it needs the exact existing text, so a model that imagines a file simply can't edit it.
-
-The same idea is applied to what an answer says about its own turn. If the answer claims it ran the tests, committed, pushed or installed something, Kyklos compares that against the commands the turn actually ran — and against whether they *succeeded*, since a denied or failing test command is as much a gap as none at all:
+**Checking the answer's story.** A harness can't make a model truthful, but in a coding agent the untruths are about checkable things. `edit_file` already does the strongest version of this: it needs the exact existing text, so a model that imagines a file can't edit it. The same idea is applied to what an answer claims about its own turn:
 
 ```
 ╭─ ○ kyklos ───────────────────────────────────────────────╮
@@ -212,24 +213,14 @@ The same idea is applied to what an answer says about its own turn. If the answe
 ! this answer says it ran the tests, but no test command ran this turn
 ```
 
-It reports to you, never to the model, and reports a mismatch rather than a verdict — the claim might be about an earlier turn. It only looks at claims phrased in the past tense, so advice ("run the tests before you push") and hedging ("I haven't run the tests yet") stay quiet. Like the command explainer, it derives a fact in the harness and shows you where it differs from what was claimed, rather than asking the model to mark its own work.
+Claims to have run the tests, committed, pushed or installed are compared against what ran — and whether it *succeeded*, since a denied or failing command is as much a gap as none. It reports to you, never to the model, and only on past-tense claims, so advice and hedging stay quiet.
 
 ## Tests
-
-```powershell
-.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui
-```
 
 ```bash
 ./.venv/bin/python -m unittest test_kyklos test_ui
 ```
 
-## Ideas for next steps
-
-Roughly in order of how much each one helps:
-
-1. **UI phase 2:** stream answers as they're written (`stream=True`, assembling tool calls from pieces), Esc to interrupt, and a token/cost readout.
-2. **Skills:** list `skills/*/SKILL.md` names and descriptions in the prompt, and load a full file only when the model asks for it.
-3. **Parallel explore subagents** (they're read-only, so they can safely run at the same time), and a cheaper model for subagents.
-4. **MCP client, hooks, web fetch.**
-5. **A sandbox:** run `bash` inside Docker or a git worktree.
+```powershell
+.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui
+```
