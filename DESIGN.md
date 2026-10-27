@@ -130,7 +130,7 @@ Everything the model says to you appears in a rounded box shaped like the permis
 | write_file | `path` + `+N` | `✓ created` / `✓ written` |
 | edit_file | `path` + `+N −N ~N` | `✓ applied` |
 | bash | `$ command` | `exit N` (mint for 0, coral otherwise), plus the **last** 3 lines of output, frost, under a `│` gutter |
-| task | `mode · description` | `N steps · Ns` |
+| task | `mode · description` (or `mode · model · description` when routed to a different model) | `N steps · Ns` |
 | any failure | — | a coral `✗` line with the reason |
 
 ### Permission panel
@@ -193,7 +193,7 @@ One line each:
 - `↻` retry, in sun
 - `✗` error, in coral
 
-### Picker (`/model`, `/effort`)
+### Picker (`/model`, `/effort`, `/submodel`)
 An inline rounded box (sky border) drawn below the prompt, erased when done, and replaced by one frost record line (`→ Pick a model: kimi-k3`):
 ```
   ╭─ Pick a model ───────────────────────────────────────────╮

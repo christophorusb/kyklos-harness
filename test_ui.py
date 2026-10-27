@@ -262,6 +262,26 @@ class AeroTurnTests(unittest.TestCase):
         self.assertNotIn("def main", out)  # the subagent's steps were transient
         self.assertRegex(out, r"ctx \d+% · 1 tool · \d+s")
 
+    def test_subagent_line_and_live_tree_show_model_only_when_different(self):
+        ui = make_ui(self.ws)
+        agent = self.agent(ui, [
+            reply(tool_calls=[tool_call("t1", "task", description="find main", prompt="Find main.")]),
+            reply(tool_calls=[tool_call("s1", "grep", pattern="def main")]),
+            reply(content="main is in app.py:1."),
+            reply(content="It's in app.py."),
+        ], subagent_model="kimi-flash", subagent_effort="low")
+        # Check live rendering while a routed subagent is active
+        ui._on_subagent_start(1, description="find main", mode="explore", model="kimi-flash", effort="low")
+        live_same = ui._sub_model_tag("fake-model", "default")
+        self.assertEqual(live_same, "")
+        live_diff = "".join(r.plain for r in ui._render_live().renderables)
+        self.assertIn("explore · kimi-flash low · find main", live_diff)
+        ui.reset_transient()
+
+        ui.turn(agent, "where is main?", self.session)
+        out = output(ui)
+        self.assertRegex(out, r"● task  explore · kimi-flash low · find main +2 steps · \d+s")
+
     def test_long_summary_is_shortened_before_the_tool_label(self):
         from rich.text import Text
         ui = make_ui(self.ws)
@@ -540,7 +560,7 @@ class CommandRegistryTests(unittest.TestCase):
 
     def test_help_lists_every_command(self):
         run_command(self.ctx, "/help")
-        for name in ("help", "plan", "undo", "save", "resume", "compact", "reset", "exit"):
+        for name in ("help", "plan", "undo", "save", "resume", "compact", "reset", "model", "effort", "submodel", "exit"):
             self.assertIn(f"/{name}", self.said[-1][1])
         self.assertIn("~/.kyklos/projects/", self.said[-1][1])  # AUDIT ACT-06: /save's real default
         self.assertNotIn(".sessions/last.jsonl", self.said[-1][1])

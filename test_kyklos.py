@@ -545,6 +545,36 @@ class SubagentTests(unittest.TestCase):
         Agent(client, "fake", self.ws).send("go")
         self.assertIn("mode must be one of", client.calls[1][-1]["content"])
 
+    def test_subagent_routes_explore_and_general_to_configured_subagent_model(self):
+        events = []
+        client = FakeClient([
+            reply(tool_calls=[self.task("t1", "Find main.", mode="explore")]),
+            reply(content="main is in app.py."),
+            reply(tool_calls=[self.task("t2", "Edit app.py.", mode="general")]),
+            reply(content="Edited."),
+            reply(content="All done."),
+        ])
+        parent = Agent(client, "frontier-main", self.ws, permission=allow_all,
+                       on_event=lambda ev, **kw: events.append((ev, kw)),
+                       effort="high", context_window=200_000,
+                       subagent_model="fast-sub", subagent_effort="low", subagent_context_window=64_000)
+        self.assertEqual(parent.effective_subagent_config(), ("fast-sub", "low", 64_000))
+        parent.send("delegate both")
+
+        self.assertEqual([e["model"] for e in client.extra],
+                         ["frontier-main", "fast-sub", "frontier-main", "fast-sub", "frontier-main"])
+        self.assertEqual([e.get("reasoning_effort") for e in client.extra],
+                         ["high", "low", "high", "low", "high"])
+        starts = [kw for ev, kw in events if ev == "subagent_start"]
+        self.assertEqual([(s["mode"], s["model"], s["effort"], s["routed"]) for s in starts],
+                         [("explore", "fast-sub", "low", True), ("general", "fast-sub", "low", True)])
+
+        # Resetting to None ("same") follows the parent model and any later /model switches.
+        parent.set_subagent_model(None)
+        self.assertEqual(parent.effective_subagent_config(), ("frontier-main", "high", 200_000))
+        parent.set_model("next-main", "max", 500_000)
+        self.assertEqual(parent.effective_subagent_config(), ("next-main", "max", 500_000))
+
     def test_repair_after_interrupt_answers_dangling_calls(self):
         agent = Agent(FakeClient([]), "fake", self.ws)
         agent.messages += [
@@ -897,6 +927,80 @@ class CompactionCeilingTests(unittest.TestCase):
         self.assertEqual(data["compact_at"], 100_000)
         self.assertTrue(data["compact_capped"])
         self.assertFalse(context_breakdown(self.agent(128_000))["compact_capped"])
+
+
+class UnsupportedClaimTests(unittest.TestCase):
+    """The answer's story about the turn, checked against what the turn actually ran.
+
+    Reported to the user, never to the model, and as a mismatch rather than a verdict — the claim
+    may be about an earlier turn. A check that cries wolf gets ignored, so it errs towards silence.
+    """
+
+    def claims(self, answer, runs=()):
+        from kyklos import unsupported_claims
+        return unsupported_claims(answer, list(runs))
+
+    def test_a_claim_with_nothing_behind_it_is_flagged(self):
+        for answer, label in [("I ran the tests and they all pass.", "ran the tests"),
+                              ("All 42 tests pass now.", "ran the tests"),
+                              ("Tests are passing.", "ran the tests"),
+                              ("Committed and pushed.", "committed"),
+                              ("I installed left-pad.", "installed packages")]:
+            with self.subTest(answer=answer):
+                self.assertIn(label, [c for c, _ in self.claims(answer)])
+
+    def test_a_claim_the_turn_backs_up_is_quiet(self):
+        self.assertEqual(self.claims("I ran the tests and they pass.",
+                                     [("pytest -q", "exit code 0\n5 passed")]), [])
+        self.assertEqual(self.claims("Committed and pushed.",
+                                     [("git commit -m x && git push", "exit code 0")]), [])
+
+    def test_a_command_that_ran_but_failed_is_not_support(self):
+        flagged = self.claims("The tests pass.", [("pytest -q", "exit code 1\n2 failed")])
+        self.assertEqual(flagged, [("ran the tests", "the test command didn't succeed")])
+
+    def test_a_denied_command_is_not_support(self):
+        """Denial leaves no exit code at all, which is as much a gap as a failure."""
+        flagged = self.claims("The tests pass.", [("pytest -q", "The user denied this bash call.")])
+        self.assertEqual(flagged, [("ran the tests", "the test command didn't succeed")])
+
+    def test_advice_and_hedging_are_not_claims(self):
+        for answer in ("You can run the tests with npm test.",
+                       "Run the tests before you push.",
+                       "I did not run the tests.",
+                       "I haven't run the tests yet.",
+                       "I was unable to run the tests.",
+                       "You should commit this when ready.",
+                       "The tests would pass if you fix this.",
+                       "Tests should pass now.",
+                       "If you push, CI will run the tests.",
+                       "This would install left-pad as a dependency.",
+                       "The test suite covers this path."):
+            with self.subTest(answer=answer):
+                self.assertEqual(self.claims(answer), [], answer)
+
+    def test_only_the_claims_actually_made_are_checked(self):
+        self.assertEqual(self.claims("Changed two files."), [])
+        self.assertEqual(self.claims("Committed.", [("git commit -m x", "exit code 0")]), [])
+
+    def test_the_agent_records_them_for_the_turn(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ws = Path(tmp.name)
+        agent = Agent(FakeClient([reply(tool_calls=[tool_call("1", "bash", command="ls")]),
+                                  reply("Done. I ran the tests and they pass.")]),
+                      "fake", ws, permission=allow_all, on_event=lambda *a, **k: None)
+        agent.send("fix it")
+        self.assertEqual([c for c, _ in agent.last_claims], ["ran the tests"])
+
+    def test_a_clean_turn_leaves_no_claims(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ws = Path(tmp.name)
+        agent = Agent(FakeClient([reply("Had a look; nothing needed changing.")]),
+                      "fake", ws, permission=allow_all, on_event=lambda *a, **k: None)
+        agent.send("check it")
+        self.assertEqual(agent.last_claims, [])
 
 
 class BashModeTests(unittest.TestCase):
@@ -1699,6 +1803,13 @@ class ModelCatalogTests(unittest.TestCase):
         load_model_catalog(self.home, "https://ollama.com/v1", "k", fetch=fetch, now=lambda: clock[0] + 90000)
         load_model_catalog(self.home, "https://ollama.com/v1", "k", fetch=fetch, now=lambda: clock[0], refresh=True)
         self.assertEqual(len(calls), 3)  # expired, then refreshed on request
+        # If the 24h TTL has expired and the network is down, the cached list is still returned.
+        offline = load_model_catalog(
+            self.home, "https://ollama.com/v1", "k",
+            fetch=lambda *a, **k: (_ for _ in ()).throw(OSError("nodename nor servname provided")),
+            now=lambda: clock[0] + 200000,
+        )
+        self.assertEqual([m["name"] for m in offline], ["kimi-k3", "minimax-m3.1-flash", "mistral-large-3"])
         self.assertEqual(cached_model_info(self.home, "https://ollama.com/v1", "kimi-k3")["context"], 1048576)
         self.assertIsNone(cached_model_info(self.home, "https://other/v1", "kimi-k3"))
 
@@ -1713,10 +1824,24 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual(effort_options(models[0]), ["default", "low", "medium", "high"])
 
     def test_model_priority(self):
-        from kyklos import choose_model
+        from kyklos import choose_model, choose_subagent_model
         self.assertEqual(choose_model("x", {"model": "y"}, {"MODEL": "z"}), ("x", "--model"))
         self.assertEqual(choose_model(None, {"model": "y"}, {"MODEL": "z"}), ("y", "picked"))
         self.assertEqual(choose_model(None, {}, {"MODEL": "z"}), ("z", "MODEL"))
+
+        self.assertEqual(choose_subagent_model("x", {"subagent_model": "y"}, {"SUBAGENT_MODEL": "z"}),
+                         ("x", "--submodel"))
+        self.assertEqual(choose_subagent_model(None, {"subagent_model": "y"}, {"SUBAGENT_MODEL": "z"}),
+                         ("y", "picked"))
+        self.assertEqual(choose_subagent_model(None, {}, {"SUBAGENT_MODEL": "z"}),
+                         ("z", "SUBAGENT_MODEL"))
+        self.assertEqual(choose_subagent_model(None, {}, {}), (None, "same"))
+        self.assertEqual(choose_subagent_model(None, {}, {"SUBAGENT_MODEL": ""}), (None, "same"))
+        # "same" (or "default"/"off"/"none") at a higher level overrides SUBAGENT_MODEL in .env.
+        self.assertEqual(choose_subagent_model("same", {"subagent_model": "y"}, {"SUBAGENT_MODEL": "z"}),
+                         (None, "--submodel"))
+        self.assertEqual(choose_subagent_model(None, {"subagent_model": "same"}, {"SUBAGENT_MODEL": "z"}),
+                         (None, "picked"))
 
     def test_agent_sends_reasoning_effort_and_subagents_inherit_it(self):
         ws = Path(self.tmp.name)
@@ -1812,6 +1937,37 @@ class ModelCommandTests(unittest.TestCase):
         from kyklos import run_command
         run_command(self.ctx(answers=[0, 0], context_override=True), "/model")
         self.assertEqual(self.agent.context_window, 1000000)  # CONTEXT_WINDOW wins over kimi's 1M
+
+    def test_submodel_pick_and_reset_to_same(self):
+        from kyklos import load_settings, run_command
+        # Row 0 is "same as main model" (marked=0 initially); row 1 is kimi-k3.
+        run_command(self.ctx(answers=[1, 2]), "/submodel")  # kimi-k3, then "low"
+        title, rows, cursor, marked = self.picks[0]
+        self.assertEqual(title, "Pick a subagent model")
+        self.assertEqual(rows[0][0], "same as main model")
+        self.assertEqual(marked, 0)
+        self.assertEqual((self.agent.subagent_model, self.agent.subagent_effort, self.agent.subagent_context_window),
+                         ("kimi-k3", "low", 1048576))
+        self.assertEqual(self.agent.model, "minimax-m3.1-flash")  # main model untouched
+        self.assertEqual(load_settings(self.home),
+                         {"subagent_model": "kimi-k3", "subagent_efforts": {"kimi-k3": "low"}})
+        self.assertIn("Subagents using kimi-k3 · effort low · 1M context.", self.said[-1][1])
+
+        # Opening /submodel again marks row 1 (kimi-k3); picking row 0 resets to same as main.
+        self.picks.clear()
+        run_command(self.ctx(answers=[0]), "/submodel")
+        self.assertEqual(self.picks[0][3], 1)
+        self.assertIsNone(self.agent.subagent_model)
+        self.assertEqual(load_settings(self.home)["subagent_model"], "same")
+        self.assertIn("Subagents will use the main model (minimax-m3.1-flash).", self.said[-1][1])
+
+        # By name and /submodel same
+        run_command(self.ctx(), "/submodel kimi-k3")
+        self.assertEqual((self.agent.subagent_model, self.agent.subagent_effort), ("kimi-k3", "low"))
+        run_command(self.ctx(), "/submodel same")
+        self.assertIsNone(self.agent.subagent_model)
+        run_command(self.ctx(), "/submodel kimi")
+        self.assertEqual(self.said[-1], ("error", "No model named kimi. Did you mean: kimi-k3?"))
 
     def test_plain_picker(self):
         import builtins

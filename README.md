@@ -33,6 +33,7 @@ kyklos --resume                          # resume this folder's last session
 kyklos "create fizzbuzz.py and run it"   # one task, then exit
 kyklos --trust "..."                     # trust this folder for one run, without asking (for scripts)
 kyklos --model kimi-k3                   # use another model for one run (not remembered)
+kyklos --submodel minimax-m3.1-flash     # use another subagent model for one run (or 'same')
 ```
 
 **Using `kyklos` from any folder.** `kyklos.cmd` (Windows) and `kyklos` (macOS / Linux) run `kyklos.py` with this folder's venv, from wherever you are. Set it up once, then open a new terminal.
@@ -75,7 +76,7 @@ Your home folder and drive roots can only be trusted for one session. Piped or s
 **Where Kyklos keeps its data:** `~/.kyklos` (or `KYKLOS_HOME`), so projects stay clean:
 - `trusted.json`: the folders you've trusted. Delete an entry to be asked again.
 - `projects/<folder-slug>/last.jsonl` and `history`: each folder's own session and input history.
-- `settings.json`: the model you last picked with `/model`, and each model's thinking effort.
+- `settings.json`: the model you last picked with `/model` (and `/submodel`), and each model's thinking effort.
 - `models.json`: the provider's model list, cached for a day.
 
 Commands (type `/help` for the list, Tab completes them):
@@ -87,6 +88,7 @@ Commands (type `/help` for the list, Tab completes them):
 | `/save [file]`, `/resume [file]` | Save or load a JSONL session. Each folder's latest session is also saved automatically to `~/.kyklos/projects/<folder-slug>/last.jsonl` |
 | `/model [name]` | Pick the model, then its thinking effort (see below). `/model --refresh` reloads the list |
 | `/effort [level]` | Change the thinking effort for the current model |
+| `/submodel [name\|same]` | Pick a separate model (and effort) for subagents, or `same` to match the main model |
 | `/compact` | Shrink the conversation now |
 | `/tokens` | What fills the context window, the session's billed tokens, and when compaction hits |
 | `/tools` | The tools the model can call now, and the rules that auto-approve them |
@@ -139,6 +141,7 @@ The loop in `Agent.send` sends the conversation to the model, runs any tool call
 - `explore` mode (default) has only `read_file`, `grep` and `glob`, so it never asks for permission.
 - `general` mode can also edit files and run commands. Its permission prompts come to you like the main agent's, and "always" carries over between them.
 - Subagents can't start subagents of their own, and they run one at a time.
+- **Subagent model routing:** by default subagents use the main model and effort, or you can route them to a faster/cheaper model with `/submodel` (remembered in `~/.kyklos/settings.json`), `SUBAGENT_MODEL` in `.env`, or `--submodel` for one run. `/submodel same` resets subagents back to following the main model. When a subagent runs on a different model or effort, the `task` line shows it (`● task  explore · minimax-m3.1-flash · Find compaction constants`).
 
 In a live test, a subagent took 12 steps and read five whole files, while the main agent's context stayed at 6%.
 
@@ -189,6 +192,19 @@ The step the model is working on is always kept whole, and a tool call is never 
 - Ctrl+C during a turn gives any unfinished tool call an "Interrupted" result, so the conversation stays valid for the next request.
 
 Errors such as a bad path, an ambiguous edit, a timeout, or invalid JSON go back to the model as tool results, so it can correct itself.
+
+**Checking the answer's story.** A harness can't make a model truthful, but in a coding agent the untruths are about checkable things, and it can make them fail rather than pass quietly. `edit_file` already does the strongest version of this: it needs the exact existing text, so a model that imagines a file simply can't edit it.
+
+The same idea is applied to what an answer says about its own turn. If the answer claims it ran the tests, committed, pushed or installed something, Kyklos compares that against the commands the turn actually ran — and against whether they *succeeded*, since a denied or failing test command is as much a gap as none at all:
+
+```
+╭─ ○ kyklos ───────────────────────────────────────────────╮
+│ Fixed it. I ran the tests and they all pass.             │
+╰────────────────────────────── ctx 0% · 1 tool · 0s ──────╯
+! this answer says it ran the tests, but no test command ran this turn
+```
+
+It reports to you, never to the model, and reports a mismatch rather than a verdict — the claim might be about an earlier turn. It only looks at claims phrased in the past tense, so advice ("run the tests before you push") and hedging ("I haven't run the tests yet") stay quiet. Like the command explainer, it derives a fact in the harness and shows you where it differs from what was claimed, rather than asking the model to mark its own work.
 
 ## Tests
 

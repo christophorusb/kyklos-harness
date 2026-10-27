@@ -617,6 +617,75 @@ def _command_findings(tokens: list[str]) -> list[tuple[str, str]]:
 
 
 
+# ---- claims the answer makes that the turn didn't back up ---------------------------------------
+# A model can't be made truthful, but in a coding agent the lies are about checkable things. Kyklos
+# already turns one class of them into a hard failure: edit_file needs the exact existing text, so a
+# model that imagines a file simply can't edit it. This does the same for the turn's own story —
+# "I ran the tests" is compared against whether a test command actually ran.
+#
+# It reports to you, never to the model, and reports a mismatch rather than a verdict: the claim may
+# be about an earlier turn. It errs towards silence, since a check that cries wolf gets ignored.
+
+CLAIM_NEGATION_RE = re.compile(r"\b(not|n't|never|unable|without|couldn't|didn't|haven't|should|would|"
+                               r"could|can|please|if you|you can|try)\b", re.I)
+CLAIM_CHECKS = [
+    ("ran the tests",
+     # Past tense only: "Run the tests before you push" is advice, not a claim to have run them.
+     re.compile(r"\b(?:ran|re-?ran|executed)\s+(?:the\s+|all\s+|your\s+)?(?:unit\s+|full\s+)?tests?\b|"
+                r"\b(?:have|has|had|'ve)\s+run\s+(?:the\s+|all\s+)?tests?\b|"
+                r"\btests?\s+(?:(?:are|is|were|all|now|still|again)\s+){0,2}"
+                r"(?:pass|passes|passing|passed|green)\b|"
+                r"\b(?:all|the)\s+\d*\s*tests?\s+pass", re.I),
+     re.compile(r"\b(?:pytest|unittest|vitest|jest|mocha|tox|rspec|phpunit)\b|"
+                r"\b(?:npm|yarn|pnpm|bun)\s+(?:run\s+)?test\b|\b(?:go|cargo)\s+test\b|"
+                r"\bmake\s+\w*test\w*\b", re.I),
+     "no test command ran this turn", "the test command didn't succeed"),
+    ("committed",
+     re.compile(r"\bcommitted\b|\bmade\s+(?:a|the)\s+commit\b", re.I),
+     re.compile(r"\bgit\s+commit\b", re.I),
+     "no `git commit` ran this turn", "`git commit` didn't succeed"),
+    ("pushed",
+     re.compile(r"\bpushed\b", re.I),
+     re.compile(r"\bgit\s+push\b", re.I),
+     "no `git push` ran this turn", "`git push` didn't succeed"),
+    ("installed packages",
+     re.compile(r"\binstalled\b", re.I),
+     re.compile(r"\b(?:npm|pnpm|yarn|pip3?|uv|cargo|go|gem|brew|apt(?:-get)?)\s+(?:install|add|ci)\b", re.I),
+     "no install command ran this turn", "the install command didn't succeed"),
+]
+EXIT_CODE_RE = re.compile(r"^exit code (\d+)", re.M)
+
+
+def _succeeded(result: str) -> bool:
+    """A command succeeded only if it reported `exit code 0`. No exit code at all means it never
+    ran — denied, or it errored before starting — which is just as much a gap in the story."""
+    match = EXIT_CODE_RE.search(result or "")
+    return bool(match) and match.group(1) == "0"
+
+
+def _claimed(answer: str, pattern: re.Pattern) -> bool:
+    """True if `answer` asserts this, ignoring matches that are hedged, negated or advisory."""
+    for match in pattern.finditer(answer):
+        lead = answer[max(0, match.start() - 60):match.start()]
+        if not CLAIM_NEGATION_RE.search(lead):
+            return True
+    return False
+
+
+def unsupported_claims(answer: str, runs: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """(what the answer claims, why this turn doesn't show it), from (command, result) pairs."""
+    out = []
+    for label, says, did, missing, failed in CLAIM_CHECKS:
+        if not _claimed(answer, says):
+            continue
+        matched = [result for command, result in runs if did.search(command)]
+        if not matched:
+            out.append((label, missing))
+        elif not any(_succeeded(result) for result in matched):
+            out.append((label, failed))
+    return out
+
+
 def is_auto_allowed(name: str, args: dict, always_allowed: set[str], auto_bash: bool = False) -> bool:
     """True if a tool call may run without prompting the user.
 
@@ -748,7 +817,8 @@ def console_observer(event: str, depth: int = 0, **data) -> None:
     elif event == "tool_result":
         print(textwrap.indent(preview(data["result"]), indent))
     elif event == "subagent_start":
-        print(f"{indent}\033[35m[subagent: {data['description']} ({data['mode']})]\033[0m")
+        routed = f" · {data['model']}" if data.get("routed") else ""
+        print(f"{indent}\033[35m[subagent: {data['description']} ({data['mode']}{routed})]\033[0m")
     elif event == "subagent_end":
         print(f"{indent}\033[35m[subagent done in {data['steps']} steps]\033[0m")
     elif event == "compact":
@@ -765,7 +835,9 @@ class Agent:
                  context_window: int = DEFAULT_CONTEXT_WINDOW, tool_names: set = None,
                  depth: int = 0, always_allowed: set = None, plan_mode: bool = False,
                  before_write=None, on_event=console_observer, sleep=time.sleep, effort: str = "default",
-                 max_steps: int = DEFAULT_MAX_STEPS, compact_above: int = DEFAULT_COMPACT_ABOVE):
+                 max_steps: int = DEFAULT_MAX_STEPS, compact_above: int = DEFAULT_COMPACT_ABOVE,
+                 subagent_model: str | None = None, subagent_effort: str | None = None,
+                 subagent_context_window: int | None = None):
         self.client = client
         self.model = model
         self.active_snapshots: dict[Path, bytes | None] | None = None
@@ -780,6 +852,9 @@ class Agent:
         self.effort = effort or "default"  # thinking effort label; see effort_request_value()
         self.max_steps = max_steps
         self.compact_above = compact_above
+        self.subagent_model = subagent_model or None
+        self.subagent_effort = (subagent_effort or "default") if self.subagent_model else "default"
+        self.subagent_context_window = subagent_context_window if self.subagent_model else None
         # Chosen at startup, for this session only: a relaxation of the permission rules should
         # never outlive the run it was agreed for, the way folder trust deliberately does.
         self.auto_bash = False
@@ -791,6 +866,7 @@ class Agent:
         # Shared with subagents, so "always allow" carries over in both directions.
         self.always_allowed: set[str] = always_allowed if always_allowed is not None else set()
         self.last_steps = 0
+        self.last_claims: list[tuple[str, str]] = []  # answer claims this turn didn't back up
         # Billed tokens for the whole session: prompt + completion over every API call, including
         # compaction summaries and subagents. Set here rather than in reset(), so /reset clears the
         # conversation without forgetting what has already been spent.
@@ -869,6 +945,20 @@ class Agent:
         if context_window:
             self.context_window = context_window
         self.usage_mark = None
+
+    def set_subagent_model(self, model: str | None, effort: str = "default",
+                           context_window: int | None = None) -> None:
+        """Route subagents (`task`) to a separate model and thinking effort, or None to match the main model."""
+        self.subagent_model = model or None
+        self.subagent_effort = (effort or "default") if self.subagent_model else "default"
+        self.subagent_context_window = context_window if self.subagent_model else None
+
+    def effective_subagent_config(self) -> tuple[str, str, int]:
+        """(model, effort, context_window) that a subagent spawned by this agent will use."""
+        if self.subagent_model:
+            return (self.subagent_model, self.subagent_effort or "default",
+                    self.subagent_context_window or self.context_window)
+        return (self.model, self.effort, self.context_window)
 
     def set_plan_mode(self, enabled: bool) -> None:
         """Switch between read-only plan mode and full execution mode without losing the conversation."""
@@ -1070,16 +1160,20 @@ class Agent:
             return f"Error: mode must be one of {', '.join(SUBAGENT_TOOLS)}"
         if self.plan_mode and mode != "explore":
             return "Error: in plan mode, subagents must use mode 'explore'."
-        sub = Agent(self.client, self.model, self.tools.workspace, permission=self.permission,
-                    context_window=self.context_window, tool_names=SUBAGENT_TOOLS[mode],
+        sub_model, sub_effort, sub_window = self.effective_subagent_config()
+        routed = bool(self.subagent_model and (sub_model != self.model or sub_effort != self.effort))
+        sub = Agent(self.client, sub_model, self.tools.workspace, permission=self.permission,
+                    context_window=sub_window, tool_names=SUBAGENT_TOOLS[mode],
                     depth=self.depth + 1, always_allowed=self.always_allowed,
                     before_write=self._before_write, on_event=self.on_event, sleep=self.sleep,
-                    effort=self.effort, max_steps=self.max_steps, compact_above=self.compact_above)
+                    effort=sub_effort, max_steps=self.max_steps, compact_above=self.compact_above)
         sub.auto_bash = self.auto_bash
-        sub._emit("subagent_start", description=description, mode=mode)
+        sub._emit("subagent_start", description=description, mode=mode, model=sub_model, effort=sub_effort,
+                  routed=routed)
         answer = sub.send(prompt)
         self.session_tokens += sub.session_tokens  # a subagent's calls are billed to this session too
-        sub._emit("subagent_end", description=description, mode=mode, steps=sub.last_steps)
+        sub._emit("subagent_end", description=description, mode=mode, steps=sub.last_steps, model=sub_model,
+                  effort=sub_effort, routed=routed)
         return answer or "(The subagent finished without an answer.)"
 
     def send(self, user_text: str) -> str:
@@ -1105,6 +1199,8 @@ class Agent:
         compactions = 0
         tools_run = 0
         hinted = False  # the delegation nudge is once per turn, not once per tool call
+        self.last_claims = []
+        commands_run: list[tuple[str, str]] = []  # (command, result), to check the answer's story
         for step in range(1, self.max_steps + 1):
             self.last_steps = step
             if self.context_tokens() > self.compaction_trigger():
@@ -1138,12 +1234,19 @@ class Agent:
 
             if not msg.tool_calls:
                 self.turn_log.append((user_text, msg.content or ""))
+                self.last_claims = unsupported_claims(msg.content or "", commands_run)
                 return msg.content or ""
 
             if msg.content:
                 self._emit("thought", text=msg.content)
             for tc in msg.tool_calls:
                 tools_run += 1
+                bash_command = ""
+                if tc.function.name == "bash":
+                    try:
+                        bash_command = str(json.loads(tc.function.arguments).get("command", ""))
+                    except (ValueError, AttributeError):
+                        bash_command = ""
                 self._emit("tool_call", name=tc.function.name, arguments=tc.function.arguments)
                 result = self.run_tool(tc.function.name, tc.function.arguments)
                 # SEC-04: secrets never reach the model (or the screen) through tool output.
@@ -1154,6 +1257,8 @@ class Agent:
                 if not hinted and self._should_hint_delegation():
                     result += f"\n\n{self._delegation_hint()}"
                     hinted = True
+                if bash_command:
+                    commands_run.append((bash_command, result))
                 self._emit("tool_result", name=tc.function.name, result=result)
                 self.messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
@@ -1362,7 +1467,8 @@ def fetch_model_catalog(base_url: str, api_key: str, client=None, urlopen=None) 
 
 def load_model_catalog(home: Path, base_url: str, api_key: str, client=None, refresh: bool = False,
                        fetch=fetch_model_catalog, now=time.time) -> list[dict]:
-    """The model catalog, cached for a day in ~/.kyklos/models.json (per BASE_URL)."""
+    """The model catalog, cached for a day in ~/.kyklos/models.json (per BASE_URL).
+    If refreshing an expired cache fails (e.g. offline), the cached list is still returned."""
     path = home / "models.json"
     try:
         cache = json.loads(path.read_text(encoding="utf-8"))
@@ -1371,7 +1477,12 @@ def load_model_catalog(home: Path, base_url: str, api_key: str, client=None, ref
     entry = cache.get(base_url)
     if entry and not refresh and now() - entry.get("fetched", 0) < MODEL_CACHE_TTL:
         return entry["models"]
-    models = fetch(base_url, api_key, client=client)
+    try:
+        models = fetch(base_url, api_key, client=client)
+    except Exception:
+        if entry and entry.get("models") and not refresh:
+            return entry["models"]
+        raise
     cache[base_url] = {"fetched": now(), "models": models}
     home.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(cache, indent=2), encoding="utf-8")
@@ -1408,6 +1519,20 @@ def choose_model(flag: str | None, settings: dict, env) -> tuple[str | None, str
     if settings.get("model"):
         return settings["model"], "picked"
     return env.get("MODEL"), "MODEL"
+
+
+SAME_MODEL_WORDS = {"same", "default", "off", "none", ""}
+
+
+def choose_subagent_model(flag: str | None, settings: dict, env) -> tuple[str | None, str]:
+    """(model, source): `--submodel` > /submodel in settings.json > SUBAGENT_MODEL in .env > None (same as main)."""
+    for value, source in ((flag, "--submodel"),
+                          (settings.get("subagent_model"), "picked"),
+                          (env.get("SUBAGENT_MODEL"), "SUBAGENT_MODEL")):
+        if value is not None and (value.strip() or source != "SUBAGENT_MODEL"):
+            cleaned = value.strip()
+            return (None if cleaned.lower() in SAME_MODEL_WORDS else cleaned), source
+    return None, "same"
 
 
 # Per-user data lives in ~/.kyklos (override with KYKLOS_HOME), so `kyklos` can run in any folder:
@@ -1826,6 +1951,74 @@ def _cmd_effort(ctx, arg):
     _apply_model(ctx, info, effort)
 
 
+def _apply_subagent_model(ctx, info: dict | None, effort: str = "default") -> None:
+    if info is None:
+        ctx.agent.set_subagent_model(None)
+        if ctx.home:
+            settings = load_settings(ctx.home)
+            settings["subagent_model"] = "same"
+            save_settings(ctx.home, settings)
+        ctx.say("ok", f"Subagents will use the main model ({ctx.agent.model}).")
+        return
+    window = None if ctx.context_override else (info.get("context") or DEFAULT_CONTEXT_WINDOW)
+    ctx.agent.set_subagent_model(info["name"], effort, window)
+    if ctx.home:
+        settings = load_settings(ctx.home)
+        settings["subagent_model"] = info["name"]
+        settings.setdefault("subagent_efforts", {})[info["name"]] = effort
+        save_settings(ctx.home, settings)
+    thinking = "no thinking" if not effort_options(info) else f"effort {effort}"
+    sub_window = ctx.agent.subagent_context_window or ctx.agent.context_window
+    ctx.say("ok", f"Subagents using {info['name']} · {thinking} · {short_tokens(sub_window)} context.")
+
+
+@command("submodel", "/submodel [name|same]",
+         "Pick the model for subagents, or 'same' to match the main model (remembered)")
+def _cmd_submodel(ctx, arg):
+    if arg and arg.lower() in SAME_MODEL_WORDS:
+        _apply_subagent_model(ctx, None)
+        return
+    refresh = arg == "--refresh"
+    catalog = _model_catalog(ctx, refresh=refresh)
+    names = [m["name"] for m in catalog]
+    if arg and not refresh:
+        if catalog and arg not in names:
+            close = [n for n in names if arg.lower() in n.lower()]
+            ctx.say("error", f"No model named {arg}." + (f" Did you mean: {', '.join(close[:5])}?" if close else
+                                                          " Type /submodel to pick from the list."))
+            return
+        info = _model_info(catalog, arg)
+    else:
+        if not catalog:
+            ctx.say("warn", "No model list available. Use /submodel <name> or /submodel same.")
+            return
+        if not ctx.pick:
+            ctx.say("error", "This front end can't show a picker. Use /submodel <name> or /submodel same.")
+            return
+        rows = [("same as main model", "", f"follows /model ({ctx.agent.model})")] + [
+            (m["name"], short_tokens(m["context"]) if m.get("context") else "",
+             " · ".join(effort_options(m)[1:]) if effort_options(m) else "no thinking") for m in catalog
+        ]
+        active = ctx.agent.subagent_model
+        marked = (names.index(active) + 1) if active in names else (0 if active is None else None)
+        choice = ctx.pick("Pick a subagent model", rows, cursor=marked or 0, marked=marked, filterable=True)
+        if choice is None:
+            current_label = ctx.agent.subagent_model or f"same as main ({ctx.agent.model})"
+            ctx.say("info", f"Kept subagent model ({current_label}).")
+            return
+        if choice == 0:
+            _apply_subagent_model(ctx, None)
+            return
+        info = catalog[choice - 1]
+    saved = (load_settings(ctx.home).get("subagent_efforts", {}) if ctx.home else {}).get(info["name"], "default")
+    effort = _pick_effort(ctx, info, saved) if ctx.pick and not arg else saved
+    if effort is None:
+        current_label = ctx.agent.subagent_model or f"same as main ({ctx.agent.model})"
+        ctx.say("info", f"Kept subagent model ({current_label}).")
+        return
+    _apply_subagent_model(ctx, info, effort if effort in (effort_options(info) or ["default"]) else "default")
+
+
 @command("exit", "/exit", "Quit")
 def _cmd_exit(ctx, arg):
     return EXIT
@@ -1870,7 +2063,8 @@ def plain_repl(agent: "Agent", default_session: Path, **ctx_extras) -> None:
     agents_md = " (AGENTS.md loaded)" if (agent.tools.workspace / "AGENTS.md").is_file() else ""
     source = getattr(agent, "context_source", "default")
     effort = f"  effort={agent.effort}" if agent.effort != "default" else ""
-    print(f"Kyklos ready. model={agent.model}{effort}  context={short_tokens(agent.context_window)} ({source})  "
+    sub = f"  submodel={agent.subagent_model}" if agent.subagent_model and agent.subagent_model != agent.model else ""
+    print(f"Kyklos ready. model={agent.model}{effort}{sub}  context={short_tokens(agent.context_window)} ({source})  "
           f"workspace={agent.tools.workspace}{agents_md}")
     print("Type /help for commands.\n")
     while True:
@@ -1891,6 +2085,8 @@ def plain_repl(agent: "Agent", default_session: Path, **ctx_extras) -> None:
                     continue
                 text = result
             print(f"\n{agent.send(text)}")
+            for label, missing in agent.last_claims:
+                print(f"  \033[33m! this answer says it {label}, but {missing}\033[0m")
             agent.save_session(default_session)
             used = agent.context_tokens()
             print(f"\033[2m(context: ~{used:,} / {agent.context_window:,} tokens, {used / agent.context_window:.0%})\033[0m\n")
@@ -1913,14 +2109,24 @@ def main() -> None:
         if idx >= len(args):
             sys.exit("--model needs a model name, e.g. kyklos --model kimi-k3")
         model_flag = args.pop(idx)
+    submodel_flag = None
+    if "--submodel" in args:  # use this subagent model for one run (not remembered)
+        idx = args.index("--submodel")
+        args.pop(idx)
+        if idx >= len(args):
+            sys.exit("--submodel needs a model name (or 'same'), e.g. kyklos --submodel kimi-flash")
+        submodel_flag = args.pop(idx)
     home = kyklos_home()
     settings = load_settings(home)
     model, model_source = choose_model(model_flag, settings, os.environ)
+    sub_model, _ = choose_subagent_model(submodel_flag, settings, os.environ)
     missing = [k for k in ("BASE_URL", "API_KEY") if not os.environ.get(k)] + ([] if model else ["MODEL"])
     if missing:
         sys.exit(f"Missing {', '.join(missing)}. Copy .env.example to .env and fill it in.")
     base_url, api_key = os.environ["BASE_URL"], os.environ["API_KEY"]
     effort = settings.get("efforts", {}).get(model, "default")
+    sub_effort = (settings.get("subagent_efforts", {}).get(sub_model)
+                  or os.environ.get("SUBAGENT_EFFORT") or "default") if sub_model else "default"
 
     workspace = Path(os.environ.get("WORKSPACE") or Path.cwd()).resolve()
     client = OpenAI(base_url=base_url, api_key=api_key)
@@ -1932,8 +2138,16 @@ def main() -> None:
         window, window_source = choose_context_window(os.environ, detected)
     except ValueError as e:
         sys.exit(str(e))
+    sub_window = None
+    if sub_model:
+        if os.environ.get("CONTEXT_WINDOW"):
+            sub_window = window
+        else:
+            sub_window = ((cached_model_info(home, base_url, sub_model) or {}).get("context")
+                          or detect_context_window(base_url, api_key, sub_model)
+                          or DEFAULT_CONTEXT_WINDOW)
     default_session = project_dir(home, workspace) / "last.jsonl"
-    ctx_extras = {"home": None if model_flag else home,  # a one-run --model doesn't overwrite the saved pick
+    ctx_extras = {"home": None if (model_flag or submodel_flag) else home,  # one-run flags don't overwrite saved picks
                   "load_models": lambda refresh=False: load_model_catalog(home, base_url, api_key, client, refresh),
                   "context_override": bool(os.environ.get("CONTEXT_WINDOW"))}
 
@@ -1970,6 +2184,7 @@ def main() -> None:
                  "or pass --trust to allow it for one run.")
     agent = Agent(client, model, workspace, context_window=window, plan_mode=plan_mode, effort=effort,
                   max_steps=choose_max_steps(os.environ), compact_above=choose_compact_above(os.environ),
+                  subagent_model=sub_model, subagent_effort=sub_effort, subagent_context_window=sub_window,
                   **({"permission": ui.permission, "on_event": ui.observer} if ui else {}))
     # Asked after trust, and never remembered: unlike trusting a folder, this relaxes the rules that
     # protect every run, so it is agreed once per session or not at all.

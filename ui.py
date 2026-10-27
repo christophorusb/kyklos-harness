@@ -443,6 +443,18 @@ class AeroUI:
         secs = int(time.monotonic() - start)
         return self._tool_text(self.g["run"], "aqua", name, label), (Text(f"{secs}s", style="frost") if secs else None)
 
+    def _sub_model_tag(self, model: str | None, effort: str | None) -> str:
+        """Short label for a subagent's model when it differs from the main agent's (empty when the same)."""
+        if not model or not self.agent:
+            return ""
+        eff = effort or "default"
+        main_eff = getattr(self.agent, "effort", "default") or "default"
+        if model == self.agent.model and eff == main_eff:
+            return ""
+        if eff != "default" or model == self.agent.model:
+            return f"{model} {eff}"
+        return model
+
     def _render_live(self):
         rows = []
         running = self._running.get(0)
@@ -453,8 +465,10 @@ class AeroUI:
             indent = 2 + 4 * i
             glyph, color = self._bubble()
             secs = int(time.monotonic() - sub["start"])
+            tag = self._sub_model_tag(sub.get("model"), sub.get("effort"))
+            tag_text = Text(f" {self.g['dot']} {tag}", style="frost") if tag else Text()
             head = Text(glyph, style=color) + Text(" ") + Text("task", style="bold") + Text("  ") + \
-                Text(sub["mode"], style="orchid") + Text(f" {self.g['dot']} {sub['description']}", style="frost")
+                Text(sub["mode"], style="orchid") + tag_text + Text(f" {self.g['dot']} {sub['description']}", style="frost")
             rows.append(self._line(head, Text(f"{secs}s", style="frost"), indent))
             items = list(sub["steps"])  # (left, right) pairs of finished steps
             now = self._running.get(depth)
@@ -526,8 +540,11 @@ class AeroUI:
         if self.ascii:
             summary = summary.replace("✓ ", "")
         if name == "task":
+            sub = self._last_sub if status == "ok" else None
+            tag = self._sub_model_tag(sub.get("model"), sub.get("effort")) if sub else ""
+            tag_text = Text(f" {self.g['dot']} {tag}", style="frost") if tag else Text()
             left = self._tool_text(glyph, glyph_style, name, "") + Text("  ") + \
-                Text(args.get("mode") or "explore", style="orchid") + \
+                Text(args.get("mode") or "explore", style="orchid") + tag_text + \
                 Text(f" {self.g['dot']} {args.get('description', '')}", style="frost")
         else:
             extra = None
@@ -548,13 +565,14 @@ class AeroUI:
         if status == "ok" and "old" in info and not info["panel_shown"]:
             self._print_diff(info, indent=4, max_rows=12)  # auto-approved edits still show what changed, once
 
-    def _on_subagent_start(self, depth, description="", mode="explore", **_):
-        self._subs.append({"description": description, "mode": mode, "start": time.monotonic(),
-                           "steps": deque(maxlen=3), "count": 0})
+    def _on_subagent_start(self, depth, description="", mode="explore", model=None, effort=None, **_):
+        self._subs.append({"description": description, "mode": mode, "model": model, "effort": effort,
+                           "start": time.monotonic(), "steps": deque(maxlen=3), "count": 0})
 
-    def _on_subagent_end(self, depth, steps=0, **_):
+    def _on_subagent_end(self, depth, steps=0, model=None, effort=None, **_):
         sub = self._subs.pop() if self._subs else {"start": time.monotonic()}
-        self._last_sub = {"steps": steps, "secs": time.monotonic() - sub["start"]}
+        self._last_sub = {"steps": steps, "secs": time.monotonic() - sub["start"],
+                          "model": model or sub.get("model"), "effort": effort or sub.get("effort")}
 
     def _on_compact(self, depth, stage="", before=0, after=0, pruned=0, **_):
         what = f"cleared {_plural(pruned, 'old tool result')}" if stage == "pruned" else "summarized older turns"
@@ -1157,6 +1175,10 @@ class AeroUI:
             return
         self.reset_transient()
         self.answer(answer, footer=self.footer_text(agent, time.monotonic() - start))
+        for label, missing in getattr(agent, "last_claims", []):
+            # Reported to you, not to the model, and as a mismatch rather than a verdict: the claim
+            # may be about an earlier turn.
+            self.print(Text(f"! this answer says it {label}, but {missing}", style="sun"), indent=2)
         agent.save_session(default_session)
 
     def run(self, agent, default_session: Path, one_shot: str = None, notice: tuple = None, **ctx_extras) -> None:
