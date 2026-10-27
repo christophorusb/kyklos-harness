@@ -292,6 +292,40 @@ class ToolError(Exception):
     """An error message meant for the model, not a crash."""
 
 
+# A disposable corner of the workspace for one-off diagnostic scripts. It has to be *inside* the
+# workspace: a script in /tmp can't resolve `./src/...` or the project's dependencies, and
+# _resolve() refuses to write outside the workspace at all, so the model's only way out was
+# `cat > /tmp/x.mjs <<'EOF'` through bash — two permission prompts and a heredoc, to run five lines.
+SCRATCH_DIR = ".kyklos/scratch"
+
+
+def scratch_dir(workspace: Path) -> Path:
+    # Resolved on both sides: on macOS /var is a symlink to /private/var, so comparing an
+    # unresolved workspace against a resolved path would never match.
+    return workspace.resolve() / ".kyklos" / "scratch"
+
+
+def ensure_scratch(workspace: Path) -> Path:
+    """Create the scratch directory, ignoring itself rather than editing the project's .gitignore:
+    `.kyklos/.gitignore` holding `*` keeps the whole thing out of git and touches nothing of yours."""
+    directory = scratch_dir(workspace)
+    directory.mkdir(parents=True, exist_ok=True)
+    marker = directory.parent / ".gitignore"
+    if not marker.exists():
+        marker.write_text("*\n", encoding="utf-8")
+    return directory
+
+
+def is_scratch_path(workspace: Path, path: str) -> bool:
+    """True if `path` lands inside this workspace's scratch directory."""
+    try:
+        resolved = (workspace / path).resolve()
+    except (OSError, ValueError):
+        return False
+    root = scratch_dir(workspace)
+    return resolved == root or root in resolved.parents
+
+
 class Tools:
     def __init__(self, workspace: Path, before_write=None):
         self.workspace = workspace.resolve()
@@ -348,6 +382,8 @@ class Tools:
             raise ToolError(f"Refusing to write {path}: it likely contains secrets. Ask the user to change it.")
         if self.before_write:
             self.before_write(p)
+        if is_scratch_path(self.workspace, path):
+            ensure_scratch(self.workspace)  # also writes the .gitignore that keeps it out of git
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} chars to {path}"

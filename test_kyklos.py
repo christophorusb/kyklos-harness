@@ -929,6 +929,66 @@ class CompactionCeilingTests(unittest.TestCase):
         self.assertFalse(context_breakdown(self.agent(128_000))["compact_capped"])
 
 
+class ScratchDirTests(unittest.TestCase):
+    """A disposable corner of the workspace for one-off diagnostic scripts.
+
+    It has to be inside the workspace: `_resolve` refuses to write outside it, so the model's only
+    route for a throwaway script was `cat > /tmp/x.mjs <<'EOF'` through bash — and nothing in /tmp
+    can import the project anyway.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name).resolve()
+        self.addCleanup(self.tmp.cleanup)
+
+    def auto(self, name, path):
+        from kyklos import is_auto_allowed
+        return is_auto_allowed(name, {"path": path}, set(), workspace=self.ws)
+
+    def test_writing_scratch_needs_no_approval(self):
+        for name in ("write_file", "edit_file"):
+            with self.subTest(name=name):
+                self.assertTrue(self.auto(name, ".kyklos/scratch/probe.mjs"))
+
+    def test_writing_anywhere_else_still_asks(self):
+        for path in ("src/app.ts", "README.md", ".kyklos/notes.md", "../outside.ts",
+                     ".kyklos/scratch/../../src/app.ts"):
+            with self.subTest(path=path):
+                self.assertFalse(self.auto("write_file", path), path)
+
+    def test_running_a_scratch_script_still_asks(self):
+        """bash isn't confined to a directory, and the script was written moments ago."""
+        from kyklos import is_auto_allowed
+        self.assertFalse(is_auto_allowed("bash", {"command": "node .kyklos/scratch/probe.mjs"},
+                                         set(), auto_bash=True, workspace=self.ws))
+
+    def test_the_explainer_leaves_scratch_writes_alone(self):
+        from kyklos import explain_command
+        quiet = explain_command("echo x > .kyklos/scratch/probe.mjs")
+        self.assertNotIn("danger", {level for level, _ in quiet})
+        loud = explain_command("echo x > notes.txt")
+        self.assertIn("danger", {level for level, _ in loud})
+
+    def test_it_keeps_itself_out_of_git(self):
+        from tools import Tools, ensure_scratch
+        Tools(self.ws).write_file(".kyklos/scratch/probe.mjs", "console.log(1)\n")
+        self.assertTrue((self.ws / ".kyklos" / "scratch" / "probe.mjs").is_file())
+        self.assertEqual((self.ws / ".kyklos" / ".gitignore").read_text().strip(), "*")
+        ensure_scratch(self.ws)  # idempotent
+
+    def test_a_scratch_script_sits_inside_the_workspace(self):
+        """The whole point: relative imports and the project's dependencies resolve from there."""
+        from tools import scratch_dir
+        self.assertIn(self.ws, scratch_dir(self.ws).parents)
+
+    def test_the_model_is_told_about_it(self):
+        agent = Agent(FakeClient([]), "fake", self.ws)
+        prompt = agent.messages[0]["content"]
+        self.assertIn(".kyklos/scratch", prompt)
+        self.assertIn("/tmp", prompt)  # and told not to use it
+
+
 class UnsupportedClaimTests(unittest.TestCase):
     """The answer's story about the turn, checked against what the turn actually ran.
 

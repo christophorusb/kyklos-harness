@@ -21,7 +21,7 @@ from pathlib import Path
 from openai import APIConnectionError, APITimeoutError, InternalServerError, OpenAI, RateLimitError
 
 from tools import (SAFE_TOOLS, SCHEMAS, SHELL_NAME, ToolError, Tools, command_touches_secret, hide_env_names,
-                   missing_unix_tools, probe_commands, scrub_secrets)
+                   is_scratch_path, missing_unix_tools, probe_commands, scrub_secrets, SCRATCH_DIR)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -487,6 +487,8 @@ def explain_command(command: str) -> list[tuple[str, str]]:
         target = target.strip("\"'")
         if target.lower() in NULL_SINKS:
             continue  # discarding output, not writing a file
+        if SCRATCH_DIR in target.replace("\\", "/"):
+            continue  # the scratch directory exists to be written over
         findings.append(("danger", f"{'appends to' if op == '>>' else 'overwrites'} {target}"))
     if command_touches_secret(command):
         findings.append(("danger", "names a secret file, so it can only ever be allowed once"))
@@ -686,14 +688,23 @@ def unsupported_claims(answer: str, runs: list[tuple[str, str]]) -> list[tuple[s
     return out
 
 
-def is_auto_allowed(name: str, args: dict, always_allowed: set[str], auto_bash: bool = False) -> bool:
+def is_auto_allowed(name: str, args: dict, always_allowed: set[str], auto_bash: bool = False,
+                    workspace: Path | None = None) -> bool:
     """True if a tool call may run without prompting the user.
 
     `auto_bash` is the session mode chosen at startup: run bash commands unprompted unless the
     explainer flags them. Secret files still always ask, as they always have.
+
+    Writing into the scratch directory needs no approval — it is a disposable corner of the
+    workspace, and asking before each throwaway diagnostic script is friction without safety.
+    *Running* one still asks: bash is not confined to a directory, and a script the model wrote
+    moments ago is exactly the kind of thing whose contents you want to look at first.
     """
     if name in SAFE_TOOLS:
         return True
+    if name in ("write_file", "edit_file") and workspace is not None:
+        if is_scratch_path(workspace, str(args.get("path", ""))):
+            return True
     if name == "bash":
         cmd = str(args.get("command", ""))
         if command_touches_secret(cmd):
@@ -920,6 +931,13 @@ class Agent:
             workspace=self.tools.workspace, os=platform.system(), shell=SHELL_NAME,
             commands=describe_commands(),
         )
+        if "write_file" in self.tool_names:
+            prompt += (f"\n- For a throwaway script — checking a runtime value, reproducing a bug, "
+                       f"drafting a test — write it to {SCRATCH_DIR}/ with write_file and run it from "
+                       f"there. It sits inside the workspace, so relative imports and the project's "
+                       f"dependencies resolve, it is kept out of git, and writing there needs no "
+                       f"approval. Don't write scratch files to /tmp: nothing there can import the "
+                       f"project.")
         if "task" in self.tool_names:
             # "Broad searches" was too vague to act on: a real session made 134 exploratory calls,
             # 87% of its tool output, without delegating once. Give a threshold it can apply.
@@ -1122,7 +1140,7 @@ class Agent:
             return f"Error: {e}"
         except (KeyError, TypeError) as e:
             return f"Error: bad arguments for {name}: {e}"
-        if not is_auto_allowed(name, args, self.always_allowed, self.auto_bash):
+        if not is_auto_allowed(name, args, self.always_allowed, self.auto_bash, self.tools.workspace):
             allowed, note = self.permission(name, args, self.always_allowed)
             if not allowed:
                 return note

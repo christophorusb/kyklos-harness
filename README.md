@@ -147,6 +147,10 @@ In a live test, a subagent took 12 steps and read five whole files, while the ma
 
 **Getting it used.** Having the tool isn't enough: a real session made 134 exploratory calls — 87% of all its tool output — and delegated none of them. The model can see the files it read, but not what it costs to re-send them on every later step. So the system prompt gives a threshold rather than a vague suggestion ("more than two or three reads or searches"), and once the conversation passes half the compaction trigger, Kyklos appends a one-off note to a tool result naming the current size and pointing at `task`. It fires once per turn, and not at all when `task` isn't available or the turn is short.
 
+**Scratch space:** `.kyklos/scratch/` inside the workspace is for throwaway scripts — checking a runtime value, reproducing a bug, drafting a test. It exists because a script in `/tmp` can't resolve `./src/...` or the project's dependencies, and `write_file` refuses paths outside the workspace anyway, so the only route left was `cat > /tmp/x.mjs <<'EOF'` through bash: two permission prompts and a heredoc to run five lines.
+
+Writing there needs no approval and the explainer doesn't flag it, since the directory exists to be written over. **Running** a script from it still asks: `bash` isn't confined to a directory, and a script the model wrote moments ago is exactly what you want to read before it executes. The directory keeps itself out of git with a `.kyklos/.gitignore` containing `*`, so your own `.gitignore` is never touched.
+
 **Project instructions:** if the workspace has an `AGENTS.md`, it's added to the system prompt, like CLAUDE.md or GEMINI.md in other harnesses. Put project conventions there, such as "use tabs" or "run `npm test` after changes".
 
 **Models and thinking effort:** `/model` opens an arrow-key picker of the provider's models: ↑/↓ to move, type to filter, Enter to pick, Esc to cancel. Each model shows its context size and thinking levels. Then a second picker offers *that model's own* effort levels:
