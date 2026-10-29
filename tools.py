@@ -558,6 +558,22 @@ class Tools:
                 break
         return "\n".join(files) or "No files matched."
 
+    def _timed_out(self, timeout: int, stdout: str | None, stderr: str | None) -> str:
+        """What a command managed to say before it hung, kept rather than thrown away.
+
+        Discarding it costs more than it looks. A command that prints as it goes has usually done
+        most of the work by the time it hangs, and without its output the only way to read the
+        numbers it already produced is to run the whole thing again -- which hangs again. Printing
+        nothing at all is itself worth saying: that is the shape of a command waiting for input.
+        """
+        note = (f"Command timed out after {timeout}s. If it waits for input, pass the answer as "
+                "a flag instead (e.g. -Force, --yes); if it's just slow, use a larger timeout.")
+        out = ((stdout or "") + (stderr or "")).rstrip()
+        if not out:
+            return f"{note}\nIt printed nothing before it was stopped."
+        return self._truncate(f"{note}\nIt printed this before it was stopped, and there may have "
+                              f"been more to come:\n{out}")
+
     def bash(self, command: str, timeout: int = 120) -> str:
         # Commands get no keyboard. Their output is captured, so a prompt ("Confirm", Read-Host, npx's
         # "Ok to proceed?", git asking for a password) would be invisible and hang until the timeout.
@@ -574,9 +590,11 @@ class Tools:
             stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             kill_process_tree(process)
-            process.communicate()
-            raise ToolError(f"Command timed out after {timeout}s. If it waits for input, pass the answer as "
-                            "a flag instead (e.g. -Force, --yes); if it's just slow, use a larger timeout.")
+            try:  # the group is dead, so the pipes are closed and this returns what was buffered
+                stdout, stderr = process.communicate()
+            except (ValueError, OSError):
+                stdout, stderr = "", ""
+            raise ToolError(self._timed_out(timeout, stdout, stderr))
         except KeyboardInterrupt:  # Ctrl+C: stop everything the command started, then let the turn end
             kill_process_tree(process)
             raise

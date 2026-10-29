@@ -2404,6 +2404,34 @@ class NoKeyboardTests(unittest.TestCase):
             self.tools.bash("Start-Sleep -Seconds 5" if IS_WINDOWS else "sleep 5", timeout=1)
         self.assertIn("pass the answer as a flag", str(caught.exception))
 
+    def test_a_timed_out_command_keeps_what_it_printed(self):
+        """A command that prints as it goes has usually done most of the work by the time it hangs.
+        Throwing that away left re-running the whole thing as the only way to read it, which hangs
+        again -- a real session lost two measured runs to this."""
+        from tools import IS_WINDOWS, ToolError
+        command = ('Write-Output "recalc= 34.23"; Start-Sleep -Seconds 5' if IS_WINDOWS
+                   else 'echo "recalc= 34.23"; sleep 5')
+        with self.assertRaises(ToolError) as caught:
+            self.tools.bash(command, timeout=1)
+        self.assertIn("recalc= 34.23", str(caught.exception))
+        self.assertIn("before it was stopped", str(caught.exception))
+
+    def test_printing_nothing_before_a_timeout_is_said_outright(self):
+        """Silence is the shape of a command waiting for input, so it is worth stating rather than
+        leaving the model to infer it from an absence."""
+        from tools import IS_WINDOWS, ToolError
+        with self.assertRaises(ToolError) as caught:
+            self.tools.bash("Start-Sleep -Seconds 5" if IS_WINDOWS else "sleep 5", timeout=1)
+        self.assertIn("printed nothing", str(caught.exception))
+
+    def test_stderr_survives_a_timeout_too(self):
+        from tools import IS_WINDOWS, ToolError
+        command = ('[Console]::Error.WriteLine("boom"); Start-Sleep -Seconds 5' if IS_WINDOWS
+                   else 'echo boom >&2; sleep 5')
+        with self.assertRaises(ToolError) as caught:
+            self.tools.bash(command, timeout=1)
+        self.assertIn("boom", str(caught.exception))
+
     def test_missing_unix_tools_are_named_in_the_system_prompt(self):
         from unittest import mock
         import kyklos
