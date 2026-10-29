@@ -665,7 +665,9 @@ def explain_command(command: str) -> list[tuple[str, str]]:
             layer = peeled
 
     for op, target in REDIRECT_RE.findall(_unquoted(command)):
-        target = target.strip("\"'")
+        # A redirect inside `$(…)` ends at the paren that closes the substitution, not at the
+        # filename, so `2>/dev/null)` missed the null sinks below and was reported as a write.
+        target = _bare(target)
         if target.lower() in NULL_SINKS:
             continue  # discarding output, not writing a file
         if SCRATCH_DIR in target.replace("\\", "/"):

@@ -1473,6 +1473,17 @@ class ExplainCommandTests(unittest.TestCase):
         self.assertNotIn("dev/null", texts)
         self.assertNotIn("out.txt", self.texts("rm -rf build/ > out.txt").split("overwrites")[0])
 
+    def test_a_discarded_redirect_inside_a_substitution_is_still_discarded(self):
+        """A redirect target runs to the next space, so the `)` closing a `$(…)` came along with
+        the filename. `/dev/null)` isn't one of the null sinks, and a read-only probe was reported
+        as a write -- while the same `>/dev/null` outside the substitution stayed silent."""
+        texts = self.texts('pid=$(cat f.json 2>/dev/null); ps -p "$pid" >/dev/null 2>&1')
+        self.assertNotIn("overwrites", texts)
+        # The write a substitution really does hide is still found, and a filename that ends in a
+        # paren of its own keeps it: only an unbalanced one came from the shell.
+        self.assertIn("overwrites /etc/hosts", self.texts("X=$(cat f > /etc/hosts)"))
+        self.assertIn("overwrites backup(2)", self.texts("echo hi > backup(2)"))
+
     def test_a_command_substitution_is_explained_on_its_own_terms(self):
         """The assignment peel used to swallow the token holding the program, so `$(python3 -c …)`
         read as "runs -c" and, worse, a substituted `rm -rf` lost its danger finding entirely."""
