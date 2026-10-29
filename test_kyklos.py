@@ -1141,6 +1141,40 @@ class UnsupportedClaimTests(unittest.TestCase):
             with self.subTest(answer=answer):
                 self.assertEqual(self.claims(answer), [], answer)
 
+    def test_a_participle_describing_the_repo_is_not_a_claim(self):
+        """A determiner in front is what tells the two uses apart: "the installed version" is a
+        fact about the environment, "I installed left-pad" a story about this turn."""
+        for answer in ("The installed version is 2.1.",
+                       "Check the installed packages with pip list.",
+                       "The committed version differs from your working copy.",
+                       "The pushed branch is behind main.",
+                       "Your pushed branch is behind main.",
+                       "Its installed path is .venv/bin."):
+            with self.subTest(answer=answer):
+                self.assertEqual(self.claims(answer), [], answer)
+
+    def test_a_participle_still_reads_as_a_claim_without_a_determiner(self):
+        """The guard above is narrow on purpose: a bare participle, or one after a noun, is still
+        the turn taking credit. `this` and `that` are left out of it because they can be subjects."""
+        for answer, label in [("Changes committed.", "committed"),
+                              ("Branch pushed to origin.", "pushed"),
+                              ("Installed the dependencies.", "installed packages"),
+                              ("That installed the wrong version.", "installed packages")]:
+            with self.subTest(answer=answer):
+                self.assertIn(label, [c for c, _ in self.claims(answer)])
+
+    def test_negation_without_the_usual_words_is_still_negation(self):
+        """A turn can report that it did nothing without using "not": these said so plainly and
+        were read as claims to have done it."""
+        for answer in ("Nothing was installed.",
+                       "No packages were installed.",
+                       "Nothing was committed.",
+                       "No branch was pushed.",
+                       "None of it was committed.",
+                       "Zero tests pass right now, because the suite won't import."):
+            with self.subTest(answer=answer):
+                self.assertEqual(self.claims(answer), [], answer)
+
     def test_only_the_claims_actually_made_are_checked(self):
         self.assertEqual(self.claims("Changed two files."), [])
         self.assertEqual(self.claims("Committed.", [("git commit -m x", "exit code 0")]), [])

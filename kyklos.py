@@ -630,7 +630,19 @@ def _command_findings(tokens: list[str]) -> list[tuple[str, str]]:
 # be about an earlier turn. It errs towards silence, since a check that cries wolf gets ignored.
 
 CLAIM_NEGATION_RE = re.compile(r"\b(not|n't|never|unable|without|couldn't|didn't|haven't|should|would|"
-                               r"could|can|please|if you|you can|try)\b", re.I)
+                               r"could|can|please|if you|you can|try|"
+                               # A sentence can negate without any of the words above. "Nothing was
+                               # installed" and "Zero tests pass" are the turn saying it didn't, and
+                               # read as claims to have done it until these were here.
+                               r"no|nothing|none|zero|nor|neither)\b", re.I)
+
+# A participle straight after a determiner is an adjective, not a story: "the installed version" is
+# a fact about the environment, while "I installed left-pad" is a claim about this turn. Written as
+# lookbehinds rather than another lead scan, so a match still begins at the participle and the
+# negation window above keeps meaning what it meant. `this` and `that` are deliberately absent --
+# they can be the subject ("that installed the wrong version"), so excluding them would lose claims.
+NOT_ATTRIBUTIVE = r"(?<!the )(?<!a )(?<!an )(?<!your )(?<!my )(?<!our )(?<!its )(?<!their )"
+
 CLAIM_CHECKS = [
     ("ran the tests",
      # Past tense only: "Run the tests before you push" is advice, not a claim to have run them.
@@ -644,15 +656,16 @@ CLAIM_CHECKS = [
                 r"\bmake\s+\w*test\w*\b", re.I),
      "no test command ran this turn", "the test command didn't succeed"),
     ("committed",
-     re.compile(r"\bcommitted\b|\bmade\s+(?:a|the)\s+commit\b", re.I),
+     re.compile(NOT_ATTRIBUTIVE + r"\bcommitted\b|"
+                r"\bmade\s+(?:a|the)\s+commit\b", re.I),
      re.compile(r"\bgit\s+commit\b", re.I),
      "no `git commit` ran this turn", "`git commit` didn't succeed"),
     ("pushed",
-     re.compile(r"\bpushed\b", re.I),
+     re.compile(NOT_ATTRIBUTIVE + r"\bpushed\b", re.I),
      re.compile(r"\bgit\s+push\b", re.I),
      "no `git push` ran this turn", "`git push` didn't succeed"),
     ("installed packages",
-     re.compile(r"\binstalled\b", re.I),
+     re.compile(NOT_ATTRIBUTIVE + r"\binstalled\b", re.I),
      re.compile(r"\b(?:npm|pnpm|yarn|pip3?|uv|cargo|go|gem|brew|apt(?:-get)?)\s+(?:install|add|ci)\b", re.I),
      "no install command ran this turn", "the install command didn't succeed"),
 ]
