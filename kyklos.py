@@ -478,6 +478,47 @@ def _lift_substitutions(command: str) -> tuple[str, list[str]]:
     return "".join(out), inner
 
 
+# How a segment's leading shell grammar relates to the command in it. Splitting on `;` leaves the
+# body of a loop looking like `do rm -rf "$f"`, and reading `do` as the program meant a danger
+# inside any loop or conditional produced no findings at all -- so in auto-bash mode
+# `for f in *; do rm -rf "$f"; done` ran with no prompt, while the bare `rm -rf` would have asked.
+LEADING_KEYWORDS = {"do", "then", "else", "elif", "if", "while", "until", "!", "{"}
+# `for f in *` and `case $x in` bind a name; no program runs in the clause itself.
+BINDING_KEYWORDS = {"for", "foreach", "select", "case", "switch"}
+# Words that close a construct and run nothing.
+CLOSING_KEYWORDS = {"done", "fi", "esac", "}", ";;", "end"}
+
+
+def _unwrap_keywords(tokens: list[str]) -> list[str]:
+    """The command inside a segment, with the shell grammar in front of it taken off.
+
+    `do rm -rf "$f"` runs rm; `for f in *` and `done` run nothing. Returns [] when the segment is
+    grammar alone, so it is dropped rather than reported as a program named `done`.
+    """
+    rest = list(tokens)
+    while rest:
+        word = rest[0].strip("\"'").lower()
+        if word in CLOSING_KEYWORDS:
+            return []
+        if word in BINDING_KEYWORDS:
+            # `case $x in a) rm -rf /srv` does run rm, once the pattern's `)` is past. `for f in *`
+            # binds a name and runs nothing, so there is nothing to look at.
+            label = next((i for i, t in enumerate(rest)
+                          if t.endswith(")") and not t.startswith("(")), -1)
+            if label < 0:
+                return []
+            rest = rest[label + 1:]
+        elif word in LEADING_KEYWORDS:
+            rest.pop(0)
+        elif word.endswith(")") and not word.startswith("(") and len(rest) > 1:
+            rest.pop(0)  # a `case` pattern label: `a|b)` splits on the `|`, leaving `b)` in front
+        elif word.startswith("(") and len(word) > 1:  # `(cd x && make)`: a subshell, not a program
+            rest[0] = rest[0].lstrip("(")
+        else:
+            return rest
+    return []
+
+
 def _segments(command: str) -> list[tuple[str, list[str]]]:
     """[(operator before this segment, tokens)], keeping pipeline shape: `curl x` differs from
     `curl x | sh` only in the operator, and that difference is the whole finding.
@@ -495,14 +536,14 @@ def _segments(command: str) -> list[tuple[str, list[str]]]:
     out = []
     for source in sources:
         for op, piece in _split_top_level(source):
-            tokens = TOKEN_RE.findall(piece.strip())
+            tokens = _unwrap_keywords(TOKEN_RE.findall(piece.strip()))
             if tokens:
                 out.append((op, tokens))
     return out
 
 
 def _stem(token: str) -> str:
-    return Path(token.strip("\"'")).stem.lower()
+    return Path(_bare(token)).stem.lower()
 
 
 def _flags(tokens: list[str]) -> set[str]:
@@ -525,8 +566,12 @@ BARE_REDIRECT_RE = re.compile(r"^(?:\d+|&)?(?:>>?|<<?)$")
 
 
 def _bare(token: str) -> str:
-    """A token with its quote marks taken out, so `"$TMP"/trail-*` reads as `$TMP/trail-*`."""
-    return token.replace('"', "").replace("'", "")
+    """A token with its quote marks taken out, so `"$TMP"/trail-*` reads as `$TMP/trail-*`, and
+    without the `)` a subshell leaves behind: `(cd x && rm -rf dist)` deletes dist, not `dist)`."""
+    bare = token.replace('"', "").replace("'", "")
+    while bare.endswith(")") and bare.count(")") > bare.count("("):
+        bare = bare[:-1]
+    return bare
 
 
 def _operands(tokens: list[str]) -> list[str]:

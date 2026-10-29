@@ -103,6 +103,10 @@ PREFIX_VARS = ('"$DIR"', '"$REPO"', '"$TMP"', '"$HOME"')
 PREFIX_TAILS = ("/notes.md", "/src/main.ts", "/README.md")
 SUBST_NAMES = ("OUT", "REV", "TMP", "V")
 SUBST_INNER = ("git rev-parse HEAD", "ls -1", "date", "git branch --show-current", "pwd")
+# Loop and conditional bodies. A danger inside one used to produce no findings whatsoever, so the
+# corpus needs the benign shape too: the fix must not start prompting for every `for` loop.
+LOOP_BODIES = ('cat "$f"', 'wc -l "$f"', 'echo "$f"', "git log -1 --oneline")
+LOOP_HEADS = ("for f in *.py", "for f in src/*", "while read f")
 
 
 def command_corpus() -> list[Case]:
@@ -122,6 +126,9 @@ def command_corpus() -> list[Case]:
               for n, i in product(SUBST_NAMES, SUBST_INNER)]
     cases += [Case("redirect to /dev/null", f"{c} 2>/dev/null")
               for c in GIT_READS[:5] + TESTS[:4] + LISTINGS[:3]]
+    cases += [Case("loop body", f"{h}; do {b}; done")
+              for h, b in product(LOOP_HEADS, LOOP_BODIES)]
+    cases += [Case("conditional body", f"if true; then {t}; fi") for t in TESTS[:4]]
     return cases
 
 
