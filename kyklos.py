@@ -252,7 +252,11 @@ COMMAND_WORD_RE = re.compile(r"^[A-Za-z0-9_.\\/:-]+$")
 # 'py -3 tools/build.py' or 'node scripts/dev.mjs', never just 'py' (that would allow any Python).
 INTERPRETERS = PYTHON_STEMS | {"node", "deno", "bun", "ruby", "perl", "php", "pwsh", "powershell", "bash", "sh"}
 INLINE_CODE_FLAGS = {"-c", "-e", "-p", "-r", "--eval", "--print", "-command", "-encodedcommand"}
-TOKEN_RE = re.compile(r'"[^"]*"|\'[^\']*\'|\S+')  # words, keeping quoted paths whole
+# A word is a run of quoted spans and bare characters, so `"$TMP"/trail-*` stays one token. The
+# old `"[^"]*"|\S+` stopped at the closing quote and left `/trail-*` behind as its own word, which
+# then read as an absolute path: `rm -rf "$TMP"/trail-*` reported deleting two things, one of them
+# apparently at the root. A lone unbalanced quote still falls through to the bare-character branch.
+TOKEN_RE = re.compile(r'(?:"[^"]*"|\'[^\']*\'|[^\s])+')
 
 
 def _looks_like_script(token: str) -> bool:
@@ -417,14 +421,83 @@ def _split_top_level(command: str) -> list[tuple[str, str]]:
     return out
 
 
+def _substitution_body(command: str, start: int) -> tuple[str, int]:
+    """The text inside the substitution starting at `start`, and the index just past it."""
+    if command[start] == "`":
+        end = command.find("`", start + 1)
+        return (command[start + 1:end], end + 1) if end > 0 else (command[start + 1:], len(command))
+    depth, i = 0, start + 1  # sits on the "(" of "$("
+    while i < len(command):
+        if command[i] == "(":
+            depth += 1
+        elif command[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return command[start + 2:i], i + 1
+        i += 1
+    return command[start + 2:], len(command)
+
+
+def _lift_substitutions(command: str) -> tuple[str, list[str]]:
+    """The command with every `$(...)` and backtick span removed, plus what was inside them.
+
+    `TMP="$(python3 -c '...')"` is an assignment *and* a program being run. Left where it sits, the
+    assignment peel swallows the token holding `python3` and the explainer reports "runs -c". Worse,
+    everything substituted lost its findings: `X="$(rm -rf /tmp/foo)"` read as an unrecognised
+    program rather than a recursive delete. Lifting the inside out gets it explained on its own
+    terms, exactly as though it had been typed as a command of its own.
+
+    Single quotes are literal in shell, so a substitution inside them is text. `$((...))` is
+    arithmetic, not a command, and is skipped whole.
+    """
+    out, inner, i, quote = [], [], 0, ""
+    while i < len(command):
+        ch = command[i]
+        if quote == "'":
+            out.append(ch)
+            if ch == "'":
+                quote = ""
+        elif ch == "'":
+            quote = "'"
+            out.append(ch)
+        elif ch == '"':
+            quote = "" if quote == '"' else '"'
+            out.append(ch)
+        elif command.startswith("$((", i):
+            end = command.find("))", i)
+            i = len(command) if end < 0 else end + 2
+            continue
+        elif command.startswith("$(", i) or ch == "`":
+            body, i = _substitution_body(command, i)
+            if body.strip():
+                inner.append(body)
+            continue
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out), inner
+
+
 def _segments(command: str) -> list[tuple[str, list[str]]]:
     """[(operator before this segment, tokens)], keeping pipeline shape: `curl x` differs from
-    `curl x | sh` only in the operator, and that difference is the whole finding."""
+    `curl x | sh` only in the operator, and that difference is the whole finding.
+
+    Commands lifted out of substitutions follow the outer ones, each split in its own right, so a
+    pipeline inside `$(...)` keeps the shape that makes `curl x | sh` worth a danger finding.
+    """
+    sources, pending = [], [command]
+    for _ in range(8):  # substitutions nest; a bound keeps a pathological command cheap
+        if not pending:
+            break
+        lifted = [_lift_substitutions(src) for src in pending]
+        sources += [outer for outer, _ in lifted]
+        pending = [body for _, inner in lifted for body in inner]
     out = []
-    for op, piece in _split_top_level(command):
-        tokens = TOKEN_RE.findall(piece.strip())
-        if tokens:
-            out.append((op, tokens))
+    for source in sources:
+        for op, piece in _split_top_level(source):
+            tokens = TOKEN_RE.findall(piece.strip())
+            if tokens:
+                out.append((op, tokens))
     return out
 
 
@@ -444,12 +517,75 @@ def _flags(tokens: list[str]) -> set[str]:
     return out
 
 
+# Redirects are shell plumbing rather than arguments. `2>/dev/null` listed among the things
+# `rm -rf` deletes is worse than silence, and a redirect that really does write a file is reported
+# on its own by REDIRECT_RE further down.
+REDIRECT_TOKEN_RE = re.compile(r"^(?:\d+|&)?(?:>>?|<<?)")
+BARE_REDIRECT_RE = re.compile(r"^(?:\d+|&)?(?:>>?|<<?)$")
+
+
+def _bare(token: str) -> str:
+    """A token with its quote marks taken out, so `"$TMP"/trail-*` reads as `$TMP/trail-*`."""
+    return token.replace('"', "").replace("'", "")
+
+
 def _operands(tokens: list[str]) -> list[str]:
-    return [t.strip("\"'") for t in tokens[1:] if not t.startswith("-")]
+    """Positional arguments: not flags, not a redirect, not the file a redirect writes to."""
+    out, skip = [], False
+    for token in tokens[1:]:
+        if skip:
+            skip = False
+            continue
+        if REDIRECT_TOKEN_RE.match(token):
+            skip = bool(BARE_REDIRECT_RE.match(token))  # `> out`: the target is the next token
+            continue
+        if token.startswith("-"):
+            continue
+        out.append(_bare(token))
+    return out
+
+
+# Which directory "outside the workspace" is measured against. This is session state rather than a
+# property of a command, and the permission callback's signature is shared with the UI, so it is set
+# once at startup instead of threaded through every call. None keeps the old syntactic reading.
+_EXPLAIN_WORKSPACE: Path | None = None
+
+
+def set_explain_workspace(workspace: Path | None) -> None:
+    """Tell the explainer where the workspace is, so an absolute path inside it stops reading as
+    outside it. Bash already runs with the workspace as its cwd, so `cd /abs/path/to/workspace` is
+    the model being explicit -- warning about it on every command is the sort of noise that teaches
+    you to skim findings instead of reading them."""
+    global _EXPLAIN_WORKSPACE
+    _EXPLAIN_WORKSPACE = Path(workspace).expanduser() if workspace else None
+
+
+def _chain_stem(tokens: list[str]) -> str:
+    """The program a segment runs, looked at past any `VAR=value` in front of it. Lifting a
+    substitution out leaves the assignment behind -- `X="$(ls)"` becomes `X=""` -- and that is not a
+    program, so without this the chain note reads "runs x=, then ls"."""
+    for token in tokens:
+        if not ASSIGNMENT_RE.match(token.strip("\"'")):
+            return _stem(token)
+    return ""
 
 
 def _outside_workspace(path: str) -> bool:
-    return path.startswith(("/", "~")) or ".." in Path(path).parts or bool(re.match(r"^[A-Za-z]:[\\/]", path))
+    """Whether a path argument points out of the workspace.
+
+    With no workspace set this is the old purely syntactic reading: any absolute path, any `..`.
+    With one, an absolute path inside the workspace is just the workspace named the long way.
+    """
+    if ".." in Path(path).parts:
+        return True
+    if not (path.startswith(("/", "~")) or re.match(r"^[A-Za-z]:[\\/]", path)):
+        return False
+    if _EXPLAIN_WORKSPACE is None:
+        return True
+    try:
+        return not Path(path).expanduser().is_relative_to(_EXPLAIN_WORKSPACE)
+    except (ValueError, RuntimeError, OSError):
+        return True  # unreadable as a path: keep the louder answer
 
 
 def explain_command(command: str) -> list[tuple[str, str]]:
@@ -494,7 +630,8 @@ def explain_command(command: str) -> list[tuple[str, str]]:
     if command_touches_secret(command):
         findings.append(("danger", "names a secret file, so it can only ever be allowed once"))
     # Shell keywords aren't programs: "runs for, then do, then done" describes a loop, not commands.
-    chain = [s for s in dict.fromkeys(_stem(t[0]) for _, t in segments) if s not in SHELL_KEYWORDS]
+    chain = [s for s in dict.fromkeys(_chain_stem(t) for _, t in segments)
+             if s and s not in SHELL_KEYWORDS]
     if len(chain) > 1:  # "runs npm" for `npm ci && npm test` would be noise, not information
         shown = ", then ".join(chain[:4])
         extra = f", and {len(chain) - 4} more" if len(chain) > 4 else ""
@@ -868,6 +1005,7 @@ class Agent:
         self.active_snapshots: dict[Path, bytes | None] | None = None
         self._before_write = before_write or self._record_file_snapshot
         self.tools = Tools(workspace, before_write=self._before_write)
+        set_explain_workspace(self.tools.workspace)
         self.permission = permission
         self.context_window = context_window
         self.depth = depth  # 0 for the main agent, 1 for a subagent

@@ -96,6 +96,13 @@ LISTINGS = ("ls", "ls -la", "ls -1 src/", "tree -L 2", "du -sh .", "pwd", "df -h
 TESTS = ("pytest -q", "pytest -x tests/", "pytest --collect-only", "npm test", "cargo test",
          "go test ./...", "make test", "python -m unittest test_kyklos")
 SINKS = ("wc -l", "head -n 5", "sort | uniq -c")
+# The shapes the first version of this corpus had no entry for, and so measured nothing about: a
+# path whose prefix is a quoted variable, a command substitution, and a stderr redirect. All three
+# turned up in one screenshot of a real session, each one carrying a wrong finding.
+PREFIX_VARS = ('"$DIR"', '"$REPO"', '"$TMP"', '"$HOME"')
+PREFIX_TAILS = ("/notes.md", "/src/main.ts", "/README.md")
+SUBST_NAMES = ("OUT", "REV", "TMP", "V")
+SUBST_INNER = ("git rev-parse HEAD", "ls -1", "date", "git branch --show-current", "pwd")
 
 
 def command_corpus() -> list[Case]:
@@ -109,6 +116,12 @@ def command_corpus() -> list[Case]:
     cases += [Case("pipeline", f"{s} {d} | {k}")
               for s, d, k in product(SEARCHES[:3], DIRS[:2], SINKS)]
     cases += [Case("chain", f"{g} && {t}") for g, t in product(GIT_READS[:4], TESTS[:3])]
+    cases += [Case("quoted path prefix", f"{r} {v}{t}")
+              for r, v, t in product(READERS[:4], PREFIX_VARS, PREFIX_TAILS)]
+    cases += [Case("command substitution", f'{n}="$({i})"')
+              for n, i in product(SUBST_NAMES, SUBST_INNER)]
+    cases += [Case("redirect to /dev/null", f"{c} 2>/dev/null")
+              for c in GIT_READS[:5] + TESTS[:4] + LISTINGS[:3]]
     return cases
 
 
