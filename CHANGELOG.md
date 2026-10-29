@@ -11,6 +11,11 @@ titled by commit instead.
 
 ## Unreleased
 
+- **The system prompt names the commands this machine doesn't have (`tools.py`, `kyklos.py`):** the check existed but ran only on Windows, where it covers the unix text tools PowerShell has no answer for. The mirror-image gap was never covered: macOS ships a BSD userland, so none of the GNU coreutils extras are there, and a model trained mostly on Linux assumes they are.
+  - **`timeout` is the one that costs real time.** Bounding a command that might hang is exactly the right instinct and the first thing reached for — and it does not exist here. A session watching a verification script hang for 180s proposed `timeout 40 node …` as its next step, which would have died on `command not found` with nothing to say why.
+  - **The bash tool already takes a `timeout` of its own**, so the advice points there rather than at a command to install, and the parameter's description now says so instead of the bare "Seconds, default 120". The reach for a shell `timeout` is worth preventing, not just explaining.
+  - **Probed, not assumed.** `shutil.which` decides, so a machine with coreutils installed is told nothing, and the list never names a tool that is sitting right there. On this one it comes out as `timeout, tac, nproc`.
+
 - **A timed-out command keeps what it printed (`tools.py`):** the timeout threw away everything the command had written before it hung, so a run that printed its numbers and then stalled came back as nothing but "Command timed out after 150s". The only way to read those numbers was to run the whole thing again, which hung again. The output captured up to the kill is now returned with the error.
   - **Silence is itself a finding.** A command that printed nothing before stopping is the shape of one waiting for input, which is exactly the case the message's advice is for — so that is said outright rather than left to be inferred from an absence.
   - **The kill is unchanged and still happens first.** `kill_process_tree` stops the whole process group (SEC-06) before anything is read back, so the pipes are closed and the read returns what was buffered rather than waiting on a survivor. Checked against a backgrounded grandchild holding the pipe: the error comes back on time, carries the early output, and the grandchild is gone.

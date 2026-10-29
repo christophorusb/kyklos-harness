@@ -2432,16 +2432,40 @@ class NoKeyboardTests(unittest.TestCase):
             self.tools.bash(command, timeout=1)
         self.assertIn("boom", str(caught.exception))
 
-    def test_missing_unix_tools_are_named_in_the_system_prompt(self):
+    def test_missing_tools_are_named_in_the_system_prompt(self):
         from unittest import mock
         import kyklos
+        from tools import IS_WINDOWS
         with mock.patch.object(kyklos, "missing_unix_tools", return_value=["grep", "sed"]):
             text = kyklos.describe_commands()
         self.assertIn("Not available in this", text)
         self.assertIn("grep, sed", text)
-        self.assertIn("Select-String", text)
+        advice = "Select-String" if IS_WINDOWS else "BSD userland"
+        self.assertIn(advice, text)
         with mock.patch.object(kyklos, "missing_unix_tools", return_value=[]):
-            self.assertNotIn("Select-String", kyklos.describe_commands())
+            self.assertNotIn(advice, kyklos.describe_commands())
+
+    def test_the_missing_list_matches_the_platform(self):
+        """Two different gaps: PowerShell has no unix text tools, and a BSD userland has none of
+        the GNU coreutils extras. Probed rather than assumed, since coreutils may be installed."""
+        import shutil
+        from tools import GNU_TOOLS, UNIX_TOOLS, IS_WINDOWS, missing_unix_tools
+        expected = [t for t in (UNIX_TOOLS if IS_WINDOWS else GNU_TOOLS) if not shutil.which(t)]
+        self.assertEqual(missing_unix_tools(), expected)
+        for tool in missing_unix_tools():
+            with self.subTest(tool=tool):
+                self.assertIsNone(shutil.which(tool))  # never name something that is right there
+
+    def test_a_missing_timeout_points_at_the_bash_argument(self):
+        """`timeout` is the one that costs time: bounding a command that might hang is the right
+        instinct, it is the first thing reached for, and macOS doesn't ship it. The bash tool takes
+        a timeout of its own, so the prompt says so rather than leaving a `command not found`."""
+        from tools import IS_WINDOWS, SCHEMAS
+        bash = next(s for s in SCHEMAS if s["function"]["name"] == "bash")
+        self.assertIn("hang", bash["function"]["parameters"]["properties"]["timeout"]["description"])
+        if not IS_WINDOWS:
+            from tools import MISSING_TOOL_ADVICE
+            self.assertIn("timeout argument", MISSING_TOOL_ADVICE)
 
 
 class HelperTests(unittest.TestCase):

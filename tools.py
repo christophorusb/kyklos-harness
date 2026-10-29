@@ -279,14 +279,30 @@ def expand_braces(pattern: str) -> list[str]:
     return [pattern]
 
 
+# Commands a model reaches for that the machine may not have. Two different gaps, one per family:
+# PowerShell has no answer for the unix text tools, and a BSD userland like macOS ships none of the
+# GNU coreutils extras that a model trained mostly on Linux assumes are simply there.
 UNIX_TOOLS = ["grep", "sed", "awk", "head", "tail"]
+GNU_TOOLS = ["timeout", "tac", "nproc", "sha256sum", "md5sum", "stdbuf"]
+
+MISSING_TOOL_ADVICE = (
+    "Instead use the grep tool or Select-String, Get-Content -TotalCount / -Tail, and the "
+    "-replace operator." if IS_WINDOWS else
+    "This is a BSD userland, not GNU. To bound a command that might hang, pass the bash tool's "
+    "own timeout argument rather than reaching for a timeout command."
+)
 
 
 @lru_cache(maxsize=1)
 def missing_unix_tools() -> list[str]:
-    """Unix text tools that models reach for but plain PowerShell doesn't have (unless, say,
-    Git for Windows put them on PATH). Empty on other systems."""
-    return [t for t in UNIX_TOOLS if not shutil.which(t)] if IS_WINDOWS else []
+    """Commands a model is likely to reach for that aren't on this machine.
+
+    `timeout` is the one that costs real time. Wrapping a command that might hang is exactly the
+    right instinct, it is the first thing a model reaches for, and on macOS it isn't there -- so
+    the turn is spent on `command not found` with nothing in the prompt to explain why. Checked
+    rather than assumed, since a machine with coreutils installed has them all.
+    """
+    return [t for t in (UNIX_TOOLS if IS_WINDOWS else GNU_TOOLS) if not shutil.which(t)]
 
 
 class ToolError(Exception):
@@ -697,7 +713,8 @@ SCHEMAS = [
                 "type": "object",
                 "properties": {
                     "command": {"type": "string"},
-                    "timeout": {"type": "integer", "description": "Seconds, default 120"},
+                    "timeout": {"type": "integer", "description": "Seconds, default 120. Bound a "
+                                "command that might hang with this, not with a shell timeout command."},
                 },
                 "required": ["command"],
             },

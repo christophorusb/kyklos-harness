@@ -21,7 +21,7 @@ from pathlib import Path
 from openai import APIConnectionError, APITimeoutError, InternalServerError, OpenAI, RateLimitError
 
 from tools import (SAFE_TOOLS, SCHEMAS, SHELL_NAME, ToolError, Tools, command_touches_secret, hide_env_names,
-                   is_scratch_path, missing_unix_tools, probe_commands, repository_map, scrub_secrets,
+                   is_scratch_path, MISSING_TOOL_ADVICE, missing_unix_tools, probe_commands, repository_map, scrub_secrets,
                    SCRATCH_DIR)
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -152,8 +152,7 @@ def describe_commands() -> str:
         lines.append(f"Not available here, don't use: {', '.join(broken_python)}.")
     missing = missing_unix_tools()
     if missing:
-        lines.append(f"Not available in this {SHELL_NAME}: {', '.join(missing)}. Instead use the grep tool or "
-                     "Select-String, Get-Content -TotalCount / -Tail, and the -replace operator.")
+        lines.append(f"Not available in this {SHELL_NAME}: {', '.join(missing)}. {MISSING_TOOL_ADVICE}")
     return "\n".join(lines)
 
 
