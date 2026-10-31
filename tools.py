@@ -19,6 +19,24 @@ from pathlib import Path
 MAX_OUTPUT_CHARS = 20_000  # keep tool results from flooding the context window
 MAX_SEARCH_RESULTS = 200
 MAX_SEARCH_FILE_BYTES = 2_000_000
+MAX_PLAN_STEPS = 12  # a plan longer than this is a transcript, not a shape the user can hold
+# A step is model-written text that goes straight to the terminal, where an escape sequence is an
+# instruction: recolour the screen, set the window title, or leave an unterminated OSC that eats
+# whatever prints next. Rich drops a bare BEL but passes the rest through, so strip them here --
+# at the one place that decides what a step says, rather than at each place that draws it.
+# Stripping the ESC byte alone would leave "[31m" behind as literal text: harmless, but the step
+# then reads as rubbish. Match whole sequences -- CSI, OSC (terminated or not), and the two-byte
+# forms -- then fold anything still in the control range.
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]"      # CSI: colours, cursor moves
+                            r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\\\)?"  # OSC: window title, hyperlinks
+                            r"|\x1b[@-_]")                      # anything else introduced by ESC
+CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+
+
+def plain_line(text: str) -> str:
+    """One line fit to print: escape sequences removed, control characters and runs of whitespace
+    folded to single spaces. A step has to survive this with something left to say."""
+    return " ".join(CONTROL_CHARS_RE.sub(" ", ANSI_ESCAPE_RE.sub("", text)).split())
 SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache", "dist", "build"}
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -433,6 +451,10 @@ class Tools:
     def __init__(self, workspace: Path, before_write=None):
         self.workspace = workspace.resolve()
         self.before_write = before_write
+        # The plan the model is working through. Steps are linear, so one index is the whole
+        # state: everything before `plan_active` is done, everything after is still to do.
+        self.plan_steps: list[str] = []
+        self.plan_active = 0
 
     # ---- helpers -----------------------------------------------------------
 
@@ -617,9 +639,55 @@ class Tools:
         out = (stdout or "") + (stderr or "")
         return self._truncate(f"exit code {process.returncode}\n{out}".rstrip())
 
+    # ---- the plan ----------------------------------------------------------
+    # The one tool that changes nothing: it exists so the model's intent reaches the user as
+    # structure instead of prose. Raw reasoning arrives faster than anyone can read it, and a
+    # provider that summarises it does so out of our reach -- but "step 3 of 6, running the
+    # tests" is a stage, and a stage can be drawn. The UI renders it; nothing here prints.
+
+    def plan(self, steps: list = None, active: int = None) -> str:
+        """Set the steps for this task, or mark which one is in progress."""
+        if steps is None and active is None:
+            raise ToolError("plan needs steps (to set the plan) or active (to say which step is in progress)")
+        new_steps = self.plan_steps
+        if steps is not None:
+            if not isinstance(steps, list) or not all(isinstance(s, str) for s in steps):
+                raise ToolError("steps must be a list of strings, one per step")
+            if not 1 <= len(steps) <= MAX_PLAN_STEPS:
+                raise ToolError(f"a plan has 1 to {MAX_PLAN_STEPS} steps, not {len(steps)}")
+            new_steps = [plain_line(s) for s in steps]
+            if not all(new_steps):  # a step that was only whitespace or escapes says nothing
+                raise ToolError("every step needs some text of its own")
+        if not new_steps:
+            raise ToolError("there is no plan yet: call plan with steps before marking one active")
+        # A new plan starts on its first step unless told otherwise; an `active`-only call moves
+        # within the plan already set.
+        new_active = (1 if steps is not None else self.plan_active) if active is None else active
+        if isinstance(new_active, bool) or not isinstance(new_active, int) \
+                or not 0 <= new_active <= len(new_steps):
+            raise ToolError(f"active is the 1-based step in progress, or 0 once the plan is finished, "
+                            f"not {new_active!r} (this plan has {len(new_steps)} steps)")
+        self.plan_steps, self.plan_active = new_steps, new_active
+        return self.plan_text()
+
+    def plan_text(self) -> str:
+        """The plan as the model gets it back. It returns the whole list rather than an
+        acknowledgement so that this result, and not the model's recollection, is what a later
+        step reads: a step nobody marked done must not drift into looking done."""
+        if not self.plan_steps:
+            return "No plan set."
+        rows = []
+        for i, step in enumerate(self.plan_steps, 1):
+            done = self.plan_active == 0 or i < self.plan_active
+            mark = "x" if done else (">" if i == self.plan_active else " ")
+            rows.append(f"  [{mark}] {i}. {step}")
+        head = ("every step done" if self.plan_active == 0
+                else f"step {self.plan_active} of {len(self.plan_steps)} in progress")
+        return f"Plan ({head}):\n" + "\n".join(rows)
+
 
 # Tools that run without asking. Everything else goes through the permission prompt.
-SAFE_TOOLS = {"read_file", "grep", "glob"}
+SAFE_TOOLS = {"read_file", "grep", "glob", "plan"}
 
 SCHEMAS = [
     {
@@ -701,6 +769,33 @@ SCHEMAS = [
                     "new_string": {"type": "string"},
                 },
                 "required": ["path", "old_string", "new_string"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "plan",
+            "description": (
+                "Show the user the steps you are working through and which one you are on. Call it "
+                "with `steps` before you start any task that will take more than two or three tool "
+                "calls, then with `active` alone as each step finishes. Steps are linear: the ones "
+                "before `active` are done, the ones after are still to do. Call it with `steps` "
+                "again if the plan changes, and with active 0 when everything is done. It writes "
+                "nothing and needs no approval -- it is how your progress reaches the user, who "
+                "follows these steps instead of your reasoning."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "The whole plan, in order, as short imperative phrases of at "
+                                       "most about seven words. Replaces any previous plan.",
+                    },
+                    "active": {"type": "integer", "description": "The 1-based step now in progress, "
+                                                                 "or 0 when every step is done"},
+                },
             },
         },
     },

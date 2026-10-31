@@ -1214,6 +1214,13 @@ class Agent:
                        f"dependencies resolve, it is kept out of git, and writing there needs no "
                        f"approval. Don't write scratch files to /tmp: nothing there can import the "
                        f"project.")
+        if "plan" in self.tool_names:
+            # Without a nudge the model narrates its intent in prose, where it scrolls past between
+            # tool calls. The plan tool puts the same thing somewhere the UI can keep it in view.
+            prompt += ("\n- Before a task that will take more than two or three tool calls, post the "
+                       "steps with the plan tool, then mark each one as you finish it. The user "
+                       "follows your progress there, so keep it current: it is the plan, not a "
+                       "summary to write at the end.")
         if "task" in self.tool_names:
             # "Broad searches" was too vague to act on: a real session made 134 exploratory calls,
             # 87% of its tool output, without delegating once. Give a threshold it can apply.
@@ -1442,13 +1449,19 @@ class Agent:
             if not allowed:
                 return note
         try:
-            return fn(**args)
+            result = fn(**args)
         except ToolError as e:
             return f"Error: {e}"
         except TypeError as e:  # wrong / missing arguments
             return f"Error: bad arguments for {name}: {e}"
         except Exception as e:
             return f"Error: {type(e).__name__}: {e}"
+        if name == "plan":
+            # The event carries the resolved plan, not the call's arguments: `plan(active=3)` says
+            # nothing about the steps, and a UI that had to remember them would be keeping a second
+            # copy of state that could disagree with this one.
+            self._emit("plan", steps=list(self.tools.plan_steps), active=self.tools.plan_active)
+        return result
 
     def repair_after_interrupt(self) -> None:
         """After Ctrl+C, give any tool call that never got a result a placeholder one.

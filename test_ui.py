@@ -4,6 +4,7 @@ Run:  python -m unittest test_ui -v
 """
 
 import io
+import json
 import re
 import tempfile
 import unittest
@@ -438,6 +439,79 @@ class AeroTurnTests(unittest.TestCase):
         self.assertEqual(len({len(line) for line in LARGE_WORDMARK_LINES}), 1, "rows must be padded alike")
         leading = [len(line) - len(line.lstrip()) for line in LARGE_WORDMARK_LINES]
         self.assertEqual(leading, list(range(len(LARGE_WORDMARK_LINES) - 1, -1, -1)))
+
+
+class PlanBandTests(unittest.TestCase):
+    """Drawing the plan. The point of the tool is that a stage can be rendered where a stream of
+    reasoning cannot, so what reaches the screen is the measure of whether it works."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_new_plan_prints_every_step_with_the_active_one_marked(self):
+        ui = make_ui(self.ws)
+        ui.observer("plan", depth=0, steps=["Read the plumbing", "Add the tool", "Draw the band"], active=1)
+        out = output(ui)
+        self.assertRegex(out, r"● plan  3 steps")
+        self.assertRegex(out, r"○ Read the plumbing")   # in progress
+        self.assertRegex(out, r"· Add the tool")        # still to do
+        self.assertRegex(out, r"· Draw the band")
+
+    def test_finishing_a_step_prints_one_row_not_the_whole_plan_again(self):
+        """Reprinting six steps per advance would bury the work the steps describe."""
+        ui = make_ui(self.ws)
+        steps = ["Read the plumbing", "Add the tool", "Draw the band"]
+        ui.observer("plan", depth=0, steps=steps, active=1)
+        output(ui)  # export_text clears as it reads, so what follows is only the advance
+        ui.observer("plan", depth=0, steps=steps, active=2)
+        added = output(ui)
+        self.assertRegex(added, r"● plan  2\. Add the tool +step 2 of 3")
+        self.assertNotIn("Draw the band", added)
+
+    def test_a_changed_plan_prints_in_full_again(self):
+        ui = make_ui(self.ws)
+        ui.observer("plan", depth=0, steps=["one", "two"], active=1)
+        output(ui)  # as above: clears the recording
+        ui.observer("plan", depth=0, steps=["one", "two", "three"], active=2)
+        added = output(ui)
+        self.assertRegex(added, r"● plan  3 steps")
+        self.assertRegex(added, r"● one")     # done
+        self.assertRegex(added, r"○ two")     # in progress
+        self.assertRegex(added, r"· three")
+
+    def test_a_finished_plan_says_so_and_leaves_the_live_zone(self):
+        ui = make_ui(self.ws)
+        steps = ["one", "two"]
+        ui.observer("plan", depth=0, steps=steps, active=1)
+        ui.observer("plan", depth=0, steps=steps, active=0)
+        self.assertRegex(output(ui), r"● plan  every step done +2 steps")
+        self.assertEqual(ui._plan_active, 0)  # nothing in progress, so no stage line below
+
+    def test_the_active_step_stays_in_the_live_zone(self):
+        """Tool rows scroll into history; the stage has to stay put, or it is just another row."""
+        ui = make_ui(self.ws)
+        ui.observer("plan", depth=0, steps=["Read it", "Fix it", "Check it"], active=2)
+        self.assertEqual(ui._plan_line().plain, "  ○ step 2 of 3 · Fix it")
+
+    def test_a_plan_the_tool_rejected_is_never_silent(self):
+        """The band is only drawn for a call that worked, so a refused one has to keep its row."""
+        ui = make_ui(self.ws)
+        ui.observer("tool_call", depth=0, name="plan", arguments=json.dumps({"active": 9}))
+        ui.observer("tool_result", depth=0, name="plan", result="Error: active is the 1-based step")
+        out = output(ui)
+        self.assertRegex(out, r"✗ plan  step 9")
+        self.assertIn("active is the 1-based step", out)
+
+    def test_a_plan_that_worked_leaves_no_tool_row_and_no_tally(self):
+        ui = make_ui(self.ws)
+        ui.observer("tool_call", depth=0, name="plan", arguments=json.dumps({"steps": ["one"]}))
+        ui.observer("tool_result", depth=0, name="plan", result="Plan (step 1 of 1 in progress):\n  [>] 1. one")
+        self.assertNotIn("plan", output(ui))  # the band said it; the row would repeat it
+        self.assertEqual(ui.turn_tools, 0)    # posting a plan is not work done
 
 
 class TrustPanelTests(unittest.TestCase):

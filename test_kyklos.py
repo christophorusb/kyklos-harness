@@ -9,8 +9,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from kyklos import PRUNED_MARK, Agent, preview
-from tools import probe_commands
+from kyklos import PRUNED_MARK, SUBAGENT_TOOLS, Agent, preview
+from tools import MAX_PLAN_STEPS, ToolError, Tools, probe_commands
 
 
 def tool_call(call_id, name, **args):
@@ -761,7 +761,8 @@ class PlanModeTests(unittest.TestCase):
         agent = Agent(client, "fake", self.ws, permission=allow_all, plan_mode=True)
         self.assertIn("PLAN MODE", agent.messages[0]["content"])
         self.assertEqual(agent.send("propose a change"), "Here is the plan.")
-        self.assertEqual(client.offered[0], {"read_file", "grep", "glob", "task"})
+        # plan is read-only and belongs here most of all: plan mode is where a plan is written.
+        self.assertEqual(client.offered[0], {"read_file", "grep", "glob", "task", "plan"})
         self.assertEqual((self.ws / "app.py").read_text(), "x = 1\n")
 
         tool_outputs = [m["content"] for m in client.calls[1] if m["role"] == "tool"]
@@ -775,6 +776,114 @@ class PlanModeTests(unittest.TestCase):
         self.assertEqual(agent.send("go ahead"), "Applied the plan.")
         self.assertIn("edit_file", client.offered[2])
         self.assertEqual((self.ws / "app.py").read_text(), "x = 2\n")
+
+
+class PlanToolTests(unittest.TestCase):
+    """The plan tool: the model's intent as structure the UI can draw, instead of prose that
+    scrolls past. Steps are linear, so one index is the whole state."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        self.tools = Tools(self.ws)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_new_plan_starts_on_its_first_step(self):
+        out = self.tools.plan(steps=["Read the plumbing", "Add the tool", "Draw the band"])
+        self.assertEqual(self.tools.plan_active, 1)
+        self.assertIn("step 1 of 3 in progress", out)
+        self.assertIn("[>] 1. Read the plumbing", out)
+        self.assertIn("[ ] 2. Add the tool", out)
+
+    def test_advancing_marks_everything_before_it_done(self):
+        self.tools.plan(steps=["one", "two", "three"])
+        out = self.tools.plan(active=2)
+        self.assertEqual(self.tools.plan_steps, ["one", "two", "three"])  # kept, not re-sent
+        self.assertIn("[x] 1. one", out)
+        self.assertIn("[>] 2. two", out)
+        self.assertIn("[ ] 3. three", out)
+
+    def test_step_zero_finishes_the_plan(self):
+        self.tools.plan(steps=["one", "two"])
+        out = self.tools.plan(active=0)
+        self.assertIn("every step done", out)
+        self.assertIn("[x] 1. one", out)
+        self.assertIn("[x] 2. two", out)
+
+    def test_a_step_outside_the_plan_is_refused_and_changes_nothing(self):
+        """Validation runs before the assignment. A rejected call that had already moved the
+        pointer would leave the user looking at a step the model never claimed to be on."""
+        self.tools.plan(steps=["one", "two"], active=2)
+        with self.assertRaises(ToolError):
+            self.tools.plan(active=9)
+        self.assertEqual((self.tools.plan_steps, self.tools.plan_active), (["one", "two"], 2))
+
+    def test_true_is_not_a_step_number(self):
+        """bool is an int in Python, so `active=True` would otherwise pass the range check and
+        silently mean step 1."""
+        self.tools.plan(steps=["one", "two"])
+        with self.assertRaises(ToolError):
+            self.tools.plan(active=True)
+
+    def test_replacing_the_plan_returns_to_its_first_step(self):
+        self.tools.plan(steps=["one", "two", "three"], active=3)
+        self.tools.plan(steps=["fresh", "start"])
+        self.assertEqual(self.tools.plan_active, 1)
+
+    def test_a_plan_cannot_be_advanced_before_it_exists(self):
+        with self.assertRaises(ToolError):
+            self.tools.plan(active=1)
+
+    def test_a_call_with_neither_argument_is_refused(self):
+        with self.assertRaises(ToolError):
+            self.tools.plan()
+
+    def test_steps_must_be_a_list_of_real_text(self):
+        for bad in ("one, two", ["one", ""], ["one", 2], [], ["x"] * (MAX_PLAN_STEPS + 1)):
+            with self.subTest(steps=bad), self.assertRaises(ToolError):
+                self.tools.plan(steps=bad)
+
+    def test_a_step_cannot_carry_escape_sequences_to_the_terminal(self):
+        """Steps are model-written text printed straight to a terminal, where an escape sequence is
+        an instruction, not characters. Rich drops a bare BEL and passes the rest through."""
+        out = self.tools.plan(steps=["safe\x1b[31m\x07 and \x1b]0;pwned\x07nasty"])
+        self.assertEqual(self.tools.plan_steps, ["safe and nasty"])
+        self.assertNotIn("\x1b", out)
+
+    def test_a_step_made_only_of_escapes_says_nothing_and_is_refused(self):
+        with self.assertRaises(ToolError):
+            self.tools.plan(steps=["fine", "\x1b[2J\t "])
+
+    def test_posting_a_plan_never_asks_for_permission(self):
+        """It writes nothing, so a prompt here would be friction with nothing behind it."""
+        client = FakeClient([reply(tool_calls=[tool_call("1", "plan", steps=["look", "fix"])]),
+                             reply(content="Posted.")])
+        agent = Agent(client, "fake", self.ws, permission=deny_all, on_event=lambda *a, **k: None)
+        self.assertEqual(agent.send("go"), "Posted.")
+        said = [m["content"] for m in agent.messages if m["role"] == "tool"][0]
+        self.assertIn("step 1 of 2 in progress", said)
+
+    def test_the_event_carries_the_resolved_plan_not_the_arguments(self):
+        """`plan(active=2)` says nothing about the steps. The UI has to be handed them, or it would
+        need its own copy of the plan -- a second source of truth that could disagree."""
+        events = []
+        client = FakeClient([reply(tool_calls=[tool_call("1", "plan", steps=["look", "fix", "check"])]),
+                             reply(tool_calls=[tool_call("2", "plan", active=2)]),
+                             reply(content="Done.")])
+        agent = Agent(client, "fake", self.ws, permission=allow_all,
+                      on_event=lambda e, **d: events.append((e, d)) if e == "plan" else None)
+        agent.send("go")
+        self.assertEqual([(d["steps"], d["active"]) for _, d in events],
+                         [(["look", "fix", "check"], 1), (["look", "fix", "check"], 2)])
+
+    def test_a_subagent_gets_no_plan_tool(self):
+        """A subagent has one focused job and its own context; its steps would draw inside a tree
+        the user cannot act on, and only its final answer comes back anyway."""
+        for mode, names in SUBAGENT_TOOLS.items():
+            with self.subTest(mode=mode):
+                self.assertNotIn("plan", names)
 
 
 class SessionAndUndoTests(unittest.TestCase):

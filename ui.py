@@ -204,6 +204,8 @@ def describe_call(name: str, args: dict) -> str:
         return "$ " + str(args.get("command", "")).strip().splitlines()[0] if args.get("command") else "$"
     if name == "task":
         return f"{args.get('mode') or 'explore'} · {args.get('description', '')}"
+    if name == "plan":
+        return _plural(len(args["steps"]), "step") if args.get("steps") else f"step {args.get('active', 0)}"
     return json.dumps(args, ensure_ascii=False)[:120]
 
 
@@ -354,6 +356,8 @@ class AeroUI:
         self._last_sub = None
         self._turn_active = False  # True from the moment you send until the answer is printed
         self.turn_tools = 0
+        self._plan: list[str] = []     # the steps the model posted, in order
+        self._plan_active = 0          # the 1-based step in progress, 0 when the plan is finished
 
     # -- layout helpers --
 
@@ -455,8 +459,18 @@ class AeroUI:
             return f"{model} {eff}"
         return model
 
+    def _plan_line(self) -> Text:
+        """The step in progress. It lives in the live zone rather than scrolling away with the
+        tool rows, which is the whole point of the plan tool: the stage stays readable while the
+        work moves, where reasoning prose would go past faster than anyone can follow it."""
+        return (Text("  ") + Text(f"{self.g['run']} ", style="sky")
+                + Text(f"step {self._plan_active} of {len(self._plan)}", style="sky")
+                + Text(f" {self.g['dot']} {self._plan[self._plan_active - 1]}", style="frost"))
+
     def _render_live(self):
         rows = []
+        if self._plan and self._plan_active:  # the stage sits above the work it covers
+            rows.append(self._plan_line())
         running = self._running.get(0)
         if running and running[0] != "task":
             rows.append(self._line(*self._running_row(running)))
@@ -527,6 +541,11 @@ class AeroUI:
         info = self._pending.pop(depth, {"args": {}, "panel_shown": False})
         args = info["args"]
         status, summary, tail, span = summarize_result(name, args, result)
+        if name == "plan" and status == "ok":
+            # The band `_on_plan` just drew says everything a row would, and the plan is not work:
+            # counting it in the turn's tools would inflate the tally of what was actually done.
+            # A *failed* plan call falls through, so a rejected one is never silent.
+            return
         label = describe_call(name, args) + (f"  {span}" if span else "")
         if name == "task" and self._last_sub and status == "ok":
             summary = f"{_plural(self._last_sub['steps'], 'step')} {self.g['dot']} {self._last_sub['secs']:.0f}s"
@@ -564,6 +583,35 @@ class AeroUI:
             self.print(Text(f"{self.g['pipe']} {row}", style="frost", overflow="ellipsis", no_wrap=True), indent=4)
         if status == "ok" and "old" in info and not info["panel_shown"]:
             self._print_diff(info, indent=4, max_rows=12)  # auto-approved edits still show what changed, once
+
+    def _on_plan(self, depth, steps=(), active=0, **_):
+        """A plan posted, changed, or advanced by a step.
+
+        The whole list prints when it is new or has changed; finishing a step prints one row. The
+        alternative -- reprinting six steps on every advance -- would bury the work those steps
+        describe under a running copy of the plan.
+        """
+        steps, changed = list(steps), list(steps) != self._plan
+        self._plan, self._plan_active = steps, active
+        if depth > 0 or not steps:  # subagents get one focused job, not a plan
+            return
+        def head(label):  # the label has to go through _tool_text, which owns the column spacing
+            return self._tool_text(self.g["done"], "sky", "plan", label)
+
+        if changed:
+            self.print(self._line(head(_plural(len(steps), "step"))))
+            for i, step in enumerate(steps, 1):
+                glyph, glyph_style, text_style = (
+                    (self.g["done"], "mint", "frost") if active == 0 or i < active
+                    else (self.g["run"], "sky", "bold") if i == active
+                    else (self.g["dot"], "frost", "frost"))
+                self.print(Text(f"{glyph} ", style=glyph_style) + Text(step, style=text_style), indent=4)
+        elif active:
+            self.print(self._line(head(f"{active}. {steps[active - 1]}"),
+                                  Text(f"step {active} of {len(steps)}", style="frost")))
+        else:
+            self.print(self._line(head("every step done"),
+                                  Text(_plural(len(steps), "step"), style="mint")))
 
     def _on_subagent_start(self, depth, description="", mode="explore", model=None, effort=None, **_):
         self._subs.append({"description": description, "mode": mode, "model": model, "effort": effort,
