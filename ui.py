@@ -27,8 +27,8 @@ from rich.theme import Theme
 
 from kyklos import (BASH_MODE_CAVEAT, BASH_MODE_EXPLANATION, BROAD_WARNING, EXIT, NO_APPROVER_NOTE,
                     COMMANDS, TRUST_EXPLANATION, CommandContext,
-                    __version__, apply_permission_answer, denial_note, has_danger, permission_options,
-                    run_command, short_tokens)
+                    __version__, apply_permission_answer, denial_note, error_detail, has_danger,
+                    permission_options, run_command, short_tokens)
 from tools import ToolError, _match_edit
 
 BASH_FULL_OUTPUT_LINES = 8  # bash output up to this many lines is shown in full; longer shows the last 3
@@ -628,7 +628,7 @@ class AeroUI:
                         style="frost"), indent=2 + 4 * depth)
 
     def _on_retry(self, depth, error="", delay=0, attempt=0, max_attempts=0, **_):
-        short = error.splitlines()[0][:120] if error else "error"
+        short = error.splitlines()[0][:200] if error else "error"
         self.print(Text(f"{self.g['retry']} API error: {short}; retrying in {delay:.0f}s [{attempt}/{max_attempts}]",
                         style="sun"), indent=2 + 4 * depth)
 
@@ -1218,7 +1218,7 @@ class AeroUI:
             return
         except Exception as e:  # API errors: bad key, rate limit, network...
             self.reset_transient()
-            self.say("error", f"API error: {e}")
+            self.say("error", f"API error: {error_detail(e)}")
             self.print()
             return
         self.reset_transient()

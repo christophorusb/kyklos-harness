@@ -1083,6 +1083,29 @@ def ask_permission(name: str, args: dict, always_allowed: set) -> tuple[bool, st
     return False, denial_note(name, reason)
 
 
+def error_detail(e: BaseException, depth: int = 2) -> str:
+    """An API error as a line worth reading.
+
+    `APIConnectionError` stringifies to the constant "Connection error." whatever actually went
+    wrong: a DNS failure, a refused connection, a dead TLS handshake and a server that hung up
+    mid-reply all print the same three words. Only the chain underneath says which, and the one
+    that matters most -- a connection closed between requests -- is indistinguishable from an
+    outage without it. A timeout is the exception that names itself, and the SDK raises a
+    different class for it, so a log that says "Connection error." has already ruled that out.
+    """
+    parts = [str(e).strip() or type(e).__name__]
+    cause, seen = e.__cause__, {id(e)}
+    while cause is not None and len(parts) <= depth and id(cause) not in seen:
+        seen.add(id(cause))
+        # rstrip for the httpx errors that carry no message of their own, where the class name
+        # is the whole fact and "RemoteProtocolError:" would trail a colon over nothing.
+        text = f"{type(cause).__name__}: {cause}".strip().rstrip(":").strip()
+        if text not in parts[-1]:
+            parts.append(text)
+        cause = cause.__cause__
+    return " <- ".join(parts)
+
+
 def is_retryable_error(e: Exception) -> bool:
     """True for transient rate-limit, 5xx, timeout, and connection errors."""
     if isinstance(e, (RateLimitError, InternalServerError, APIConnectionError, APITimeoutError)):
@@ -1179,7 +1202,8 @@ class Agent:
                     if attempt >= MAX_API_RETRIES or not is_retryable_error(e):
                         raise
                     delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                    self._emit("retry", attempt=attempt, max_attempts=MAX_API_RETRIES, delay=delay, error=str(e))
+                    self._emit("retry", attempt=attempt, max_attempts=MAX_API_RETRIES, delay=delay,
+                               error=error_detail(e))
                     self.sleep(delay)
         finally:
             self._emit("model_end", purpose=purpose)
@@ -2432,7 +2456,7 @@ def plain_repl(agent: "Agent", default_session: Path, **ctx_extras) -> None:
             agent.save_session(default_session)
             print("\n(Interrupted.)")
         except Exception as e:  # API errors: bad key, rate limit, network...
-            print(f"\n\033[31mAPI error: {e}\033[0m\n")
+            print(f"\n\033[31mAPI error: {error_detail(e)}\033[0m\n")
 
 
 def main() -> None:

@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from kyklos import PRUNED_MARK, SUBAGENT_TOOLS, Agent, preview
+from kyklos import PRUNED_MARK, SUBAGENT_TOOLS, Agent, error_detail, preview
 from tools import MAX_PLAN_STEPS, ToolError, Tools, probe_commands
 
 
@@ -1989,6 +1989,91 @@ class TransientAPIError(Exception):
     def __init__(self, status_code: int, message: str = "rate limited"):
         super().__init__(message)
         self.status_code = status_code
+
+
+def chained(outer: Exception, *causes: Exception) -> Exception:
+    """`outer` raised from `causes[0]` raised from `causes[1]`..., the shape `raise X from Y`
+    builds and the shape the real SDK hands up: it sets `__cause__` and nothing else."""
+    node = outer
+    for cause in causes:
+        node.__cause__ = cause
+        node = cause
+    return outer
+
+
+class ErrorDetailTests(unittest.TestCase):
+    """What a failed API call says in the log.
+
+    `APIConnectionError` reads "Connection error." for a DNS failure, a refused connection, a dead
+    TLS handshake and a server that hung up mid-reply alike. Measured against the real SDK, the
+    causes underneath are `ConnectError: [Errno 8] nodename nor servname provided`,
+    `ConnectError: [Errno 61] Connection refused` and `ReadError: [Errno 54] Connection reset by
+    peer` -- three different problems with three different fixes, one indistinguishable message.
+    """
+
+    def test_an_error_with_no_cause_is_left_as_it_reads(self):
+        self.assertEqual(error_detail(ValueError("bad model name")), "bad model name")
+
+    def test_the_cause_is_named_under_the_generic_message(self):
+        e = chained(Exception("Connection error."),
+                    OSError("Server disconnected without sending a response."))
+        self.assertEqual(error_detail(e),
+                         "Connection error. <- OSError: Server disconnected without sending a response.")
+
+    def test_the_chain_is_followed_past_the_first_link(self):
+        """A DNS failure hides two levels down: the httpx error says only that it could not
+        connect, and the errno beneath it says why."""
+        e = chained(Exception("Connection error."), OSError("connect failed"),
+                    RuntimeError("[Errno 8] nodename nor servname provided"))
+        self.assertIn("connect failed", error_detail(e))
+        self.assertIn("[Errno 8]", error_detail(e))
+
+    def test_the_chain_stops_rather_than_printing_a_stack(self):
+        e = chained(Exception("top"), *[OSError(f"level {i}") for i in range(6)])
+        self.assertEqual(error_detail(e).count(" <- "), 2)
+        self.assertEqual(error_detail(e, depth=4).count(" <- "), 4)
+
+    def test_a_cause_that_points_back_at_itself_terminates(self):
+        """A cycle is not a thing the SDK builds, but a formatter reached only on the failure path
+        is a bad place to find out: a hang here would look like the outage it is describing."""
+        a, b = Exception("a"), Exception("b")
+        a.__cause__, b.__cause__ = b, a
+        self.assertEqual(error_detail(a), "a <- Exception: b")
+
+    def test_a_cause_with_no_message_gives_its_class_and_no_dangling_colon(self):
+        self.assertEqual(error_detail(chained(Exception("Connection error."), EOFError())),
+                         "Connection error. <- EOFError")
+
+    def test_a_link_that_would_print_nothing_new_is_dropped(self):
+        """Only a verbatim repeat is suppressed. A cause whose message matches but whose class
+        differs still prints: `ReadError` and `ConnectError` carrying the same errno are a reset
+        and a refusal, and the class name is the whole difference between them."""
+        same = chained(Exception("x <- OSError: disk full"), OSError("disk full"))
+        self.assertEqual(error_detail(same), "x <- OSError: disk full")
+        kept = chained(Exception("failed: disk full"), OSError("disk full"))
+        self.assertEqual(error_detail(kept), "failed: disk full <- OSError: disk full")
+
+    def test_an_error_with_nothing_to_say_falls_back_to_its_class(self):
+        self.assertEqual(error_detail(KeyboardInterrupt()), "KeyboardInterrupt")
+
+    def test_the_retry_event_carries_the_cause_not_the_generic_message(self):
+        """The whole point: this is the line the user reads while it is still happening."""
+        events = []
+        dropped = chained(TransientAPIError(503, "Connection error."),
+                          OSError("Server disconnected without sending a response."))
+        agent = Agent(FakeClient([dropped, reply(content="Recovered.")]), "fake", self.ws,
+                      on_event=lambda ev, **kw: events.append((ev, kw)), sleep=lambda s: None)
+        self.assertEqual(agent.send("hello"), "Recovered.")
+        said = [kw["error"] for ev, kw in events if ev == "retry"]
+        self.assertEqual(said, ["Connection error. <- OSError: Server disconnected without "
+                                "sending a response."])
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
 
 
 class RetryAndObserverTests(unittest.TestCase):
