@@ -126,12 +126,17 @@ class CorpusTests(unittest.TestCase):
     def test_no_generated_command_writes_installs_or_reaches_the_network(self):
         """The corpus is only a control if every command in it is genuinely benign. If this fails,
         a case was added that deserves its prompt and the rate below it is meaningless."""
-        banned = ("rm ", "mv ", " > ", ">>", "curl", "wget", "ssh", "chmod", "sudo",
+        banned = ("rm ", " > ", ">>", "curl", "wget", "ssh", "chmod", "sudo",
                   "install", "git push", "git commit", "git reset", "git clean")
         for case in command_corpus():
             with self.subTest(command=case.text):
                 for word in banned:
                     self.assertNotIn(word, case.text)
+                # `mv ` used to be banned outright, as a stand-in for destructive, back when mv had
+                # no rule of its own. Renaming a file in the workspace is ordinary work and belongs
+                # in a control corpus; what `mv ` was really standing in for is carrying something
+                # out of the workspace, so that is what this now says -- and it covers cp too.
+                self.assertNotRegex(case.text, r"(?:^|\s)[/~]")
 
 
 class AuditTests(unittest.TestCase):

@@ -686,7 +686,7 @@ def explain_command(command: str, depth: int = 0) -> list[tuple[str, str]]:
                 findings.append(("danger", f"pipes downloaded content straight into {_stem(tokens[0])}, "
                                            f"which runs it immediately"))
             else:  # base64 -d | sh, echo … | sh: still handing another command's output to a shell
-                findings.append(("warn", f"runs whatever {source} prints, through {_stem(tokens[0])}"))
+                findings.append(("danger", f"runs whatever {source} prints, through {_stem(tokens[0])}"))
         # `sudo rm -rf /srv` is an escalation *and* a recursive delete; `env X=1 rm -rf build` is a
         # delete wearing a disguise. Examine each layer, or a wrapper silences the real command.
         layer = tokens
@@ -787,6 +787,10 @@ def _command_findings(tokens: list[str]) -> list[tuple[str, str]]:
             findings.append(("danger", f"deletes {targets} recursively, without confirmation"))
         elif operands:
             findings.append(("danger", f"deletes {targets}"))
+        elif not flags & {"-h", "--help"}:
+            # `ls | xargs rm` peels to a bare `rm`, whose targets arrive on stdin where the
+            # explainer cannot see them. No operands is not the same as nothing to delete.
+            findings.append(("danger", "deletes the files it is handed"))
     if stem in RAW_DEVICE_CMDS:
         findings.append(("danger", f"{stem} writes raw data and can destroy a disk or file"))
     if stem == "chmod":
@@ -794,6 +798,20 @@ def _command_findings(tokens: list[str]) -> list[tuple[str, str]]:
             findings.append(("danger", "makes files writable by everyone"))
         elif flags & {"-r", "--recursive"}:
             findings.append(("danger", "changes permissions recursively"))
+    if stem == "chown" and flags & {"-r", "--recursive"}:
+        findings.append(("danger", "changes ownership recursively"))
+    if stem == "sed" and flags & {"-i", "--in-place"}:
+        findings.append(("danger", "rewrites files in place"))
+    if stem == "ln" and flags & {"-f", "--force"}:
+        findings.append(("danger", f"replaces {operands[-1] if operands else 'the link it creates'}"))
+    if stem in {"cp", "mv"} and len(operands) >= 2:
+        verb = "moves" if stem == "mv" else "copies"
+        if operands[0].lower() in NULL_SINKS:
+            findings.append(("danger", f"empties {operands[-1]}"))
+        elif _outside_workspace(operands[-1]):
+            findings.append(("danger", f"{verb} {operands[0]} out to {operands[-1]}"))
+        elif stem == "mv":
+            findings.append(("note", f"moves {operands[0]} to {operands[-1]}"))
     if stem == "git" and raw:
         verb = raw[0]
         if verb == "push" and flags & {"-f", "--force", "--force-with-lease"}:
@@ -802,6 +820,14 @@ def _command_findings(tokens: list[str]) -> list[tuple[str, str]]:
             findings.append(("danger", "discards every uncommitted change"))
         elif verb == "clean" and "-f" in flags:
             findings.append(("danger", "deletes untracked files"))
+        elif verb == "checkout" and ("--" in raw or "." in operands[1:]):
+            findings.append(("danger", "discards uncommitted changes in the files it names"))
+        elif verb == "restore" and "--staged" not in flags:
+            findings.append(("danger", "discards uncommitted changes in the files it names"))
+        elif verb == "branch" and "-D" in tokens[1:]:  # _flags lowercases, and -d is the safe one
+            findings.append(("danger", "force-deletes a branch, merged or not"))
+        elif verb == "config" and flags & {"--global", "--system"}:
+            findings.append(("danger", "changes git settings outside this repository"))
         elif verb in {"push", "pull", "clone", "fetch"}:
             findings.append(("danger", f"reaches the network: git {verb}"))
     if stem in NETWORK_CMDS:
@@ -809,12 +835,14 @@ def _command_findings(tokens: list[str]) -> list[tuple[str, str]]:
         findings.append(("danger", f"reaches the network{': ' + host if host else ''}"))
     if stem in INSTALLERS and any(v in raw for v in INSTALL_VERBS):
         findings.append(("danger", f"installs packages with {stem}, which can run their own scripts"))
+    if stem in INSTALLERS and "publish" in raw:
+        findings.append(("danger", f"publishes a package with {stem}, which cannot be taken back"))
     if stem == "find" and ("-delete" in raw or "-exec" in raw):
         findings.append(("danger", "deletes or runs a command on every file it matches"))
     if stem in PROCESS_KILLERS:
         findings.append(("danger", "stops running processes"))
     if stem == "ssh":
-        findings.append(("warn", "runs a command on another machine, where none of Kyklos's limits apply"))
+        findings.append(("danger", "runs a command on another machine, where none of Kyklos's limits apply"))
     if stem == "tee":
         for target in operands:
             findings.append(("danger", f"writes {target}"))
@@ -835,6 +863,10 @@ def _command_findings(tokens: list[str]) -> list[tuple[str, str]]:
     # It is never auto-approved, because "I can't tell" must not come to mean "go ahead".
     if script:  # the real behaviour lives in a file the panel isn't showing
         findings.append(("opaque", f"runs the script {script}, whose contents aren't shown here"))
+    elif "$" in first or "`" in first:
+        # `R=rm; $R -rf dist`: the program's name arrives at runtime. COMMAND_WORD_RE has no `$`,
+        # so this fell past the clause below and the segment produced nothing at all.
+        findings.append(("opaque", f"runs {first}, whose name comes from a variable"))
     elif stem and stem not in KNOWN_COMMANDS and COMMAND_WORD_RE.match(tokens[0]) \
             and stem not in SHELL_KEYWORDS:
         findings.append(("opaque", f"runs {stem}, which Kyklos doesn't recognise"))
@@ -978,6 +1010,10 @@ def must_be_asked(command: str) -> bool:
     Red findings, obviously. But also anything `opaque` — a program Kyklos has no rules for, or a
     script whose contents it can't see. Those are the explainer admitting it doesn't know, and a
     mode that ran them unasked would be relying on ignorance as evidence of safety.
+
+    `warn` deliberately does not gate. It marks a path outside the workspace, which says where a
+    command reaches, not what it does there: reading `/tmp/x` or grepping `/srv/app` is ordinary
+    work, and gating on location would stop those while catching nothing a rule below doesn't.
     """
     findings = explain_command(command)
     return has_danger(findings) or any(level == "opaque" for level, _ in findings)

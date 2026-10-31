@@ -106,6 +106,14 @@ SUBST_INNER = ("git rev-parse HEAD", "ls -1", "date", "git branch --show-current
 # Loop and conditional bodies. A danger inside one used to produce no findings whatsoever, so the
 # corpus needs the benign shape too: the fix must not start prompting for every `for` loop.
 LOOP_BODIES = ('cat "$f"', 'wc -l "$f"', 'echo "$f"', "git log -1 --oneline")
+# Everyday writes, moves and git that keep your work. The destructive sibling of each of these has
+# a rule now, so the corpus has to hold the benign form or a rule that fires on both reads as clean.
+EVERYDAY_WRITES = ("cp README.md README.bak", "cp -r src/ build/", "mv old.ts new.ts",
+                   "mv src/a.py src/b.py", "sed -n '1,20p' kyklos.py", "sed 's/a/b/' f.txt",
+                   "chown me:staff file.txt", "ln -s shared lib", "touch src/new.ts",
+                   "mkdir -p build/out", "git checkout main", "git checkout -b feature/x",
+                   "git branch -d merged", "git restore --staged f.txt",
+                   "git config user.email a@b.c", "git switch main")
 LOOP_HEADS = ("for f in *.py", "for f in src/*", "while read f")
 
 
@@ -129,6 +137,7 @@ def command_corpus() -> list[Case]:
     cases += [Case("loop body", f"{h}; do {b}; done")
               for h, b in product(LOOP_HEADS, LOOP_BODIES)]
     cases += [Case("conditional body", f"if true; then {t}; fi") for t in TESTS[:4]]
+    cases += [Case("everyday write", c) for c in EVERYDAY_WRITES]
     return cases
 
 

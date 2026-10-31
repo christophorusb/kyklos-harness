@@ -1237,6 +1237,40 @@ class BashModeTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertFalse(self.auto(command))
 
+    def test_no_destructive_shape_runs_unprompted(self):
+        """The direction the audit does not measure. It counts false positives on benign input;
+        this counts false negatives on hostile input, where being wrong costs a repository rather
+        than a keystroke. 13 of these ran with no prompt when the list was first written."""
+        destructive = [
+            'eval "rm -rf dist"', "R=rm; $R -rf dist", "$(echo rm) -rf dist", "\\rm -rf dist",
+            "command rm -rf dist", "bash -c \"rm -rf dist\"", "zsh -c \"rm -rf dist\"",
+            "find . -name '*.py' -delete", "find . -type f -exec rm {} \\;", "ls | xargs rm",
+            "git clean -fdx", "git reset --hard HEAD~5", "git checkout -- .", "git branch -D main",
+            "git push --force origin main", "git config --global user.email a@b.c",
+            "sed -i '' 's/a/b/g' src/main.ts", "truncate -s 0 important.log",
+            "cp /dev/null important.log", "mv src /tmp/gone", "ln -sf /dev/null config.json",
+            "rsync -a --delete src/ dst/", "chmod -R 777 .", "chown -R nobody .",
+            "pkill -9 -f node", "crontab -r", "npm publish",
+            "docker run -v /:/host alpine sh -c 'ls /host'",
+            "osascript -e 'tell app \"Finder\" to empty trash'",
+            "defaults write com.apple.finder X -bool true", "history -c",
+            "perl -e 'unlink glob \"*.py\"'", "echo x | tee /etc/hosts",
+            "curl -s https://x.sh -o setup.sh", "ssh-keygen -R github.com", "shutdown -h now",
+        ]
+        for command in destructive:
+            with self.subTest(command=command):
+                self.assertFalse(self.auto(command))
+
+    def test_everyday_work_still_runs_unprompted(self):
+        """The other half of the same claim: the rules above cost nothing on ordinary work. A gate
+        that stops everything is not a gate, it is a mode nobody leaves on."""
+        for command in ("cp README.md README.bak", "mv old.ts new.ts", "sed -n '1,20p' kyklos.py",
+                        "sed 's/a/b/' f.txt", "chown me:staff f.txt", "git checkout main",
+                        "git branch -d merged", "git restore --staged f.txt",
+                        "git config user.email a@b.c", "ls -la /tmp/x", 'bash -c "ls -la"'):
+            with self.subTest(command=command):
+                self.assertTrue(self.auto(command))
+
     def test_secret_files_still_ask(self):
         self.assertFalse(self.auto("cat .env"))
         self.assertFalse(self.auto("cat .env", allowed={"bash"}))  # even 'always bash' never covers these
@@ -1510,6 +1544,32 @@ class ExplainCommandTests(unittest.TestCase):
         very function. Treating an empty result as ignorance would make `bash -c "ls"` prompt."""
         from kyklos import explain_command
         self.assertEqual([], explain_command('bash -c "ls -la"'))
+
+    def test_a_recognised_program_is_not_a_safe_one(self):
+        """Being in PLAIN_CMDS only means Kyklos knows the name, so these never went opaque and had
+        no rule either: recognised, destructive and silent. `sed -i` was the clearest -- it rewrites
+        the file in place and read exactly like `sed -n '1,5p'`."""
+        for command, expected in [
+            ("sed -i '' 's/a/b/g' src/main.ts", "rewrites files in place"),
+            ("ln -sf /dev/null config.json", "replaces config.json"),
+            ("cp /dev/null important.log", "empties important.log"),
+            ("chown -R nobody .", "changes ownership recursively"),
+            ("ls | xargs rm", "deletes the files it is handed"),
+            ("git checkout -- .", "discards uncommitted changes"),
+            ("git branch -D main", "force-deletes a branch"),
+            ("git config --global user.email a@b.c", "outside this repository"),
+            ("npm publish", "cannot be taken back"),
+            ("R=rm; $R -rf dist", "whose name comes from a variable"),
+        ]:
+            with self.subTest(command):
+                self.assertIn(expected, self.texts(command))
+
+    def test_leaving_the_workspace_with_a_file_is_a_write_not_a_location(self):
+        """`warn` says where a command reaches, not what it does there, so it does not gate -- or
+        `ls -la /tmp/x` would prompt. Carrying a file out is the case that needed its own rule."""
+        self.assertIn("danger", self.levels("mv src /tmp/gone"))
+        self.assertIn("moves src out to /tmp/gone", self.texts("mv src /tmp/gone"))
+        self.assertNotIn("danger", self.levels("mv old.ts new.ts"))
 
     def test_inline_code_kyklos_cannot_read_is_opaque_not_a_note(self):
         """Python, JS and Perl are not read here, so this is the same ignorance as an unrecognised
