@@ -265,8 +265,28 @@ def _looks_like_script(token: str) -> bool:
     return bool(Path(path).suffix) or "/" in path or "\\" in path
 
 
+def _attached_inline_code(token: str) -> str:
+    """The code in `-c"rm -rf dist"`, where it rides on the flag instead of being the next word.
+    Only the single-dash short forms attach, and only a quoted remainder counts -- so perl's `-pi`
+    is not read as the flag `-p` carrying the code `i`, and `--experimental-x` is not an `--eval`."""
+    if len(token) > 3 and token[0] == "-" and token[1] != "-" and token[2] in "\"'" \
+            and f"-{token[1].lower()}" in INLINE_CODE_FLAGS:
+        return token[2:].strip("\"'")
+    return ""
+
+
 def _has_inline_code(tokens: list[str]) -> bool:
-    return any(t.lower() in INLINE_CODE_FLAGS for t in tokens[1:])
+    return any(t.lower() in INLINE_CODE_FLAGS or _attached_inline_code(t) for t in tokens[1:])
+
+
+def _inline_code(tokens: list[str]) -> str:
+    """The code an inline-code flag carries, unquoted; "" when the flag has no argument."""
+    for i, token in enumerate(tokens[1:], 1):
+        if token.lower() in INLINE_CODE_FLAGS:
+            return tokens[i + 1].strip("\"'") if i + 1 < len(tokens) else ""
+        if attached := _attached_inline_code(token):
+            return attached
+    return ""
 
 
 def _interpreter_prefix(tokens: list[str]) -> str:
@@ -632,7 +652,20 @@ def _outside_workspace(path: str) -> bool:
         return True  # unreadable as a path: keep the louder answer
 
 
-def explain_command(command: str) -> list[tuple[str, str]]:
+def _nested_shell_findings(tokens: list[str], depth: int) -> list[tuple[str, str]]:
+    """`bash -c "rm -rf dist"` is the command inside the quotes, so read it. Left unread, a shell
+    was a wrapper that silenced anything -- exactly what _peel exists to stop `env X=1` doing."""
+    stem = _stem(tokens[0])
+    shrug = [("opaque", f"runs inline code through {stem}, which isn't shown here")]
+    body = _inline_code(tokens)
+    if not body or depth >= 2:  # nothing to read, or nested far enough that following it is its own risk
+        return shrug
+    # No findings inside means the same as no findings at the top level -- the inner command ran
+    # through this very function. Shrugging here instead would make `bash -c "ls -la"` prompt.
+    return [(level, f"{text} (via {stem})") for level, text in explain_command(body, depth + 1)]
+
+
+def explain_command(command: str, depth: int = 0) -> list[tuple[str, str]]:
     """Plain-language findings about what a shell command would do, highest concern first.
 
     Derived here in the harness, never from the model: the permission prompt exists because the
@@ -659,6 +692,8 @@ def explain_command(command: str) -> list[tuple[str, str]]:
         layer = tokens
         for _ in range(6):
             findings += _command_findings(layer)
+            if _stem(layer[0]) in SHELL_STEMS and _has_inline_code(layer):
+                findings += _nested_shell_findings(layer, depth)
             peeled = _peel(layer)
             if not peeled or peeled == layer:
                 break
@@ -783,8 +818,12 @@ def _command_findings(tokens: list[str]) -> list[tuple[str, str]]:
     if stem == "tee":
         for target in operands:
             findings.append(("danger", f"writes {target}"))
-    if stem in INTERPRETERS and _has_inline_code(tokens):
-        findings.append(("note", f"runs inline code through {stem}"))
+    if stem in INTERPRETERS and stem not in SHELL_STEMS and _has_inline_code(tokens):
+        # Kyklos cannot read Python, JS or Perl, so this is the same ignorance as an unrecognised
+        # program -- not a note ranking below "runs cd, then echo". As a note it did not reach
+        # must_be_asked, so auto-bash ran `python3 -c "shutil.rmtree('src')"` without asking.
+        # A shell's inline code is read instead of shrugged at, by explain_command.
+        findings.append(("opaque", f"runs inline code through {stem}, which Kyklos can't read"))
     outside = next((o for o in operands if _outside_workspace(o)), "")
     if outside:
         findings.append(("warn", f"touches {outside}, outside the workspace"))
