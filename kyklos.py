@@ -21,8 +21,8 @@ from pathlib import Path
 from openai import APIConnectionError, APITimeoutError, InternalServerError, OpenAI, RateLimitError
 
 from tools import (SAFE_TOOLS, SCHEMAS, SHELL_NAME, ToolError, Tools, command_touches_secret, hide_env_names,
-                   is_scratch_path, MISSING_TOOL_ADVICE, missing_unix_tools, probe_commands, repository_map, scrub_secrets,
-                   SCRATCH_DIR)
+                   is_scratch_path, MISSING_TOOL_ADVICE, missing_unix_tools, probe_commands, probe_sandbox,
+                   repository_map, sanitize_terminal_text, scrub_secrets, SCRATCH_DIR)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -350,6 +350,28 @@ INSTALL_VERBS = {"install", "add", "ci"}
 SHELL_STEMS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "pwsh", "powershell"}
 RAW_DEVICE_CMDS = {"dd", "mkfs", "shred", "fdisk", "diskutil"}
 PROCESS_KILLERS = {"kill", "pkill", "killall"}
+OPEN_CMDS = {"open", "xdg-open"}
+AWK_STEMS = {"awk", "gawk", "nawk", "mawk"}
+RECON_CMDS = {
+    "lsof", "netstat", "ss", "ifconfig", "ipconfig", "networksetup", "nettop", "scutil",
+    "arp", "route", "systemsetup", "profiles", "fdesetup", "spctl", "csrutil",
+    "socketfilterfw", "security", "launchctl", "crontab", "dscl", "system_profiler",
+    "ioreg", "sysctl", "last", "who", "printenv",
+}
+GIT_EXEC_CONFIG_RE = re.compile(
+    r"^(?:core\.(?:hookspath|sshcommand|fsmonitor|editor|pager|gitproxy|askpass)|"
+    r"credential\.helper|alias\..+|filter\..+|diff\..*\.textconv|"
+    r"protocol\..+|remote\..*\.(?:uploadpack|receivepack|proxy))$",
+    re.IGNORECASE,
+)
+AWK_EXEC_RE = re.compile(r"\bsystem\s*\(|\|\s*getline\b|\|\s*[\"']")
+NETWORK_FINDING_PREFIXES = (
+    "reaches the network",
+    "installs packages with ",
+    "publishes a package with ",
+    "pipes downloaded content",
+    "runs a command on another machine",
+)
 PLAIN_CMDS = {"ls", "cat", "cd", "echo", "grep", "find", "rm", "mv", "cp", "mkdir", "touch", "chmod",
               "chown", "head", "tail", "sed", "awk", "sort", "uniq", "wc", "diff", "tar", "zip",
               "unzip", "make", "pytest", "sudo", "doas", "which", "env", "pwd", "date", "git",
@@ -357,11 +379,12 @@ PLAIN_CMDS = {"ls", "cat", "cd", "echo", "grep", "find", "rm", "mv", "cp", "mkdi
               "test", "true", "false", "printf", "read", "set", "unset", "source", "exit", "sleep",
               "xargs", "tee", "cut", "tr", "basename", "dirname", "realpath", "du", "df", "ps",
               "stat", "ln", "rmdir", "seq", "time", "type", "command", "jq", "rg", "fd", "bat",
-              "less", "more", "man", "tree", "shasum", "column", "rev", "nl", "open", "code"}
+              "less", "more", "man", "tree", "shasum", "column", "rev", "nl", "code"}
 # Things that run another command. Without peeling these, `env X=1 rm -rf build` says nothing at all.
 WRAPPERS = {"env", "time", "nohup", "nice", "sudo", "doas", "command", "exec", "stdbuf", "timeout", "xargs"}
 KNOWN_COMMANDS = (NETWORK_CMDS | INSTALLERS | SHELL_STEMS | INTERPRETERS | RAW_DEVICE_CMDS
-                  | PROCESS_KILLERS | MULTIWORD_CMDS | PLAIN_CMDS | WRAPPERS)
+                  | PROCESS_KILLERS | OPEN_CMDS | AWK_STEMS | RECON_CMDS | MULTIWORD_CMDS
+                  | PLAIN_CMDS | WRAPPERS)
 # `2>/dev/null` discards output; calling that an overwrite is noise, not information.
 NULL_SINKS = {"/dev/null", "/dev/stdout", "/dev/stderr", "nul"}
 # A redirect, but not the `>` of `=>`, `->` or `>=`: inline JavaScript is full of arrows, and
@@ -609,10 +632,12 @@ def _operands(tokens: list[str]) -> list[str]:
     return out
 
 
-# Which directory "outside the workspace" is measured against. This is session state rather than a
-# property of a command, and the permission callback's signature is shared with the UI, so it is set
-# once at startup instead of threaded through every call. None keeps the old syntactic reading.
+# Which directory "outside the workspace" is measured against, and which remote provider host
+# receives tool output. Both are session state rather than properties of a single command, set at
+# startup instead of threaded through every permission callback.
 _EXPLAIN_WORKSPACE: Path | None = None
+_EXPLAIN_PROVIDER_HOST: str = ""
+LOCAL_PROVIDER_HOSTS = {"", "localhost", "127.0.0.1", "::1", "0.0.0.0", "host.docker.internal"}
 
 
 def set_explain_workspace(workspace: Path | None) -> None:
@@ -622,6 +647,24 @@ def set_explain_workspace(workspace: Path | None) -> None:
     you to skim findings instead of reading them."""
     global _EXPLAIN_WORKSPACE
     _EXPLAIN_WORKSPACE = Path(workspace).expanduser() if workspace else None
+
+
+def remote_provider_host(base_url: str | None) -> str:
+    """Hostname of a non-local API endpoint (e.g. 'ollama.com'), or '' for localhost / unset."""
+    if not base_url:
+        return ""
+    from urllib.parse import urlparse
+    host = (urlparse(str(base_url)).hostname or "").lower()
+    if host in LOCAL_PROVIDER_HOSTS or host.startswith("127.") or host.endswith(".local"):
+        return ""
+    return host
+
+
+def set_explain_provider(base_url: str | None) -> None:
+    """Record the active API endpoint so permission prompts can warn when host telemetry would leave
+    the device."""
+    global _EXPLAIN_PROVIDER_HOST
+    _EXPLAIN_PROVIDER_HOST = remote_provider_host(base_url)
 
 
 def _chain_stem(tokens: list[str]) -> str:
@@ -650,6 +693,77 @@ def _outside_workspace(path: str) -> bool:
         return not Path(path).expanduser().is_relative_to(_EXPLAIN_WORKSPACE)
     except (ValueError, RuntimeError, OSError):
         return True  # unreadable as a path: keep the louder answer
+
+
+SENSITIVE_SYSTEM_PREFIXES = (
+    "/etc/sudoers", "/private/etc/sudoers", "/etc/pam.d", "/private/etc/pam.d",
+    "/etc/shadow", "/etc/master.passwd", "/private/etc/master.passwd", "/etc/ssh", "/private/etc/ssh",
+    "/var/db", "/private/var/db", "/library/launchdaemons", "/library/launchagents",
+    "/system/library/launchdaemons", "/system/library/launchagents",
+)
+VSCODE_EXEC_FILES = {"tasks.json", "launch.json", "settings.json"}
+
+
+def _is_sensitive_host_path(path: str) -> bool:
+    """True if `path` reaches a credential, persistence, or system-security location outside the
+    workspace (e.g. ~/.ssh, $HOME/.aws, ~/Library/LaunchAgents, /etc/sudoers, /var/db)."""
+    norm = path.strip("\"'").replace("\\", "/").rstrip("/")
+    if not norm:
+        return False
+    low = norm.lower()
+    for home_prefix in ("~", "$home", "${home}"):
+        if low == home_prefix:
+            return True
+        if low.startswith(home_prefix + "/"):
+            rel = norm[len(home_prefix) + 1:]
+            first = rel.split("/", 1)[0]
+            if first.startswith(".") or first.lower() == "library":
+                return True
+    if not _outside_workspace(norm):
+        return False
+    if any(low == p or low.startswith(p + "/") for p in SENSITIVE_SYSTEM_PREFIXES):
+        return True
+    try:
+        expanded = Path(norm).expanduser()
+        home = Path.home()
+        if expanded == home or home in expanded.parents:
+            rel_parts = expanded.relative_to(home).parts
+            if not rel_parts or rel_parts[0].startswith(".") or rel_parts[0].lower() == "library":
+                return True
+    except (ValueError, RuntimeError, OSError):
+        pass
+    return False
+
+
+def _protected_workspace_target(path: str) -> str:
+    """Non-empty label if `path` names a repository file that controls git hooks, persistent agent
+    instructions (AGENTS.md), or automatic editor execution (.vscode/tasks.json)."""
+    clean = path.strip("\"'").replace("\\", "/").strip("/")
+    if not clean:
+        return ""
+    parts = [p for p in clean.split("/") if p and p != "."]
+    if not parts:
+        return ""
+    low_parts = [p.lower() for p in parts]
+    if ".git" in low_parts:
+        return ".git/"
+    if ".husky" in low_parts:
+        return ".husky/"
+    leaf = low_parts[-1]
+    if leaf == "agents.md":
+        return "AGENTS.md"
+    if leaf in {".gitmodules", ".pre-commit-config.yaml", ".pre-commit-config.yml"}:
+        return parts[-1]
+    if len(low_parts) >= 2 and low_parts[-2] == ".vscode" and leaf in VSCODE_EXEC_FILES:
+        return f".vscode/{parts[-1]}"
+    return ""
+
+
+def command_needs_network(findings: list[tuple[str, str]]) -> bool:
+    """True if `explain_command` declared network or package-registry activity for this command.
+    Every such finding is `danger`, so reaching execution means the user explicitly approved it."""
+    return any(level == "danger" and text.startswith(NETWORK_FINDING_PREFIXES)
+               for level, text in findings)
 
 
 def _nested_shell_findings(tokens: list[str], depth: int) -> list[tuple[str, str]]:
@@ -777,6 +891,7 @@ def _peel(tokens: list[str]) -> list[str]:
 def _command_findings(tokens: list[str]) -> list[tuple[str, str]]:
     """Findings for one command, ignoring the pipeline it sits in."""
     findings: list[tuple[str, str]] = []
+    first = tokens[0].strip("\"'")
     stem, flags = _stem(tokens[0]), _flags(tokens)
     operands, raw = _operands(tokens), [t.lower() for t in tokens[1:]]
     if stem in {"sudo", "doas"}:
@@ -798,18 +913,30 @@ def _command_findings(tokens: list[str]) -> list[tuple[str, str]]:
             findings.append(("danger", "makes files writable by everyone"))
         elif flags & {"-r", "--recursive"}:
             findings.append(("danger", "changes permissions recursively"))
+        for target in operands:
+            if _protected_workspace_target(target):
+                findings.append(("danger", f"modifies protected repository path {target}"))
     if stem == "chown" and flags & {"-r", "--recursive"}:
         findings.append(("danger", "changes ownership recursively"))
     if stem == "sed" and flags & {"-i", "--in-place"}:
         findings.append(("danger", "rewrites files in place"))
-    if stem == "ln" and flags & {"-f", "--force"}:
-        findings.append(("danger", f"replaces {operands[-1] if operands else 'the link it creates'}"))
+    if stem == "ln":
+        if flags & {"-f", "--force"}:
+            findings.append(("danger", f"replaces {operands[-1] if operands else 'the link it creates'}"))
+        if operands and _protected_workspace_target(operands[-1]):
+            findings.append(("danger", f"links into protected repository path {operands[-1]}"))
+    if stem in {"touch", "mkdir"}:
+        for target in operands:
+            if _protected_workspace_target(target):
+                findings.append(("danger", f"modifies protected repository path {target}"))
     if stem in {"cp", "mv"} and len(operands) >= 2:
         verb = "moves" if stem == "mv" else "copies"
         if operands[0].lower() in NULL_SINKS:
             findings.append(("danger", f"empties {operands[-1]}"))
         elif _outside_workspace(operands[-1]):
             findings.append(("danger", f"{verb} {operands[0]} out to {operands[-1]}"))
+        elif _protected_workspace_target(operands[-1]):
+            findings.append(("danger", f"{verb} {operands[0]} into protected repository path {operands[-1]}"))
         elif stem == "mv":
             findings.append(("note", f"moves {operands[0]} to {operands[-1]}"))
     if stem == "git" and raw:
@@ -826,8 +953,12 @@ def _command_findings(tokens: list[str]) -> list[tuple[str, str]]:
             findings.append(("danger", "discards uncommitted changes in the files it names"))
         elif verb == "branch" and "-D" in tokens[1:]:  # _flags lowercases, and -d is the safe one
             findings.append(("danger", "force-deletes a branch, merged or not"))
-        elif verb == "config" and flags & {"--global", "--system"}:
-            findings.append(("danger", "changes git settings outside this repository"))
+        elif verb == "config":
+            if flags & {"--global", "--system"}:
+                findings.append(("danger", "changes git settings outside this repository"))
+            elif not (flags & {"--get", "--get-all", "--list", "-l"}) and len(operands) >= 3 \
+                    and GIT_EXEC_CONFIG_RE.match(operands[1]):
+                findings.append(("danger", f"configures git ({operands[1]}) to run a custom command"))
         elif verb in {"push", "pull", "clone", "fetch"}:
             findings.append(("danger", f"reaches the network: git {verb}"))
     if stem in NETWORK_CMDS:
@@ -843,19 +974,37 @@ def _command_findings(tokens: list[str]) -> list[tuple[str, str]]:
         findings.append(("danger", "stops running processes"))
     if stem == "ssh":
         findings.append(("danger", "runs a command on another machine, where none of Kyklos's limits apply"))
+    if stem in OPEN_CMDS:
+        findings.append(("danger", "opens a file, application, or URL outside the terminal"))
+    if stem in AWK_STEMS and any(AWK_EXEC_RE.search(t) for t in tokens[1:]):
+        findings.append(("danger", "runs shell commands from inside awk"))
+    if stem in RECON_CMDS:
+        findings.append(("danger", f"inspects host system or security posture ({stem})"))
+    if stem == "ps" and (flags & {"-a", "-e", "-f"} or any(o in {"aux", "ef", "ax", "e"} for o in raw)):
+        findings.append(("danger", "lists running processes across the host (ps)"))
+    if stem == "env" and len(tokens) == 1:
+        findings.append(("warn", "prints all environment variables"))
     if stem == "tee":
         for target in operands:
             findings.append(("danger", f"writes {target}"))
+    if (stem == "pytest" or (stem in PYTHON_STEMS and "unittest" in raw)) \
+            and any(SCRATCH_DIR in t.replace("\\", "/") for t in tokens[1:]):
+        findings.append(("opaque", "runs unreviewed code from the scratch directory"))
+    if stem == "source" or first == ".":
+        target = operands[0] if operands else "a script"
+        findings.append(("opaque", f"sources {target}, whose contents aren't shown here"))
     if stem in INTERPRETERS and stem not in SHELL_STEMS and _has_inline_code(tokens):
         # Kyklos cannot read Python, JS or Perl, so this is the same ignorance as an unrecognised
         # program -- not a note ranking below "runs cd, then echo". As a note it did not reach
         # must_be_asked, so auto-bash ran `python3 -c "shutil.rmtree('src')"` without asking.
         # A shell's inline code is read instead of shrugged at, by explain_command.
         findings.append(("opaque", f"runs inline code through {stem}, which Kyklos can't read"))
-    outside = next((o for o in operands if _outside_workspace(o)), "")
+    sensitive = next((o for o in operands if _is_sensitive_host_path(o)), "")
+    if sensitive:
+        findings.append(("danger", f"reaches protected host path {sensitive}, outside the workspace"))
+    outside = next((o for o in operands if _outside_workspace(o) and not _is_sensitive_host_path(o)), "")
     if outside:
         findings.append(("warn", f"touches {outside}, outside the workspace"))
-    first = tokens[0].strip("\"'")
     script = first if ("/" in first or first.startswith(".")) and _looks_like_script(first) else ""
     if not script and stem in INTERPRETERS and not _has_inline_code(tokens):
         script = next((t.strip("\"'") for t in tokens[1:] if _looks_like_script(t)), "")
@@ -961,7 +1110,8 @@ def is_auto_allowed(name: str, args: dict, always_allowed: set[str], auto_bash: 
     """True if a tool call may run without prompting the user.
 
     `auto_bash` is the session mode chosen at startup: run bash commands unprompted unless the
-    explainer flags them. Secret files still always ask, as they always have.
+    explainer flags them. Secret files and red `danger` findings always ask, even when the tool
+    itself was previously marked `always_allowed`.
 
     Writing into the scratch directory needs no approval — it is a disposable corner of the
     workspace, and asking before each throwaway diagnostic script is friction without safety.
@@ -970,20 +1120,37 @@ def is_auto_allowed(name: str, args: dict, always_allowed: set[str], auto_bash: 
     """
     if name in SAFE_TOOLS:
         return True
-    if name in ("write_file", "edit_file") and workspace is not None:
-        if is_scratch_path(workspace, str(args.get("path", ""))):
+    if name in ("write_file", "edit_file"):
+        path = str(args.get("path", ""))
+        if workspace is not None and is_scratch_path(workspace, path):
             return True
+        if _protected_workspace_target(path):
+            return False
+        return name in always_allowed
     if name == "bash":
         cmd = str(args.get("command", ""))
         if command_touches_secret(cmd):
             return False
+        findings = explain_command(cmd)
+        if has_danger(findings):
+            return False
         if "bash" in always_allowed:
             return True
-        if auto_bash and not must_be_asked(cmd):
+        if auto_bash and not any(level == "opaque" for level, _ in findings):
             return True
         prefixes = {r[5:] for r in always_allowed if r.startswith("bash:")}
-        return bool(prefixes) and not has_danger(explain_command(cmd)) and command_matches_prefixes(cmd, prefixes)
+        return bool(prefixes) and command_matches_prefixes(cmd, prefixes)
     return name in always_allowed
+
+
+HOST_DATA_FINDING_MARKERS = (
+    "posture (",
+    "processes across the host",
+    "environment variables",
+    "protected host path",
+    "outside the workspace",
+    "secret file",
+)
 
 
 def permission_options(name: str, args: dict) -> tuple[bool, str, list]:
@@ -994,7 +1161,16 @@ def permission_options(name: str, args: dict) -> tuple[bool, str, list]:
     a destructive command would auto-approve every later command that matches it.
     """
     cmd = str(args.get("command", "")) if name == "bash" else ""
-    findings = explain_command(cmd) if cmd else []
+    findings: list[tuple[str, str]] = []
+    if name == "bash" and cmd:
+        findings = list(explain_command(cmd))
+        if _EXPLAIN_PROVIDER_HOST and any(any(m in text for m in HOST_DATA_FINDING_MARKERS)
+                                          for _, text in findings):
+            findings.append(("warn", f"output from this command will be sent to remote provider {_EXPLAIN_PROVIDER_HOST}"))
+    elif name in ("write_file", "edit_file"):
+        target = _protected_workspace_target(str(args.get("path", "")))
+        if target:
+            findings.append(("danger", f"modifies {target}, which controls persistent instructions or execution hooks"))
     touches_secret = name == "bash" and command_touches_secret(cmd)
     prefix = "" if (touches_secret or has_danger(findings)) else (suggest_prefix(cmd) if cmd else "")
     return touches_secret, prefix, findings
@@ -1011,9 +1187,9 @@ def must_be_asked(command: str) -> bool:
     script whose contents it can't see. Those are the explainer admitting it doesn't know, and a
     mode that ran them unasked would be relying on ignorance as evidence of safety.
 
-    `warn` deliberately does not gate. It marks a path outside the workspace, which says where a
-    command reaches, not what it does there: reading `/tmp/x` or grepping `/srv/app` is ordinary
-    work, and gating on location would stop those while catching nothing a rule below doesn't.
+    `warn` deliberately does not gate. It marks a generic path outside the workspace, such as
+    `/tmp/x` or `/srv/app`; sensitive host locations (`~/.ssh`, `~/Library`, `/var/db`) are already
+    classified as `danger` above.
     """
     findings = explain_command(command)
     return has_danger(findings) or any(level == "opaque" for level, _ in findings)
@@ -1047,23 +1223,24 @@ def ask_permission(name: str, args: dict, always_allowed: set) -> tuple[bool, st
     """Plain terminal prompt before a risky tool runs. Returns (allowed, note_for_model)."""
     print(f"\n\033[33m? {name}\033[0m")
     if name == "edit_file" and "old_string" in args and "new_string" in args:
-        print(f"  path: {args.get('path', '')}")
-        print(format_diff(str(args["old_string"]), str(args["new_string"])))
+        print(f"  path: {sanitize_terminal_text(str(args.get('path', '')))}")
+        print(format_diff(sanitize_terminal_text(str(args["old_string"])),
+                          sanitize_terminal_text(str(args["new_string"]))))
     elif name == "write_file" and "content" in args:
-        print(f"  path: {args.get('path', '')}")
-        print(format_diff("", str(args["content"])))
+        print(f"  path: {sanitize_terminal_text(str(args.get('path', '')))}")
+        print(format_diff("", sanitize_terminal_text(str(args["content"]))))
     else:
         for key, value in args.items():
-            shown = str(value)
+            shown = sanitize_terminal_text(str(value))
             if len(shown) > 600:
                 shown = shown[:600] + f"... ({len(shown)} chars)"
-            print(f"  {key}: {shown}")
+            print(f"  {sanitize_terminal_text(str(key))}: {shown}")
 
     touches_secret, prefix, findings = permission_options(name, args)
     for level, text in findings:  # what the command would do, before you answer
         color = {"danger": "\033[31m", "warn": "\033[33m"}.get(level, "\033[2m")
         mark = "! " if level in ("danger", "warn") else "  "
-        print(f"  {color}{mark}{text}\033[0m")
+        print(f"  {color}{mark}{sanitize_terminal_text(text)}\033[0m")
     danger = has_danger(findings)
     if danger:
         prompt = "  Allow once? [y]es / [n]o: "
@@ -1117,14 +1294,16 @@ def console_observer(event: str, depth: int = 0, **data) -> None:
     """Default terminal renderer for Agent events. A UI can replace this callback."""
     indent = "    " * depth
     if event == "thought":
-        print(textwrap.indent(f"\033[2m{data['text']}\033[0m", indent))
+        print(textwrap.indent(f"\033[2m{sanitize_terminal_text(data['text'])}\033[0m", indent))
     elif event == "tool_call":
-        print(f"{indent}\033[36m> {data['name']}\033[0m \033[2m{data['arguments'][:200]}\033[0m")
+        args_clean = sanitize_terminal_text(str(data["arguments"])[:200]).replace("\n", " ")
+        print(f"{indent}\033[36m> {sanitize_terminal_text(str(data['name']))}\033[0m \033[2m{args_clean}\033[0m")
     elif event == "tool_result":
-        print(textwrap.indent(preview(data["result"]), indent))
+        print(textwrap.indent(preview(sanitize_terminal_text(data["result"])), indent))
     elif event == "subagent_start":
-        routed = f" · {data['model']}" if data.get("routed") else ""
-        print(f"{indent}\033[35m[subagent: {data['description']} ({data['mode']}{routed})]\033[0m")
+        routed = f" · {sanitize_terminal_text(str(data['model']))}" if data.get("routed") else ""
+        desc = sanitize_terminal_text(str(data["description"]))
+        print(f"{indent}\033[35m[subagent: {desc} ({data['mode']}{routed})]\033[0m")
     elif event == "subagent_end":
         print(f"{indent}\033[35m[subagent done in {data['steps']} steps]\033[0m")
     elif event == "compact":
@@ -1132,7 +1311,7 @@ def console_observer(event: str, depth: int = 0, **data) -> None:
                   if data["stage"] == "pruned" else "summarized older turns")
         print(f"{indent}\033[2m(Context compacted: {detail}, ~{data['before']:,} -> ~{data['after']:,} tokens)\033[0m")
     elif event == "retry":
-        print(f"{indent}\033[33m(API error: {data['error']}; retrying in {data['delay']:.0f}s "
+        print(f"{indent}\033[33m(API error: {sanitize_terminal_text(str(data['error']))}; retrying in {data['delay']:.0f}s "
               f"[{data['attempt']}/{data['max_attempts']}])\033[0m")
 
 
@@ -1150,6 +1329,7 @@ class Agent:
         self._before_write = before_write or self._record_file_snapshot
         self.tools = Tools(workspace, before_write=self._before_write)
         set_explain_workspace(self.tools.workspace)
+        set_explain_provider(getattr(client, "base_url", None))
         self.permission = permission
         self.context_window = context_window
         self.depth = depth  # 0 for the main agent, 1 for a subagent
@@ -1337,12 +1517,11 @@ class Agent:
 
     def save_session(self, path: Path) -> None:
         """Write the conversation (excluding the system prompt, which is rebuilt on load) to JSONL."""
-        path.parent.mkdir(parents=True, exist_ok=True)
         lines = [json.dumps(m, ensure_ascii=False) for m in self.messages[1:]]
         meta = {"_meta": "state", "turn_log": self.turn_log, "usage_mark": self.usage_mark,
                 "plan_mode": self.plan_mode, "session_tokens": self.session_tokens}
         lines.append(json.dumps(meta, ensure_ascii=False))
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        write_private_text(path, "\n".join(lines) + "\n")
 
     def load_session(self, path: Path) -> int:
         """Restore a conversation from a JSONL file. Returns the number of restored messages."""
@@ -1473,7 +1652,11 @@ class Agent:
             if not allowed:
                 return note
         try:
-            result = fn(**args)
+            if name == "bash":
+                allow_net = command_needs_network(explain_command(args["command"]))
+                result = self.tools.run_bash(**args, allow_network=allow_net)
+            else:
+                result = fn(**args)
         except ToolError as e:
             return f"Error: {e}"
         except TypeError as e:  # wrong / missing arguments
@@ -1604,7 +1787,7 @@ class Agent:
                 self._emit("tool_call", name=tc.function.name, arguments=tc.function.arguments)
                 result = self.run_tool(tc.function.name, tc.function.arguments)
                 # SEC-04: secrets never reach the model (or the screen) through tool output.
-                result, redacted = scrub_secrets(result)
+                result, redacted = scrub_secrets(result, workspace=self.tools.workspace)
                 if redacted:
                     result += (f"\n\n[Kyklos redacted {redacted} secret value{'s' if redacted > 1 else ''} "
                                "from this output. Don't try to recover them.]")
@@ -1838,8 +2021,7 @@ def load_model_catalog(home: Path, base_url: str, api_key: str, client=None, ref
             return entry["models"]
         raise
     cache[base_url] = {"fetched": now(), "models": models}
-    home.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+    write_private_text(path, json.dumps(cache, indent=2))
     return models
 
 
@@ -1862,8 +2044,7 @@ def load_settings(home: Path) -> dict:
 
 
 def save_settings(home: Path, settings: dict) -> None:
-    home.mkdir(parents=True, exist_ok=True)
-    (home / "settings.json").write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    write_private_text(home / "settings.json", json.dumps(settings, indent=2))
 
 
 def choose_model(flag: str | None, settings: dict, env) -> tuple[str | None, str]:
@@ -1894,6 +2075,41 @@ def choose_subagent_model(flag: str | None, settings: dict, env) -> tuple[str | 
 #   ~/.kyklos/projects/<folder-slug>/        that folder's saved session and input history
 def kyklos_home(env=os.environ) -> Path:
     return Path(env.get("KYKLOS_HOME") or Path.home() / ".kyklos")
+
+
+def ensure_private_dir(path: Path) -> Path:
+    """Create `path` (and any missing parents) with owner-only 0700 permissions on POSIX."""
+    missing = []
+    cur = path
+    while not cur.exists() and cur != cur.parent:
+        missing.append(cur)
+        cur = cur.parent
+    path.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        for d in (*reversed(missing), path):
+            try:
+                d.chmod(0o700)
+            except OSError:
+                pass
+    return path
+
+
+def write_private_text(path: Path, content: str) -> None:
+    """Write `content` with owner-only permissions (0700 dir, 0600 file on POSIX)."""
+    ensure_private_dir(path.parent)
+    if os.name == "nt":
+        path.write_text(content, encoding="utf-8")
+        return
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        pass
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(content)
 
 
 def project_slug(folder: Path) -> str:
@@ -1928,8 +2144,7 @@ def trust_folder(home: Path, folder: Path) -> None:
     folder = str(Path(folder).resolve())
     if not any(os.path.normcase(f) == os.path.normcase(folder) for f in folders):
         folders.append(folder)
-    home.mkdir(parents=True, exist_ok=True)
-    (home / "trusted.json").write_text(json.dumps({"folders": folders}, indent=2), encoding="utf-8")
+    write_private_text(home / "trusted.json", json.dumps({"folders": folders}, indent=2))
 
 
 def is_broad_folder(folder: Path) -> bool:
@@ -2031,6 +2246,7 @@ def tool_overview(agent: "Agent") -> dict:
         "plan_mode": agent.plan_mode,
         "rules": rules,
         "workspace": str(agent.tools.workspace),
+        "sandbox": probe_sandbox()[1],
     }
 
 
@@ -2173,7 +2389,8 @@ def _cmd_tools(ctx, arg):
     data = tool_overview(ctx.agent)
     lines = [f"Mode:           {'plan (read-only)' if data['plan_mode'] else 'full'}",
              f"Tools:          {', '.join(data['tools'])}",
-             f"No approval:    {', '.join(data['safe']) or 'none'}"]
+             f"No approval:    {', '.join(data['safe']) or 'none'}",
+             f"Sandbox:        {data['sandbox']}"]
     if data["rules"]:
         lines.append("Always allowed this session:")
         lines += [f"  {kind}: {value}" for kind, value in data["rules"]]

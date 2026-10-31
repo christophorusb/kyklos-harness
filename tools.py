@@ -27,19 +27,32 @@ MAX_PLAN_STEPS = 12  # a plan longer than this is a transcript, not a shape the 
 # Stripping the ESC byte alone would leave "[31m" behind as literal text: harmless, but the step
 # then reads as rubbish. Match whole sequences -- CSI, OSC (terminated or not), and the two-byte
 # forms -- then fold anything still in the control range.
-ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]"      # CSI: colours, cursor moves
-                            r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\\\)?"  # OSC: window title, hyperlinks
-                            r"|\x1b[@-_]")                      # anything else introduced by ESC
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]"                  # CSI: colours, cursor moves
+                            r"|\x1b[\]PX^_][^\x07\x1b]*(?:\x07|\x1b\\)?"  # OSC / DCS / APC: clipboard, links, title
+                            r"|\x1b[@-_]")                                # anything else introduced by ESC
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+UNSAFE_TERMINAL_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]+")
 
 
 def plain_line(text: str) -> str:
     """One line fit to print: escape sequences removed, control characters and runs of whitespace
     folded to single spaces. A step has to survive this with something left to say."""
     return " ".join(CONTROL_CHARS_RE.sub(" ", ANSI_ESCAPE_RE.sub("", text)).split())
+
+
+def sanitize_terminal_text(text: str) -> str:
+    """Multiline text safe to draw in a terminal: strips CSI/OSC escapes (including OSC 52 clipboard
+    writes and OSC 8 deceptive links) and unsafe control bytes while keeping newlines and tabs.
+    Bare CR becomes a newline so `evil\\rbenign` cannot visually overwrite itself on screen."""
+    cleaned = ANSI_ESCAPE_RE.sub("", text).replace("\r\n", "\n").replace("\r", "\n")
+    return UNSAFE_TERMINAL_CTRL_RE.sub("", cleaned)
+
+
 SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache", "dist", "build"}
 
 IS_WINDOWS = platform.system() == "Windows"
+IS_MACOS = platform.system() == "Darwin"
+IS_LINUX = platform.system() == "Linux"
 SHELL_NAME = "PowerShell" if IS_WINDOWS else "bash"
 
 # ---- secrets in the environment and in output (SEC-01, SEC-04) -----------------------------
@@ -51,14 +64,22 @@ HIDDEN_ENV_NAMES: set[str] = set()  # names from Kyklos's .env; filled by hide_e
 MIN_SECRET_VALUE_LEN = 8  # shorter values ("true", "1") would redact ordinary text
 REDACTED = "[REDACTED]"
 SECRET_VALUE_PATTERNS = [
-    re.compile(r"\bsk-(?:proj-|ant-|or-)?[A-Za-z0-9_-]{20,}"),           # OpenAI, Anthropic, OpenRouter
-    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}"),                          # GitHub tokens
-    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}"),                        # GitHub fine-grained tokens
-    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),                         # AWS access key ids
-    re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),                        # Slack tokens
-    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),                             # Google API keys
+    re.compile(r"\bsk-(?:proj-|ant-|or-|live-|test-)?[A-Za-z0-9_-]{20,}"),     # OpenAI, Anthropic, OpenRouter
+    re.compile(r"\b(?:sk|rk)_live_[A-Za-z0-9]{20,}\b"),                        # Stripe live keys
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}"),                               # GitHub tokens
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}"),                             # GitHub fine-grained tokens
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),                              # AWS access key ids
+    re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),                             # Slack tokens
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),                                  # Google API keys
+    re.compile(r"\bnpm_[A-Za-z0-9]{36,}\b"),                                   # npm access tokens
+    re.compile(r"\bpypi-[A-Za-z0-9_-]{32,}\b"),                                # PyPI API tokens
+    re.compile(r"\bhf_[A-Za-z0-9]{30,}\b"),                                    # HuggingFace tokens
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),  # JWTs
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)"),
 ]
+URI_PASSWORD_RE = re.compile(
+    r"\b((?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqp|amqps)://[^/\s:@]*:)([^@\s/]{4,})(@)"
+)
 
 
 def kill_process_tree(process: subprocess.Popen) -> None:
@@ -104,17 +125,74 @@ def known_secret_values(base=None) -> list[str]:
     return sorted(values, key=len, reverse=True)
 
 
-def scrub_secrets(text: str, values=None) -> tuple[str, int]:
-    """(text with secrets replaced by [REDACTED], how many were replaced): known secret values exactly,
-    plus common token formats."""
+def workspace_secret_values(workspace: Path | None) -> list[str]:
+    """Secret values defined in the workspace's own `.env*` files, read into harness memory purely for
+    output redaction (never placed in os.environ, child_env, or any prompt). Catching custom passwords
+    here prevents a noisy test failure from leaking a project secret that matches no generic regex."""
+    if workspace is None or not workspace.is_dir():
+        return []
+    candidates = [workspace]
+    for sub in ("config", "env", ".config"):
+        d = workspace / sub
+        if d.is_dir():
+            candidates.append(d)
+    values: set[str] = set()
+    for folder in candidates:
+        try:
+            entries = list(folder.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            name = entry.name.lower()
+            if not (name == ".env" or (name.startswith(".env.") and not name.endswith(SAFE_ENV_SUFFIXES))):
+                continue
+            try:
+                if not entry.is_file() or entry.stat().st_size > 256_000:
+                    continue
+                lines = entry.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            for raw in lines:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                if line.startswith("export "):
+                    line = line[7:].strip()
+                key, val = line.split("=", 1)
+                key, val = key.strip(), val.strip().strip('"').strip("'")
+                if is_secret_env_name(key) and len(val) >= MIN_SECRET_VALUE_LEN:
+                    values.add(val)
+                for m in URI_PASSWORD_RE.finditer(val):
+                    if len(m.group(2)) >= 4 and m.group(2) != REDACTED:
+                        values.add(m.group(2))
+    return sorted(values, key=len, reverse=True)
+
+
+def scrub_secrets(text: str, values=None, workspace: Path | None = None) -> tuple[str, int]:
+    """(text with secrets replaced by [REDACTED], how many were replaced): known secret values exactly
+    (from os.environ and any workspace .env* files), plus common token and credential-URI formats."""
     count = 0
-    for value in known_secret_values() if values is None else values:
+    if values is None:
+        combined = set(known_secret_values()) | set(workspace_secret_values(workspace))
+        ordered = sorted(combined, key=len, reverse=True)
+    else:
+        ordered = list(values)
+    for value in ordered:
         if value in text:
             count += text.count(value)
             text = text.replace(value, REDACTED)
     for pattern in SECRET_VALUE_PATTERNS:
         text, n = pattern.subn(REDACTED, text)
         count += n
+
+    def _redact_uri(match: re.Match) -> str:
+        nonlocal count
+        if match.group(2) == REDACTED:
+            return match.group(0)
+        count += 1
+        return f"{match.group(1)}{REDACTED}{match.group(3)}"
+
+    text = URI_PASSWORD_RE.sub(_redact_uri, text)
     return text, count
 
 
@@ -155,18 +233,32 @@ def probe_commands() -> tuple[dict, list]:
 
 
 SAFE_ENV_SUFFIXES = (".example", ".sample", ".template")
+SECRET_EXACT_NAMES = {
+    ".env", ".npmrc", ".pypirc", ".netrc", ".git-credentials", ".pgpass", ".my.cnf",
+    "credentials", "credentials.json", "kubeconfig", "master.passwd", "shadow", "sudoers",
+}
+SECRET_PREFIXES = ("id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "service-account")
+SECRET_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".keystore", ".jks", ".kdbx", ".ovpn",
+                   ".tfvars", ".tfstate", ".tfstate.backup")
 
 
 def is_secret_file(p: Path) -> bool:
-    """Files that usually hold API keys or private keys. The agent may not read their contents."""
+    """Files that usually hold API keys, tokens, or private keys. The agent may not read their contents."""
     name = p.name.lower()
-    if name == ".env" or (name.startswith(".env.") and not name.endswith(SAFE_ENV_SUFFIXES)):
+    if name.endswith(SAFE_ENV_SUFFIXES):
+        return False
+    if name in SECRET_EXACT_NAMES or name.startswith(".env."):
         return True
-    return p.suffix.lower() in {".pem", ".key", ".p12", ".pfx"} or name.startswith(("id_rsa", "id_ed25519", "id_ecdsa"))
+    return name.endswith(SECRET_SUFFIXES) or name.startswith(SECRET_PREFIXES)
 
 
-SECRET_GLOB_TARGETS = (".env", ".env.local", "id_rsa", "id_ed25519", "id_ecdsa",
-                       "secret.pem", "secret.key", "secret.p12", "secret.pfx")
+SECRET_GLOB_TARGETS = (
+    ".env", ".env.local", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
+    "secret.pem", "secret.key", "secret.p12", "secret.pfx", "secret.kdbx",
+    "secret.keystore", "secret.jks", "secret.ovpn", "prod.tfvars", "terraform.tfstate",
+    ".npmrc", ".pypirc", ".netrc", ".git-credentials", ".pgpass", "kubeconfig",
+    "credentials.json", "service-account.json",
+)
 
 
 def command_touches_secret(command: str) -> bool:
@@ -447,6 +539,207 @@ def repository_map(workspace: Path, budget_tokens: int = MAP_TOKEN_BUDGET) -> st
     return "\n".join(kept)
 
 
+# ---- OS-level kernel sandboxing for bash (macOS Seatbelt / Linux bubblewrap) ----------------
+# Regex parsing is an aid to reading, never a security boundary. Where the OS gives us a real
+# kernel boundary without root or third-party dependencies, wrap child commands in it:
+#   - writes confined to the workspace (excluding .git/hooks), /tmp, and standard caches
+#   - reads blocked on credential stores (~/.ssh, ~/.aws, Keychains, browser profiles, ~/.kyklos)
+#   - network denied by default unless the user explicitly approved a network/installer command
+
+SANDBOX_PROTECTED_HOME_DIRS = (
+    ".ssh", ".aws", ".gnupg", ".kube", ".docker", ".kyklos",
+    "Library/Keychains", "Library/Cookies", "Library/Safari", "Library/Mail", "Library/Messages",
+    "Library/LaunchAgents",
+    "Library/Application Support/Google/Chrome",
+    "Library/Application Support/Firefox",
+    "Library/Application Support/Arc",
+    "Library/Application Support/BraveSoftware",
+)
+SANDBOX_PROTECTED_HOME_FILES = (
+    ".netrc", ".npmrc", ".pypirc", ".git-credentials", ".pgpass", ".my.cnf",
+    ".zsh_history", ".bash_history",
+)
+
+
+def _sbpl_quote(path: str) -> str:
+    return '"' + path.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _canonical_variants(path: Path) -> list[str]:
+    """Both the literal path and its symlink-resolved counterpart (e.g. /tmp and /private/tmp)."""
+    out = [str(path)]
+    try:
+        resolved = str(path.resolve())
+        if resolved not in out:
+            out.append(resolved)
+    except OSError:
+        pass
+    return out
+
+
+def _workspace_inside(workspace: Path, target: Path) -> bool:
+    try:
+        ws = workspace.resolve()
+        tg = target.resolve()
+        return ws == tg or tg in ws.parents
+    except OSError:
+        return False
+
+
+def seatbelt_profile(workspace: Path, allow_network: bool = False, home: Path | None = None) -> str:
+    """macOS sandbox-exec (SBPL v1) profile confining writes, credential reads, and network."""
+    ws = workspace.resolve()
+    home_dir = (home or Path.home()).resolve()
+    writable_subpaths: list[str] = []
+    for p in (ws, Path("/tmp"), Path("/private/tmp"), Path("/var/tmp"), Path("/private/var/tmp"),
+              Path("/var/folders"), Path("/private/var/folders"),
+              home_dir / ".cache", home_dir / "Library" / "Caches"):
+        for v in _canonical_variants(p):
+            if v not in writable_subpaths:
+                writable_subpaths.append(v)
+
+    lines = [
+        "(version 1)",
+        "(allow default)",
+        "(deny file-write*)",
+        "(allow file-write*",
+    ]
+    for sub in writable_subpaths:
+        lines.append(f"  (subpath {_sbpl_quote(sub)})")
+    for dev in ("/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/tty", "/dev/dtracehelper"):
+        lines.append(f"  (literal {_sbpl_quote(dev)})")
+    lines.append('  (subpath "/dev/fd"))')
+
+    # Keep git hooks and repo persistence targets kernel-read-only inside bash.
+    for rel_ro in (".git/hooks", ".husky", ".vscode"):
+        for v in _canonical_variants(ws / rel_ro):
+            lines.append(f"(deny file-write* (subpath {_sbpl_quote(v)}))")
+    for rel_file in ("AGENTS.md", ".gitmodules", ".pre-commit-config.yaml", ".pre-commit-config.yml"):
+        for v in _canonical_variants(ws / rel_file):
+            lines.append(f"(deny file-write* (literal {_sbpl_quote(v)}))")
+
+    deny_reads: list[str] = []
+    for rel_dir in SANDBOX_PROTECTED_HOME_DIRS:
+        target = home_dir / rel_dir
+        if not _workspace_inside(ws, target):
+            for v in _canonical_variants(target):
+                deny_reads.append(f"  (subpath {_sbpl_quote(v)})")
+    for rel_file in SANDBOX_PROTECTED_HOME_FILES:
+        target = home_dir / rel_file
+        for v in _canonical_variants(target):
+            deny_reads.append(f"  (literal {_sbpl_quote(v)})")
+    for sys_path, kind in (("/etc/sudoers", "literal"), ("/private/etc/sudoers", "literal"),
+                           ("/etc/sudoers.d", "subpath"), ("/private/etc/sudoers.d", "subpath")):
+        deny_reads.append(f"  ({kind} {_sbpl_quote(sys_path)})")
+    if deny_reads:
+        lines.append("(deny file-read*")
+        lines.extend(deny_reads)
+        lines.append(")")
+
+    if not allow_network:
+        lines.extend([
+            "(deny network*)",
+            "(allow network* (local unix-socket))",
+            "(allow network-outbound (remote unix-socket))",
+        ])
+    return "\n".join(lines)
+
+
+def bwrap_argv(inner_argv: list[str], workspace: Path, allow_network: bool = False,
+               home: Path | None = None, bwrap_bin: str = "bwrap") -> list[str]:
+    """Linux bubblewrap command line confining writes, credential reads, and network."""
+    ws = workspace.resolve()
+    home_dir = (home or Path.home()).resolve()
+    cmd = [
+        bwrap_bin, "--die-with-parent",
+        "--ro-bind", "/", "/",
+        "--dev", "/dev",
+        "--proc", "/proc",
+        "--tmpfs", "/tmp",
+    ]
+    for cache_dir in (home_dir / ".cache",):
+        if cache_dir.is_dir():
+            cmd += ["--bind", str(cache_dir), str(cache_dir)]
+    cmd += ["--bind", str(ws), str(ws)]
+    for rel_ro in (".git/hooks", ".husky", ".vscode"):
+        ro_dir = ws / rel_ro
+        if ro_dir.is_dir():
+            cmd += ["--ro-bind", str(ro_dir), str(ro_dir)]
+    for rel_file in ("AGENTS.md", ".gitmodules", ".pre-commit-config.yaml", ".pre-commit-config.yml"):
+        ro_file = ws / rel_file
+        if ro_file.is_file():
+            cmd += ["--ro-bind", str(ro_file), str(ro_file)]
+    for rel_dir in SANDBOX_PROTECTED_HOME_DIRS:
+        target = home_dir / rel_dir
+        if target.is_dir() and not _workspace_inside(ws, target):
+            cmd += ["--tmpfs", str(target)]
+    for rel_file in SANDBOX_PROTECTED_HOME_FILES:
+        target = home_dir / rel_file
+        if target.is_file():
+            cmd += ["--ro-bind", "/dev/null", str(target)]
+    if not allow_network:
+        cmd.append("--unshare-net")
+    cmd.append("--")
+    cmd.extend(inner_argv)
+    return cmd
+
+
+@lru_cache(maxsize=1)
+def _probe_host_sandbox() -> tuple[str, str]:
+    """Detect once whether macOS Seatbelt or Linux bubblewrap can initialize here."""
+    if IS_MACOS:
+        exe = shutil.which("sandbox-exec")
+        if not exe:
+            return "unavailable", "sandbox-exec not found"
+        true_bin = shutil.which("true") or "/usr/bin/true"
+        try:
+            r = subprocess.run([exe, "-p", "(version 1)(allow default)", true_bin],
+                               capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return "unavailable", "sandbox-exec failed"
+        if r.returncode == 0:
+            return "seatbelt", "macOS seatbelt"
+        err = (r.stderr or "") + (r.stdout or "")
+        if "Operation not permitted" in err or "sandbox_init" in err:
+            return "outer", "outer OS sandbox active"
+        return "unavailable", "sandbox-exec unavailable"
+    if IS_LINUX:
+        exe = shutil.which("bwrap")
+        if not exe:
+            return "unavailable", "bwrap not installed"
+        true_bin = shutil.which("true") or "/bin/true"
+        try:
+            r = subprocess.run([exe, "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", true_bin],
+                               capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return "unavailable", "bwrap failed"
+        if r.returncode == 0:
+            return "bwrap", "Linux bubblewrap"
+        return "unavailable", "bwrap unavailable"
+    return "unavailable", "no native OS sandbox"
+
+
+def probe_sandbox(env=None) -> tuple[str, str]:
+    """(kind, label) for bash sandboxing: 'seatbelt', 'bwrap', 'outer', 'off', or 'unavailable'."""
+    cfg = ((os.environ if env is None else env).get("KYKLOS_SANDBOX") or "auto").strip().lower()
+    if cfg in {"0", "off", "false", "none", "no"}:
+        return "off", "off (KYKLOS_SANDBOX=off)"
+    return _probe_host_sandbox()
+
+
+def sandbox_argv(inner_argv: list[str], workspace: Path, allow_network: bool = False,
+                 env=None) -> list[str]:
+    """Wrap `inner_argv` in the active OS kernel sandbox when available."""
+    kind, _ = probe_sandbox(env=env)
+    if kind == "seatbelt":
+        exe = shutil.which("sandbox-exec") or "/usr/bin/sandbox-exec"
+        return [exe, "-p", seatbelt_profile(workspace, allow_network=allow_network), *inner_argv]
+    if kind == "bwrap":
+        exe = shutil.which("bwrap") or "bwrap"
+        return bwrap_argv(inner_argv, workspace, allow_network=allow_network, bwrap_bin=exe)
+    return inner_argv
+
+
 class Tools:
     def __init__(self, workspace: Path, before_write=None):
         self.workspace = workspace.resolve()
@@ -531,13 +824,21 @@ class Tools:
         return f"Edited {path}"
 
     def check(self, name: str, args: dict) -> None:
-        """Validate a write/edit call before asking the user for permission."""
+        """Validate tool arguments before asking the user for permission."""
+        if not isinstance(args, dict):
+            raise TypeError(f"{name}() arguments must be a JSON object")
         if name == "write_file":
             p = self._resolve_writable(args["path"], "write")
             if is_secret_file(p):
                 raise ToolError(f"Refusing to write {args['path']}: it likely contains secrets. Ask the user to change it.")
         elif name == "edit_file":
             self._prepare_edit(args["path"], args["old_string"], args["new_string"])
+        elif name == "bash":
+            unknown = sorted(set(args) - {"command", "timeout"})
+            if unknown:
+                raise TypeError(f"bash() got an unexpected keyword argument {unknown[0]!r}")
+            if "command" not in args or not isinstance(args["command"], str):
+                raise TypeError("bash() missing 1 required string argument: 'command'")
 
     def _rel(self, p: Path) -> str:
         return p.relative_to(self.workspace).as_posix()
@@ -613,12 +914,19 @@ class Tools:
                               f"been more to come:\n{out}")
 
     def bash(self, command: str, timeout: int = 120) -> str:
+        """Public bash tool callable by the model. Network stays off unless `run_bash` is called
+        by the harness after explicit user approval of a network/installer command."""
+        return self.run_bash(command, timeout=timeout, allow_network=False)
+
+    def run_bash(self, command: str, timeout: int = 120, allow_network: bool = False) -> str:
         # Commands get no keyboard. Their output is captured, so a prompt ("Confirm", Read-Host, npx's
         # "Ok to proceed?", git asking for a password) would be invisible and hang until the timeout.
         # Without stdin, and with PowerShell's -NonInteractive, such prompts fail at once with an error
         # the model can read and react to.
-        argv = (["powershell", "-NoProfile", "-NonInteractive", "-Command", command] if IS_WINDOWS
-                else ["bash", "-c", command])
+        base_argv = (["powershell", "-NoProfile", "-NonInteractive", "-Command", command] if IS_WINDOWS
+                     else ["bash", "-c", command])
+        effective_net = allow_network or os.environ.get("KYKLOS_SANDBOX_NET", "").strip() == "1"
+        argv = sandbox_argv(base_argv, self.workspace, allow_network=effective_net)
         process = subprocess.Popen(
             argv, cwd=self.workspace, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
             text=True, encoding="utf-8", errors="replace", env=child_env(),

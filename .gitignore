@@ -8,9 +8,28 @@
 *.key
 *.p12
 *.pfx
+*.keystore
+*.jks
+*.kdbx
+*.ovpn
+*.tfvars
+*.tfvars.json
+*.tfstate
+*.tfstate.*
 id_rsa*
 id_ed25519*
 id_ecdsa*
+id_dsa*
+.npmrc
+!.npmrc.example
+.pypirc
+!.pypirc.example
+.netrc
+.git-credentials
+.pgpass
+.my.cnf
+credentials.json
+kubeconfig
 
 # Local environment and caches
 .venv/
@@ -20,7 +39,8 @@ __pycache__/
 # macOS Finder metadata
 .DS_Store
 
-# The agent's scratch workspace
+# Kyklos local data and scratch workspace
+.kyklos/
 sandbox/
 
 # Local log of audit findings (like CHANGELOG.md, but for audits); kept out of git

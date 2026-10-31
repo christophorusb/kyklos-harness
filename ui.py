@@ -27,9 +27,9 @@ from rich.theme import Theme
 
 from kyklos import (BASH_MODE_CAVEAT, BASH_MODE_EXPLANATION, BROAD_WARNING, EXIT, NO_APPROVER_NOTE,
                     COMMANDS, TRUST_EXPLANATION, CommandContext,
-                    __version__, apply_permission_answer, denial_note, error_detail, has_danger,
-                    permission_options, run_command, short_tokens)
-from tools import ToolError, _match_edit
+                    __version__, apply_permission_answer, denial_note, ensure_private_dir,
+                    error_detail, has_danger, permission_options, run_command, short_tokens)
+from tools import ToolError, _match_edit, sanitize_terminal_text
 
 BASH_FULL_OUTPUT_LINES = 8  # bash output up to this many lines is shown in full; longer shows the last 3
 
@@ -191,22 +191,23 @@ def _plural(n: int, word: str) -> str:
 def describe_call(name: str, args: dict) -> str:
     """Human-readable arguments for a tool call line."""
     if name == "read_file":
-        return str(args.get("path", ""))
+        return sanitize_terminal_text(str(args.get("path", "")))
     if name == "grep":
         where = args.get("path") or "."
         text = f"/{args.get('pattern', '')}/" + (f" in {where}" if where != "." else "")
-        return text + (f"  {args['glob']}" if args.get("glob") else "")
+        return sanitize_terminal_text(text + (f"  {args['glob']}" if args.get("glob") else ""))
     if name == "glob":
-        return str(args.get("pattern", ""))
+        return sanitize_terminal_text(str(args.get("pattern", "")))
     if name in ("write_file", "edit_file"):
-        return str(args.get("path", ""))
+        return sanitize_terminal_text(str(args.get("path", "")))
     if name == "bash":
-        return "$ " + str(args.get("command", "")).strip().splitlines()[0] if args.get("command") else "$"
+        cmd = sanitize_terminal_text(str(args.get("command", ""))).strip()
+        return "$ " + cmd.splitlines()[0] if cmd else "$"
     if name == "task":
-        return f"{args.get('mode') or 'explore'} · {args.get('description', '')}"
+        return sanitize_terminal_text(f"{args.get('mode') or 'explore'} · {args.get('description', '')}")
     if name == "plan":
         return _plural(len(args["steps"]), "step") if args.get("steps") else f"step {args.get('active', 0)}"
-    return json.dumps(args, ensure_ascii=False)[:120]
+    return sanitize_terminal_text(json.dumps(args, ensure_ascii=False))[:120]
 
 
 def result_status(result: str) -> str:
@@ -223,7 +224,8 @@ def summarize_result(name: str, args: dict, result: str) -> tuple:
     """(status, summary, preview_lines, range_label) for a finished tool call."""
     status = result_status(result)
     if status == "fail":
-        return status, result[len("Error:"):].strip().splitlines()[0], [], ""
+        err = sanitize_terminal_text(result[len("Error:"):]).strip()
+        return status, (err.splitlines()[0] if err else "failed"), [], ""
     if status == "denied":
         # The reason is already shown on the permission panel's "⊘ denied: …" line; don't repeat it here.
         return status, "denied: no one to approve" if "nobody is available" in result else "denied by you", [], ""
@@ -248,8 +250,8 @@ def summarize_result(name: str, args: dict, result: str) -> tuple:
         return status, "✓ applied", [], ""
     if name == "bash":
         first, _, rest = result.partition("\n")
-        code = first.replace("exit code", "").strip()
-        lines = [l for l in rest.splitlines() if l.strip()]
+        code = sanitize_terminal_text(first.replace("exit code", "")).strip()
+        lines = [l for l in sanitize_terminal_text(rest).splitlines() if l.strip()]
         if len(lines) > BASH_FULL_OUTPUT_LINES:  # long output: the end matters most for commands
             lines = [f"… {len(lines) - 3} earlier lines"] + lines[-3:]
         return ("ok" if code == "0" else "exitfail"), f"exit {code}", lines, ""
@@ -662,7 +664,7 @@ class AeroUI:
         return rows
 
     def _diff_row(self, kind: str, lineno: int, text: str, spans, width: int) -> Text:
-        text = text.replace("\t", "    ")
+        text = sanitize_terminal_text(text).replace("\t", "    ")
         if kind == "gap":
             return Text(f"  {'':>4}   {self.g['ellipsis']} {text}", style="frost")
         if kind == "ctx":
@@ -723,10 +725,13 @@ class AeroUI:
         self._view_panel("context & token budget", rows)
 
     def _view_tools(self, data: dict) -> None:
+        sandbox = data.get("sandbox", "off")
+        sandbox_on = any(k in sandbox for k in ("seatbelt", "bubblewrap", "outer"))
         rows = [self._view_row("mode", "plan (read-only)" if data["plan_mode"] else "full",
                                style="sun" if data["plan_mode"] else ""),
                 self._view_row("tools", ", ".join(data["tools"]), style="aqua"),
                 self._view_row("no approval", ", ".join(data["safe"]) or "none"),
+                self._view_row("sandbox", sandbox, style="mint" if sandbox_on else "sun"),
                 Text("")]
         if data["rules"]:
             rows.append(Text("always allowed for the rest of this session", style="frost"))
@@ -762,21 +767,23 @@ class AeroUI:
         if name in ("edit_file", "write_file") and info and "old" in info:
             counts = self._counts(*diff_counts(info["old"], info["new"]))
             kind = "" if name == "edit_file" else ("  overwrite" if info["old"] else "  new file")
-            title += Text(f"  {args.get('path', '')}", style="frost") + Text("  ") + counts + Text(kind, style="frost")
+            shown_path = sanitize_terminal_text(str(args.get("path", "")))
+            title += Text(f"  {shown_path}", style="frost") + Text("  ") + counts + Text(kind, style="frost")
             body += self.diff_rows(info, width - 4)
             info["panel_shown"] = True
         elif name == "bash":
-            body.append(Text("$ ", style="frost") + Text(str(args.get("command", "")), style="bold"))
-            if findings:  # what it would do, in words, before you answer
-                body.append(Text(""))
-                for level, text in findings:
-                    style = {"danger": "coral", "warn": "sun"}.get(level, "frost")
-                    mark = "! " if level in ("danger", "warn") else "  "
-                    body.append(Text(f"{mark}{text}", style=style))
+            body.append(Text("$ ", style="frost") + Text(sanitize_terminal_text(str(args.get("command", ""))), style="bold"))
         else:
             for key, value in args.items():
-                shown = str(value)
+                shown = sanitize_terminal_text(str(value))
                 body.append(Text(f"{key}: ", style="frost") + Text(shown[:600] + ("…" if len(shown) > 600 else "")))
+        if findings:  # what it would do, in words, before you answer
+            if body:
+                body.append(Text(""))
+            for level, text in findings:
+                style = {"danger": "coral", "warn": "sun"}.get(level, "frost")
+                mark = "! " if level in ("danger", "warn") else "  "
+                body.append(Text(f"{mark}{sanitize_terminal_text(text)}", style=style))
         keys = [("y", "yes"), ("n", "no")]
         if prefix:
             keys.append(("p", f"prefix '{prefix}'"))
@@ -1188,7 +1195,19 @@ class AeroUI:
         def _(event):
             event.current_buffer.insert_text("\n")
 
-        history_path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(history_path.parent)
+        if os.name != "nt":
+            flags = os.O_WRONLY | os.O_CREAT
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                fd = os.open(history_path, flags, 0o600)
+                try:
+                    os.fchmod(fd, 0o600)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
         style = Style.from_dict({
             "bottom-toolbar": "noreverse",
             "completion-menu.completion": f"bg:#0A2139 fg:{self._pt_color('frost')}",
