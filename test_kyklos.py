@@ -1574,17 +1574,29 @@ class ExplainCommandTests(unittest.TestCase):
                 self.assertIn(expected, self.texts(command))
 
     def test_the_colours_mean_one_thing(self):
-        """Red means the command changes something outside the conversation; a warning means it
-        reads somewhere you might not expect. Rules drifted from this one at a time until a plain
-        `rm` was milder than an overwrite, so the line itself is pinned here."""
+        """Red means the command changes something outside the conversation, **or** reads data that
+        must not leave the machine -- credentials, and the user's own documents. A warning means it
+        reads somewhere you might not expect but a project legitimately reaches (`/tmp`, `/srv`,
+        another folder). Rules drifted from this one at a time until a plain `rm` was milder than an
+        overwrite, so the line itself is pinned here.
+
+        The second half of red is not a softening of the first. Output goes to the model and then to
+        whichever provider the conversation is pointed at, so reading `~/Documents` *is* the thing
+        leaving the machine; there is no later step to catch it at.
+        """
         changes = ["rm old.txt", "rm -rf build", "echo x > f", "echo x >> f", "curl https://x",
                    "wget https://x", "npm install left-pad", "pip install requests", "sudo ls",
                    "git push --force", "git pull", "git reset --hard", "chmod 777 f",
                    "chmod -R 755 dir", "dd if=/dev/zero of=/dev/disk2", "find . -delete",
                    "pkill -f node", "ssh host uptime", "npm run b | tee out.log"]
+        private_reads = ["cat ~/.ssh/config", 'ls -1 "$HOME/.aws"', "cat ~/Documents/taxes.pdf",
+                         "grep -r . ~/Downloads", "ls ~/Desktop"]
         reads = ["cat /etc/hosts", "ls -la /tmp", "ls -la /Users/someone/elsewhere"]
         for command in changes:
             with self.subTest(changes=command):
+                self.assertIn("danger", self.levels(command), self.texts(command))
+        for command in private_reads:
+            with self.subTest(private_read=command):
                 self.assertIn("danger", self.levels(command), self.texts(command))
         for command in reads:
             with self.subTest(reads=command):
@@ -3090,6 +3102,97 @@ class SecurityReinforcementTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 write_private_text(link, "clobbered")
             self.assertEqual(victim.read_text(encoding="utf-8"), "untouched")
+
+    # ---- reading the user's own files (the read side of the sandbox) --------------------------
+    # Writes were allowlisted to the workspace while reads were only denylisted, so anything not
+    # named as a credential store stayed readable -- and a personal folder was `warn`, the level
+    # that deliberately does not gate, so in auto-bash mode it ran unprompted.
+
+    def test_personal_data_reads_are_danger_and_gate_auto_bash(self):
+        from kyklos import explain_command, has_danger, is_auto_allowed
+        for cmd in (
+            "cat ~/Documents/taxes.pdf",
+            "grep -r . ~/Downloads",
+            "tar czf /tmp/out.tgz ~/Desktop",
+            'ls -1 "$HOME/Pictures"',
+            "cat ~/Movies/clip.mov",
+            "cat ~/Videos/clip.mkv",
+            "cat ~/Music/library.xml",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(has_danger(explain_command(cmd)),
+                                f"expected danger for {cmd!r}, got {explain_command(cmd)!r}")
+                self.assertFalse(is_auto_allowed("bash", {"command": cmd}, {"bash"},
+                                                 auto_bash=True, workspace=self.ws))
+
+        # `warn` must keep not gating: the finding says where a command reaches, not what it does
+        # there, and making it gate was tried and reverted because it stopped ordinary work.
+        for cmd in ("ls -la /tmp/x", "cd /srv/app && grep -rn foo src", 'cat "$HOME/notes.md"'):
+            with self.subTest(allowed=cmd):
+                self.assertFalse(has_danger(explain_command(cmd)))
+                self.assertTrue(is_auto_allowed("bash", {"command": cmd}, set(),
+                                                auto_bash=True, workspace=self.ws))
+
+    def test_workspace_inside_a_personal_folder_reads_its_own_files_unprompted(self):
+        """A repository checked out under ~/Desktop or ~/Documents is the ordinary layout. Flagging
+        its own files would make every read in it stop for approval, so the gate is on leaving the
+        workspace, not on the folder name."""
+        from kyklos import explain_command, has_danger, set_explain_workspace
+        self.addCleanup(set_explain_workspace, None)
+        set_explain_workspace(Path.home() / "Desktop" / "proj")
+
+        for inside in ("cat ~/Desktop/proj/main.py", "cat main.py", "grep -rn foo ~/Desktop/proj/src"):
+            with self.subTest(inside=inside):
+                self.assertFalse(has_danger(explain_command(inside)),
+                                 f"workspace file should stay quiet: {explain_command(inside)!r}")
+        # A sibling on the same Desktop is still someone else's data.
+        self.assertTrue(has_danger(explain_command("cat ~/Desktop/other-client/notes.txt")))
+        self.assertTrue(has_danger(explain_command("cat ~/Documents/taxes.pdf")))
+
+    def test_seatbelt_denies_personal_folders_but_allows_the_workspace_within_one(self):
+        from tools import seatbelt_profile
+        fake_home = Path("/Users/alice")
+        ws = fake_home / "Desktop" / "proj"
+        profile = seatbelt_profile(ws, allow_network=False, home=fake_home)
+
+        for rel in ("Documents", "Desktop", "Downloads", "Pictures", "Movies", "Videos", "Music"):
+            self.assertIn(f'(subpath "{fake_home / rel}")', profile)
+        # SBPL takes the last matching rule, so the order is what makes this work: the personal
+        # deny, then the workspace allowed back, then credentials denied so nothing re-opens them.
+        deny_personal = profile.index(f'(subpath "{ws.parent}")')
+        allow_ws = profile.index(f'(allow file-read* (subpath "{ws}"))')
+        deny_creds = profile.index(f'(subpath "{fake_home / ".ssh"}")')
+        self.assertLess(deny_personal, allow_ws)
+        self.assertLess(allow_ws, deny_creds)
+
+    def test_bwrap_masks_personal_folders_before_binding_the_workspace(self):
+        from tools import bwrap_argv
+        fake_home = self.ws / "fake-home"
+        ws = fake_home / "Desktop" / "proj"
+        ws.mkdir(parents=True)
+        (fake_home / "Documents").mkdir()
+        (fake_home / "Desktop" / "other-client").mkdir()
+
+        argv = bwrap_argv(["bash", "-c", "id"], ws, allow_network=False, home=fake_home)
+        self.assertIn(str((fake_home / "Documents").resolve()), argv)
+        self.assertIn(str((fake_home / "Desktop").resolve()), argv)
+        # bwrap applies mounts in order, so the tmpfs over ~/Desktop has to be laid down before the
+        # workspace is bound on top of it; the other way round would shadow the workspace itself.
+        self.assertLess(argv.index(str((fake_home / "Desktop").resolve())),
+                        argv.index(str(ws.resolve())))
+
+    def test_personal_folder_that_is_not_present_is_simply_skipped(self):
+        """bwrap cannot mount a tmpfs over a path that does not exist, and a Linux home has no
+        ~/Movies. A missing folder must drop out rather than fail the whole command."""
+        from tools import bwrap_argv
+        fake_home = self.ws / "sparse-home"
+        ws = fake_home / "proj"
+        ws.mkdir(parents=True)
+        (fake_home / "Documents").mkdir()
+
+        argv = bwrap_argv(["bash", "-c", "id"], ws, allow_network=False, home=fake_home)
+        self.assertIn(str((fake_home / "Documents").resolve()), argv)
+        self.assertNotIn(str((fake_home / "Movies").resolve()), argv)
 
 
 if __name__ == "__main__":

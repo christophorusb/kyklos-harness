@@ -702,11 +702,25 @@ SENSITIVE_SYSTEM_PREFIXES = (
     "/system/library/launchdaemons", "/system/library/launchagents",
 )
 VSCODE_EXEC_FILES = {"tasks.json", "launch.json", "settings.json"}
+# The home folders that hold a person's own documents rather than a project's code. Reading one is
+# not "touches a path outside the workspace" -- the `warn` that deliberately does not gate -- it is
+# reading the user's private files, which in auto-bash mode would otherwise happen unprompted and
+# then travel to whichever provider the conversation is pointed at. Both spellings of the video
+# folder are here: macOS ships Movies, the XDG desktops ship Videos.
+PERSONAL_DATA_DIRS = {"documents", "desktop", "downloads", "pictures", "movies", "videos", "music"}
+# Everything directly under $HOME that counts as sensitive: dotfiles are handled separately (any
+# name starting with "."), these are the named folders.
+HOME_SENSITIVE_DIRS = {"library"} | PERSONAL_DATA_DIRS
 
 
 def _is_sensitive_host_path(path: str) -> bool:
-    """True if `path` reaches a credential, persistence, or system-security location outside the
-    workspace (e.g. ~/.ssh, $HOME/.aws, ~/Library/LaunchAgents, /etc/sudoers, /var/db)."""
+    """True if `path` reaches a credential, persistence, personal-data, or system-security location
+    outside the workspace (e.g. ~/.ssh, $HOME/.aws, ~/Documents, /etc/sudoers, /var/db).
+
+    Every branch is gated on the path actually leaving the workspace, because a workspace can sit
+    *inside* one of these folders -- a repository checked out under ~/Desktop is the ordinary case,
+    not the exception -- and flagging its own files would make every read in it stop for approval.
+    """
     norm = path.strip("\"'").replace("\\", "/").rstrip("/")
     if not norm:
         return False
@@ -717,7 +731,10 @@ def _is_sensitive_host_path(path: str) -> bool:
         if low.startswith(home_prefix + "/"):
             rel = norm[len(home_prefix) + 1:]
             first = rel.split("/", 1)[0]
-            if first.startswith(".") or first.lower() == "library":
+            # `_outside_workspace` reads `/` and `~` but not `$HOME`, so the spelling is normalised
+            # before asking it; without that, `"$HOME/.aws"` answered "inside" and fell through.
+            if (first.startswith(".") or first.lower() in HOME_SENSITIVE_DIRS) \
+                    and _outside_workspace("~/" + rel):
                 return True
     if not _outside_workspace(norm):
         return False
@@ -728,7 +745,8 @@ def _is_sensitive_host_path(path: str) -> bool:
         home = Path.home()
         if expanded == home or home in expanded.parents:
             rel_parts = expanded.relative_to(home).parts
-            if not rel_parts or rel_parts[0].startswith(".") or rel_parts[0].lower() == "library":
+            if not rel_parts or rel_parts[0].startswith(".") \
+                    or rel_parts[0].lower() in HOME_SENSITIVE_DIRS:
                 return True
     except (ValueError, RuntimeError, OSError):
         pass

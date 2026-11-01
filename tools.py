@@ -559,6 +559,13 @@ SANDBOX_PROTECTED_HOME_FILES = (
     ".netrc", ".npmrc", ".pypirc", ".git-credentials", ".pgpass", ".my.cnf",
     ".zsh_history", ".bash_history",
 )
+# The folders holding the user's own documents rather than any project's code. Nothing in a build
+# or a test suite reads these, so denying them costs nothing and closes the pair that makes a
+# single approved command an exfiltration: a readable home folder and an open socket.
+# Both spellings of the video folder: macOS ships Movies, the XDG desktops ship Videos.
+SANDBOX_PROTECTED_PERSONAL_DIRS = (
+    "Documents", "Desktop", "Downloads", "Pictures", "Movies", "Videos", "Music",
+)
 
 
 def _sbpl_quote(path: str) -> str:
@@ -618,6 +625,23 @@ def seatbelt_profile(workspace: Path, allow_network: bool = False, home: Path | 
         for v in _canonical_variants(ws / rel_file):
             lines.append(f"(deny file-write* (literal {_sbpl_quote(v)}))")
 
+    # Reads are emitted in three passes because SBPL takes the last matching rule, which is what
+    # the blanket `(deny file-write*)` above already relies on. Personal folders are denied first
+    # and the workspace is allowed back afterwards, so a repository living under ~/Desktop or
+    # ~/Documents -- the ordinary layout, not the exception -- still reads its own files while its
+    # siblings stay unreadable. Credentials are denied last so that nothing re-opens them, not even
+    # a workspace that happens to contain them (the home folder, trusted for one session).
+    personal_denies: list[str] = []
+    for rel_dir in SANDBOX_PROTECTED_PERSONAL_DIRS:
+        for v in _canonical_variants(home_dir / rel_dir):
+            personal_denies.append(f"  (subpath {_sbpl_quote(v)})")
+    if personal_denies:
+        lines.append("(deny file-read*")
+        lines.extend(personal_denies)
+        lines.append(")")
+        for v in _canonical_variants(ws):
+            lines.append(f"(allow file-read* (subpath {_sbpl_quote(v)}))")
+
     deny_reads: list[str] = []
     for rel_dir in SANDBOX_PROTECTED_HOME_DIRS:
         target = home_dir / rel_dir
@@ -660,6 +684,14 @@ def bwrap_argv(inner_argv: list[str], workspace: Path, allow_network: bool = Fal
     for cache_dir in (home_dir / ".cache",):
         if cache_dir.is_dir():
             cmd += ["--bind", str(cache_dir), str(cache_dir)]
+    # Personal folders are masked *before* the workspace is bound, because bwrap applies mounts in
+    # order: a repository under ~/Desktop is the ordinary layout, and masking the parent afterwards
+    # would shadow the workspace itself. Binding it second puts it back on top of the empty tmpfs
+    # (bwrap creates the missing mountpoint), so the project reads while its siblings do not.
+    for rel_dir in SANDBOX_PROTECTED_PERSONAL_DIRS:
+        target = home_dir / rel_dir
+        if target.is_dir():
+            cmd += ["--tmpfs", str(target)]
     cmd += ["--bind", str(ws), str(ws)]
     for rel_ro in (".git/hooks", ".husky", ".vscode"):
         ro_dir = ws / rel_ro
