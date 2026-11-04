@@ -2737,6 +2737,23 @@ class NoKeyboardTests(unittest.TestCase):
             self.tools.bash("Start-Sleep -Seconds 5" if IS_WINDOWS else "sleep 5", timeout=1)
         self.assertIn("printed nothing", str(caught.exception))
 
+    def test_a_sandbox_denial_says_which_wall_was_hit(self):
+        """A kernel refusal arrives as bare `Operation not permitted`, indistinguishable from a real
+        host permissions problem. A session watched the model read one, conclude macOS App Management
+        was blocking it, and start asking for ways around it -- the sandbox worked and the diagnosis
+        was wrong. Naming the sandbox removes the reason to go looking for an escalation."""
+        from unittest import mock
+        import tools as tools_mod
+        with mock.patch.object(tools_mod, "probe_sandbox", return_value=("seatbelt", "macOS seatbelt")):
+            note = self.tools._sandbox_note("touch: /Applications/x: Operation not permitted")
+            self.assertIn("[harness]", note)
+            self.assertIn("macOS seatbelt", note)
+            self.assertIn("Escalating will not change it", note)
+            # An ordinary failure is not dressed up as a sandbox denial.
+            self.assertEqual("", self.tools._sandbox_note("fatal: not a git repository"))
+        with mock.patch.object(tools_mod, "probe_sandbox", return_value=("off", "off")):
+            self.assertEqual("", self.tools._sandbox_note("Operation not permitted"))
+
     def test_stderr_survives_a_timeout_too(self):
         from tools import IS_WINDOWS, ToolError
         command = ('[Console]::Error.WriteLine("boom"); Start-Sleep -Seconds 5' if IS_WINDOWS
@@ -3016,6 +3033,23 @@ class SecurityReinforcementTests(unittest.TestCase):
         self.assertIn('(subpath "/Users/alice/.ssh")', online)
         self.assertIn('(subpath "/Users/alice/.kyklos")', online)
         self.assertIn(f'(literal "{self.ws.resolve()}/AGENTS.md")', online)
+
+    def test_seatbelt_lets_a_command_write_scratch_but_not_run_it(self):
+        """Allowing writes to $TMPDIR and execution from it is what makes `curl | sh` worth doing
+        twice: the second stage drops a binary in scratch and runs it. The write has to stay -- every
+        download and mktemp needs it -- so the exec is the half to refuse. The workspace is exempt
+        on purpose: a build must be able to run what it just compiled."""
+        from tools import seatbelt_profile, SANDBOX_SCRATCH_ROOTS
+        fake_home = Path("/Users/alice")
+        profile = seatbelt_profile(self.ws, allow_network=False, home=fake_home)
+        for root in SANDBOX_SCRATCH_ROOTS:
+            self.assertIn(f'(subpath "{root}")', profile)              # still writable
+            self.assertIn(f'(deny process-exec* (subpath "{root}"))', profile)
+        self.assertNotIn(f'(deny process-exec* (subpath "{self.ws.resolve()}"))', profile)
+
+        # The toolchains that compile into $TMPDIR and run it from there need a way back.
+        opened = seatbelt_profile(self.ws, allow_network=False, home=fake_home, allow_scratch_exec=True)
+        self.assertNotIn("process-exec", opened)
 
     def test_bwrap_argv_enforces_network_unshare_and_credential_masking(self):
         from tools import bwrap_argv

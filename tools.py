@@ -567,6 +567,19 @@ SANDBOX_PROTECTED_PERSONAL_DIRS = (
     "Documents", "Desktop", "Downloads", "Pictures", "Movies", "Videos", "Music",
 )
 
+# Scratch space a command may write to. It has to be writable: downloads, build temporaries and
+# anything using mktemp land here. It must not also be runnable. `curl | sh`, and its unpack-then-run
+# cousins, stage a payload under $TMPDIR and execute it from there -- the write is the harmless half
+# of that pair, and the exec is the half worth refusing (SEC-11).
+SANDBOX_SCRATCH_ROOTS = (
+    "/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp", "/var/folders", "/private/var/folders",
+)
+
+# What a kernel refusal looks like by the time it reaches stderr. The kernel does not sign its work,
+# so a denied write reads exactly like a permissions problem on the host -- which is how a model ends
+# up blaming macOS, asking for sudo, or asking the user to loosen something (SEC-12).
+SANDBOX_DENIAL_SIGNATURES = ("operation not permitted", "permission denied", "not permitted")
+
 
 def _sbpl_quote(path: str) -> str:
     return '"' + path.replace("\\", "\\\\").replace('"', '\\"') + '"'
@@ -593,13 +606,13 @@ def _workspace_inside(workspace: Path, target: Path) -> bool:
         return False
 
 
-def seatbelt_profile(workspace: Path, allow_network: bool = False, home: Path | None = None) -> str:
-    """macOS sandbox-exec (SBPL v1) profile confining writes, credential reads, and network."""
+def seatbelt_profile(workspace: Path, allow_network: bool = False, home: Path | None = None,
+                     allow_scratch_exec: bool = False) -> str:
+    """macOS sandbox-exec (SBPL v1) profile confining writes, execution, credential reads, and network."""
     ws = workspace.resolve()
     home_dir = (home or Path.home()).resolve()
     writable_subpaths: list[str] = []
-    for p in (ws, Path("/tmp"), Path("/private/tmp"), Path("/var/tmp"), Path("/private/var/tmp"),
-              Path("/var/folders"), Path("/private/var/folders"),
+    for p in (ws, *(Path(r) for r in SANDBOX_SCRATCH_ROOTS),
               home_dir / ".cache", home_dir / "Library" / "Caches"):
         for v in _canonical_variants(p):
             if v not in writable_subpaths:
@@ -624,6 +637,20 @@ def seatbelt_profile(workspace: Path, allow_network: bool = False, home: Path | 
     for rel_file in ("AGENTS.md", ".gitmodules", ".pre-commit-config.yaml", ".pre-commit-config.yml"):
         for v in _canonical_variants(ws / rel_file):
             lines.append(f"(deny file-write* (literal {_sbpl_quote(v)}))")
+
+    # Writable scratch stays un-runnable, so a download cannot become a process. The workspace is
+    # deliberately not on this list: a build has to be able to run what it just compiled, and the
+    # project's own code is what the agent was pointed at in the first place. Toolchains that
+    # compile to $TMPDIR and run it from there -- `go test` is the common one -- need
+    # KYKLOS_SANDBOX_EXEC_TMP=1, which trades this back for them.
+    if not allow_scratch_exec:
+        noexec: list[str] = []
+        for root in SANDBOX_SCRATCH_ROOTS:
+            for v in _canonical_variants(Path(root)):
+                if v not in noexec:
+                    noexec.append(v)
+        for v in noexec:
+            lines.append(f"(deny process-exec* (subpath {_sbpl_quote(v)}))")
 
     # Reads are emitted in three passes because SBPL takes the last matching rule, which is what
     # the blanket `(deny file-write*)` above already relies on. Personal folders are denied first
@@ -760,13 +787,16 @@ def probe_sandbox(env=None) -> tuple[str, str]:
 
 
 def sandbox_argv(inner_argv: list[str], workspace: Path, allow_network: bool = False,
-                 env=None) -> list[str]:
+                 env=None, allow_scratch_exec: bool = False) -> list[str]:
     """Wrap `inner_argv` in the active OS kernel sandbox when available."""
     kind, _ = probe_sandbox(env=env)
     if kind == "seatbelt":
         exe = shutil.which("sandbox-exec") or "/usr/bin/sandbox-exec"
-        return [exe, "-p", seatbelt_profile(workspace, allow_network=allow_network), *inner_argv]
+        return [exe, "-p", seatbelt_profile(workspace, allow_network=allow_network,
+                                            allow_scratch_exec=allow_scratch_exec), *inner_argv]
     if kind == "bwrap":
+        # No scratch-exec equivalent here: bubblewrap binds mounts but cannot remount one noexec,
+        # so SEC-11 is a seatbelt-only guarantee today. Saying so beats implying parity.
         exe = shutil.which("bwrap") or "bwrap"
         return bwrap_argv(inner_argv, workspace, allow_network=allow_network, bwrap_bin=exe)
     return inner_argv
@@ -929,6 +959,27 @@ class Tools:
                 break
         return "\n".join(files) or "No files matched."
 
+    def _sandbox_note(self, out: str) -> str:
+        """Name the sandbox when it is the likely author of a failure.
+
+        A seatbelt denial surfaces as `Operation not permitted` and nothing else -- the same text a
+        genuine host permissions problem produces. A model reading that reasonably concludes the OS
+        is in the way and reaches for the fix that works on a real OS problem: sudo, or asking the
+        user to grant something. Both are worse than the original failure. Saying which wall was hit
+        costs one line and removes the reason to go looking for a way around it.
+        """
+        kind, label = probe_sandbox()
+        if kind not in {"seatbelt", "bwrap"} or not out:
+            return ""
+        low = out.lower()
+        if not any(sig in low for sig in SANDBOX_DENIAL_SIGNATURES):
+            return ""
+        return (f"\n\n[harness] bash runs under {label}. If that was a write outside the workspace "
+                f"or a scratch dir, or running a file from {SANDBOX_SCRATCH_ROOTS[0]} and friends, "
+                "this sandbox refused it -- not the host OS, and not a missing privilege. Escalating "
+                "will not change it: work inside the workspace, or tell the user what has to happen "
+                "outside it and let them do it.")
+
     def _timed_out(self, timeout: int, stdout: str | None, stderr: str | None) -> str:
         """What a command managed to say before it hung, kept rather than thrown away.
 
@@ -958,7 +1009,9 @@ class Tools:
         base_argv = (["powershell", "-NoProfile", "-NonInteractive", "-Command", command] if IS_WINDOWS
                      else ["bash", "-c", command])
         effective_net = allow_network or os.environ.get("KYKLOS_SANDBOX_NET", "").strip() == "1"
-        argv = sandbox_argv(base_argv, self.workspace, allow_network=effective_net)
+        scratch_exec = os.environ.get("KYKLOS_SANDBOX_EXEC_TMP", "").strip() == "1"
+        argv = sandbox_argv(base_argv, self.workspace, allow_network=effective_net,
+                            allow_scratch_exec=scratch_exec)
         process = subprocess.Popen(
             argv, cwd=self.workspace, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
             text=True, encoding="utf-8", errors="replace", env=child_env(),
@@ -977,6 +1030,8 @@ class Tools:
             kill_process_tree(process)
             raise
         out = (stdout or "") + (stderr or "")
+        if process.returncode != 0:
+            out += self._sandbox_note(out)
         return self._truncate(f"exit code {process.returncode}\n{out}".rstrip())
 
     # ---- the plan ----------------------------------------------------------
