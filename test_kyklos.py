@@ -328,6 +328,15 @@ class AgentsMdTests(unittest.TestCase):
             prompt = Agent(FakeClient([]), "fake", Path(tmp)).messages[0]["content"]
         self.assertNotIn("Project instructions from AGENTS.md", prompt)
 
+    def test_default_and_project_guardrails_go_into_system_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "GUARDRAILS.md").write_text("Never touch production databases.")
+            prompt = Agent(FakeClient([]), "fake", Path(tmp)).messages[0]["content"]
+        self.assertIn("Default guardrails from GUARDRAILS.md", prompt)
+        self.assertIn("Zero Privilege Escalation", prompt)
+        self.assertIn("Project guardrails from GUARDRAILS.md", prompt)
+        self.assertIn("Never touch production databases.", prompt)
+
 
 class CompactionTests(unittest.TestCase):
     """The fake API reports a large prompt_tokens to push the agent past the threshold."""
@@ -3021,7 +3030,9 @@ class SecurityReinforcementTests(unittest.TestCase):
 
         for protected in (
             "AGENTS.md",
+            "GUARDRAILS.md",
             "packages/api/AGENTS.md",
+            "packages/api/GUARDRAILS.md",
             ".vscode/tasks.json",
             ".vscode/launch.json",
             ".vscode/settings.json",
@@ -3111,6 +3122,7 @@ class SecurityReinforcementTests(unittest.TestCase):
         self.assertIn('(subpath "/Users/alice/.ssh")', online)
         self.assertIn('(subpath "/Users/alice/.kyklos")', online)
         self.assertIn(f'(literal "{self.ws.resolve()}/AGENTS.md")', online)
+        self.assertIn(f'(literal "{self.ws.resolve()}/GUARDRAILS.md")', online)
 
     def test_seatbelt_lets_a_command_write_scratch_but_not_run_it(self):
         """Allowing writes to $TMPDIR and execution from it is what makes `curl | sh` worth doing
@@ -3305,6 +3317,65 @@ class SecurityReinforcementTests(unittest.TestCase):
         argv = bwrap_argv(["bash", "-c", "id"], ws, allow_network=False, home=fake_home)
         self.assertIn(str((fake_home / "Documents").resolve()), argv)
         self.assertNotIn(str((fake_home / "Movies").resolve()), argv)
+
+    def test_python_tools_enforce_parity_with_protected_home_credentials_and_history(self):
+        from tools import is_secret_file, command_touches_secret, ToolError, Tools
+        # 1. Protected credentials directories & files
+        protected_cases = [
+            ".ssh/config", ".ssh/known_hosts", ".ssh/authorized_keys",
+            ".docker/config.json", ".aws/credentials", ".aws/config",
+            ".kube/config", ".gnupg/pubring.kbx",
+            ".zsh_history", ".bash_history", ".sh_history", ".history",
+            "login.keychain-db", "cert.keychain", "AuthKey_12345.p8",
+        ]
+        for p in protected_cases:
+            with self.subTest(protected=p):
+                self.assertTrue(is_secret_file(Path(p)), f"{p} should be secret")
+                self.assertTrue(command_touches_secret(f"cat {p}"), f"cat {p} should touch secret")
+
+        # 2. Benign lookalikes must remain unblocked
+        safe_cases = [
+            "src/config.py", "config/default.json", "docker/Dockerfile", "docker-compose.yml",
+            ".ssh/config.example", ".aws/config.template", "config.json",
+        ]
+        for s in safe_cases:
+            with self.subTest(safe=s):
+                self.assertFalse(is_secret_file(Path(s)), f"{s} should be safe")
+                self.assertFalse(command_touches_secret(f"cat {s}"), f"cat {s} should not touch secret")
+
+        # 3. Tools runtime enforcement inside workspace
+        fake_home = self.ws / "fake_home"
+        ssh_dir = fake_home / ".ssh"
+        ssh_dir.mkdir(parents=True)
+        (ssh_dir / "config").write_text("Host github.com\n  User git\n")
+        docker_dir = fake_home / ".docker"
+        docker_dir.mkdir(parents=True)
+        (docker_dir / "config.json").write_text('{"auths": {"https://index.docker.io/v1/": {"auth": "dGVzdA=="}}}')
+        (fake_home / ".zsh_history").write_text(": 1600000000:0;export TOKEN=secret_tok_123\n")
+        (fake_home / "app.py").write_text("print('hello')\n")
+
+        tools = Tools(fake_home)
+        # read_file
+        with self.assertRaises(ToolError):
+            tools.read_file(".ssh/config")
+        with self.assertRaises(ToolError):
+            tools.read_file(".docker/config.json")
+        with self.assertRaises(ToolError):
+            tools.read_file(".zsh_history")
+        self.assertIn("hello", tools.read_file("app.py"))
+
+        # write_file & edit_file
+        with self.assertRaises(ToolError):
+            tools.write_file(".ssh/config", "hacked")
+        with self.assertRaises(ToolError):
+            tools.edit_file(".docker/config.json", "dGVzdA==", "hacked")
+
+        # grep
+        grep_res = tools.grep("github|auth|TOKEN|hello")
+        self.assertNotIn("Host github.com", grep_res)
+        self.assertNotIn("dGVzdA==", grep_res)
+        self.assertNotIn("secret_tok_123", grep_res)
+        self.assertIn("app.py", grep_res)
 
 
 if __name__ == "__main__":

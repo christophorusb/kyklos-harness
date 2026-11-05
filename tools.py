@@ -236,10 +236,13 @@ SAFE_ENV_SUFFIXES = (".example", ".sample", ".template")
 SECRET_EXACT_NAMES = {
     ".env", ".npmrc", ".pypirc", ".netrc", ".git-credentials", ".pgpass", ".my.cnf",
     "credentials", "credentials.json", "kubeconfig", "master.passwd", "shadow", "sudoers",
+    ".zsh_history", ".bash_history", ".sh_history", ".history",
+    ".python_history", ".node_repl_history", ".mysql_history", ".psql_history",
 }
 SECRET_PREFIXES = ("id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "service-account")
 SECRET_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".keystore", ".jks", ".kdbx", ".ovpn",
-                   ".tfvars", ".tfstate", ".tfstate.backup")
+                   ".tfvars", ".tfstate", ".tfstate.backup", ".keychain", ".keychain-db", ".p8")
+PROTECTED_CREDENTIAL_DIRS = {".ssh", ".aws", ".gnupg", ".kube", ".docker"}
 
 
 def is_secret_file(p: Path) -> bool:
@@ -249,7 +252,10 @@ def is_secret_file(p: Path) -> bool:
         return False
     if name in SECRET_EXACT_NAMES or name.startswith(".env."):
         return True
-    return name.endswith(SECRET_SUFFIXES) or name.startswith(SECRET_PREFIXES)
+    if name.endswith(SECRET_SUFFIXES) or name.startswith(SECRET_PREFIXES):
+        return True
+    parts = {part.lower() for part in p.parts}
+    return bool(parts & PROTECTED_CREDENTIAL_DIRS)
 
 
 SECRET_GLOB_TARGETS = (
@@ -258,6 +264,7 @@ SECRET_GLOB_TARGETS = (
     "secret.keystore", "secret.jks", "secret.ovpn", "prod.tfvars", "terraform.tfstate",
     ".npmrc", ".pypirc", ".netrc", ".git-credentials", ".pgpass", "kubeconfig",
     "credentials.json", "service-account.json",
+    ".zsh_history", ".bash_history", ".sh_history", ".history", "keychain", "keychain-db",
 )
 
 
@@ -634,7 +641,7 @@ def seatbelt_profile(workspace: Path, allow_network: bool = False, home: Path | 
     for rel_ro in (".git/hooks", ".husky", ".vscode"):
         for v in _canonical_variants(ws / rel_ro):
             lines.append(f"(deny file-write* (subpath {_sbpl_quote(v)}))")
-    for rel_file in ("AGENTS.md", ".gitmodules", ".pre-commit-config.yaml", ".pre-commit-config.yml"):
+    for rel_file in ("AGENTS.md", "GUARDRAILS.md", ".gitmodules", ".pre-commit-config.yaml", ".pre-commit-config.yml"):
         for v in _canonical_variants(ws / rel_file):
             lines.append(f"(deny file-write* (literal {_sbpl_quote(v)}))")
 
@@ -724,7 +731,7 @@ def bwrap_argv(inner_argv: list[str], workspace: Path, allow_network: bool = Fal
         ro_dir = ws / rel_ro
         if ro_dir.is_dir():
             cmd += ["--ro-bind", str(ro_dir), str(ro_dir)]
-    for rel_file in ("AGENTS.md", ".gitmodules", ".pre-commit-config.yaml", ".pre-commit-config.yml"):
+    for rel_file in ("AGENTS.md", "GUARDRAILS.md", ".gitmodules", ".pre-commit-config.yaml", ".pre-commit-config.yml"):
         ro_file = ws / rel_file
         if ro_file.is_file():
             cmd += ["--ro-bind", str(ro_file), str(ro_file)]
