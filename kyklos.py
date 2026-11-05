@@ -2107,6 +2107,66 @@ def save_settings(home: Path, settings: dict) -> None:
     write_private_text(home / "settings.json", json.dumps(settings, indent=2))
 
 
+# Profiles. One .env can describe several providers, each as a suffixed block -- BASE_URL_LOCAL,
+# API_KEY_LOCAL, MODEL_LOCAL, CONTEXT_WINDOW_LOCAL -- chosen with `kyklos --profile local` or
+# KYKLOS_PROFILE. The unsuffixed names are the default profile, so an .env written before any of
+# this existed keeps working unchanged and the common case stays a three-line file.
+PROFILE_KEYS = ("BASE_URL", "API_KEY", "MODEL", "CONTEXT_WINDOW", "SUBAGENT_MODEL")
+
+
+def profile_env_name(key: str, profile: str | None) -> str:
+    """BASE_URL for the default profile, BASE_URL_LOCAL for `local`."""
+    if not profile:
+        return key
+    return f"{key}_{re.sub(r'[^A-Za-z0-9]+', '_', profile).strip('_').upper()}"
+
+
+def choose_profile(flag: str | None, env) -> str | None:
+    """(profile, or None for the unsuffixed block): `--profile` > KYKLOS_PROFILE > none."""
+    return ((flag or env.get("KYKLOS_PROFILE") or "").strip().lower()) or None
+
+
+def known_profiles(env) -> list[str]:
+    """Profile names the environment defines, by the BASE_URL_<NAME> that has to exist for one."""
+    found = set()
+    for key in env:
+        m = re.fullmatch(r"BASE_URL_([A-Za-z0-9_]+)", key)
+        if m:
+            found.add(m.group(1).lower())
+    return sorted(found)
+
+
+def profile_env(env, profile: str | None):
+    """`env` as the chosen profile sees it: its own suffixed values, and nothing inherited.
+
+    A named profile deliberately blanks the unsuffixed keys rather than falling back to them. A
+    profile that gave a BASE_URL and inherited the default API_KEY would send one provider's
+    credential to another provider's host -- the exact thing the suffix exists to prevent -- and a
+    profile that inherited MODEL would start by asking a server for a model it has never heard of.
+    Half a profile is a mistake worth reporting, not a merge worth guessing at.
+    """
+    if not profile:
+        return env
+    return {**env, **{key: (env.get(profile_env_name(key, profile)) or "") for key in PROFILE_KEYS}}
+
+
+def profile_picks(settings: dict, profile: str | None) -> dict:
+    """Where this profile's /model choice is remembered: the top level for the default profile, a
+    slot of its own otherwise, so switching profiles cannot re-apply the other provider's model."""
+    if not profile:
+        return settings
+    return (settings.get("profiles") or {}).get(profile) or {}
+
+
+def remember_pick(settings: dict, profile: str | None, key: str, value) -> dict:
+    """Write a remembered choice into the slot `profile_picks` reads it back from."""
+    if not profile:
+        settings[key] = value
+    else:
+        settings.setdefault("profiles", {}).setdefault(profile, {})[key] = value
+    return settings
+
+
 def choose_model(flag: str | None, settings: dict, env) -> tuple[str | None, str]:
     """(model, source): `--model` > the model last picked with /model > MODEL in .env."""
     if flag:
@@ -2341,7 +2401,7 @@ COMMANDS: dict[str, tuple] = {}  # name -> (handler, usage, summary)
 
 class CommandContext:
     def __init__(self, agent: "Agent", say, default_session: Path, pick=None, home: Path = None,
-                 load_models=None, context_override: bool = False, render=None):
+                 load_models=None, context_override: bool = False, render=None, profile: str | None = None):
         self.agent = agent
         self.say = say  # say(kind, text) with kind in info / ok / warn / error
         self.default_session = default_session
@@ -2351,6 +2411,7 @@ class CommandContext:
         self.home = home  # where /model saves settings; None means don't save
         self.load_models = load_models  # load_models(refresh=False) -> catalog list
         self.context_override = context_override  # CONTEXT_WINDOW is set: keep it when switching models
+        self.profile = profile  # which .env provider block is active; None is the unsuffixed one
 
     def show(self, view: str, data, fallback: str) -> None:
         """Hand a view to the front end to draw, falling back to plain text where it can't.
@@ -2524,7 +2585,7 @@ def _apply_model(ctx, info: dict, effort: str) -> None:
         ctx.agent.context_source = "detected" if info.get("context") else "default"
     if ctx.home:
         settings = load_settings(ctx.home)
-        settings["model"] = info["name"]
+        remember_pick(settings, ctx.profile, "model", info["name"])
         settings.setdefault("efforts", {})[info["name"]] = effort
         save_settings(ctx.home, settings)
     thinking = "no thinking" if not effort_options(info) else f"effort {effort}"
@@ -2594,7 +2655,7 @@ def _apply_subagent_model(ctx, info: dict | None, effort: str = "default") -> No
         ctx.agent.set_subagent_model(None)
         if ctx.home:
             settings = load_settings(ctx.home)
-            settings["subagent_model"] = "same"
+            remember_pick(settings, ctx.profile, "subagent_model", "same")
             save_settings(ctx.home, settings)
         ctx.say("ok", f"Subagents will use the main model ({ctx.agent.model}).")
         return
@@ -2602,7 +2663,7 @@ def _apply_subagent_model(ctx, info: dict | None, effort: str = "default") -> No
     ctx.agent.set_subagent_model(info["name"], effort, window)
     if ctx.home:
         settings = load_settings(ctx.home)
-        settings["subagent_model"] = info["name"]
+        remember_pick(settings, ctx.profile, "subagent_model", info["name"])
         settings.setdefault("subagent_efforts", {})[info["name"]] = effort
         save_settings(ctx.home, settings)
     thinking = "no thinking" if not effort_options(info) else f"effort {effort}"
@@ -2754,14 +2815,29 @@ def main() -> None:
         if idx >= len(args):
             sys.exit("--submodel needs a model name (or 'same'), e.g. kyklos --submodel kimi-flash")
         submodel_flag = args.pop(idx)
+    profile_flag = None
+    if "--profile" in args:  # run against one of .env's suffixed provider blocks
+        idx = args.index("--profile")
+        args.pop(idx)
+        if idx >= len(args):
+            sys.exit("--profile needs a name, e.g. kyklos --profile local")
+        profile_flag = args.pop(idx)
     home = kyklos_home()
     settings = load_settings(home)
-    model, model_source = choose_model(model_flag, settings, os.environ)
-    sub_model, _ = choose_subagent_model(submodel_flag, settings, os.environ)
-    missing = [k for k in ("BASE_URL", "API_KEY") if not os.environ.get(k)] + ([] if model else ["MODEL"])
+    profile = choose_profile(profile_flag, os.environ)
+    env = profile_env(os.environ, profile)
+    if profile and not env["BASE_URL"]:
+        known = known_profiles(os.environ)
+        sys.exit(f"No profile named {profile}: nothing sets {profile_env_name('BASE_URL', profile)}."
+                 + (f" Defined: {', '.join(known)}." if known else " Add that block to .env."))
+    picks = profile_picks(settings, profile)
+    model, model_source = choose_model(model_flag, picks, env)
+    sub_model, _ = choose_subagent_model(submodel_flag, picks, env)
+    missing = [profile_env_name(k, profile) for k in ("BASE_URL", "API_KEY") if not env.get(k)] \
+        + ([] if model else [profile_env_name("MODEL", profile)])
     if missing:
         sys.exit(f"Missing {', '.join(missing)}. Copy .env.example to .env and fill it in.")
-    base_url, api_key = os.environ["BASE_URL"], os.environ["API_KEY"]
+    base_url, api_key = env["BASE_URL"], env["API_KEY"]
     effort = settings.get("efforts", {}).get(model, "default")
     sub_effort = (settings.get("subagent_efforts", {}).get(sub_model)
                   or os.environ.get("SUBAGENT_EFFORT") or "default") if sub_model else "default"
@@ -2769,16 +2845,16 @@ def main() -> None:
     workspace = Path(os.environ.get("WORKSPACE") or Path.cwd()).resolve()
     client = OpenAI(base_url=base_url, api_key=api_key)
     detected = None
-    if not os.environ.get("CONTEXT_WINDOW"):  # the cached catalog avoids a request on most starts
+    if not env.get("CONTEXT_WINDOW"):  # the cached catalog avoids a request on most starts
         detected = (cached_model_info(home, base_url, model) or {}).get("context") or \
             detect_context_window(base_url, api_key, model)
     try:
-        window, window_source = choose_context_window(os.environ, detected)
+        window, window_source = choose_context_window(env, detected)
     except ValueError as e:
         sys.exit(str(e))
     sub_window = None
     if sub_model:
-        if os.environ.get("CONTEXT_WINDOW"):
+        if env.get("CONTEXT_WINDOW"):
             sub_window = window
         else:
             sub_window = ((cached_model_info(home, base_url, sub_model) or {}).get("context")
@@ -2787,7 +2863,8 @@ def main() -> None:
     default_session = project_dir(home, workspace) / "last.jsonl"
     ctx_extras = {"home": None if (model_flag or submodel_flag) else home,  # one-run flags don't overwrite saved picks
                   "load_models": lambda refresh=False: load_model_catalog(home, base_url, api_key, client, refresh),
-                  "context_override": bool(os.environ.get("CONTEXT_WINDOW"))}
+                  "context_override": bool(env.get("CONTEXT_WINDOW")),
+                  "profile": profile}
 
     plan_mode = False
     resume_path = None

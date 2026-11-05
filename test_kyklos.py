@@ -2450,6 +2450,51 @@ class ModelCatalogTests(unittest.TestCase):
         from kyklos import effort_options
         self.assertEqual(effort_options(models[0]), ["default", "low", "medium", "high"])
 
+    def test_a_profile_reads_only_its_own_block(self):
+        """The suffix exists to keep one provider's credential away from another's host. A profile
+        that named a BASE_URL and inherited the default API_KEY would post a cloud key to whatever
+        the profile points at, so a named profile blanks the unsuffixed keys rather than falling
+        back to them -- a half-written profile fails to start instead of leaking."""
+        from kyklos import profile_env, profile_env_name, known_profiles
+        env = {"BASE_URL": "https://ollama.com/v1", "API_KEY": "cloud-secret", "MODEL": "cloud-m",
+               "CONTEXT_WINDOW": "1000000",
+               "BASE_URL_LOCAL": "http://localhost:11434/v1", "API_KEY_LOCAL": "ollama",
+               "MODEL_LOCAL": "qwen3-32k", "CONTEXT_WINDOW_LOCAL": "32768"}
+        local = profile_env(env, "local")
+        self.assertEqual(local["BASE_URL"], "http://localhost:11434/v1")
+        self.assertEqual(local["API_KEY"], "ollama")
+        self.assertEqual(local["MODEL"], "qwen3-32k")
+        self.assertEqual(local["CONTEXT_WINDOW"], "32768")
+        self.assertIs(profile_env(env, None), env)  # the default profile is the environment itself
+
+        half = profile_env({"API_KEY": "cloud-secret", "BASE_URL_HALF": "http://x:11434/v1"}, "half")
+        self.assertEqual(half["API_KEY"], "")  # not "cloud-secret"
+        self.assertEqual(profile_env_name("API_KEY", "my local!"), "API_KEY_MY_LOCAL")
+        self.assertEqual(known_profiles(env), ["local"])
+
+    def test_each_profile_remembers_its_own_model(self):
+        """One remembered name shared across providers is how `/model` and `.env` already disagree;
+        giving every profile its own slot keeps switching provider from re-applying a model the new
+        one has never heard of. The default profile keeps writing at the top level, so settings
+        files written before profiles existed still read back."""
+        from kyklos import choose_profile, profile_picks, remember_pick, choose_model
+        settings = {"model": "glm-5.3", "profiles": {"local": {"model": "qwen3-32k"}}}
+        self.assertEqual(choose_model(None, profile_picks(settings, None), {}), ("glm-5.3", "picked"))
+        self.assertEqual(choose_model(None, profile_picks(settings, "local"), {}), ("qwen3-32k", "picked"))
+        # A profile with no pick yet falls through to its own MODEL_<NAME>, never the other's.
+        self.assertEqual(choose_model(None, profile_picks(settings, "work"), {"MODEL": "m"}), ("m", "MODEL"))
+
+        remember_pick(settings, "local", "model", "llama4")
+        self.assertEqual(settings["profiles"]["local"]["model"], "llama4")
+        self.assertEqual(settings["model"], "glm-5.3")  # the default profile is untouched
+        remember_pick(settings, None, "model", "kimi-k3")
+        self.assertEqual(settings["model"], "kimi-k3")
+
+        self.assertEqual(choose_profile("Local", {"KYKLOS_PROFILE": "work"}), "local")
+        self.assertEqual(choose_profile(None, {"KYKLOS_PROFILE": "work"}), "work")
+        self.assertIsNone(choose_profile(None, {}))
+        self.assertIsNone(choose_profile("", {"KYKLOS_PROFILE": "  "}))
+
     def test_model_priority(self):
         from kyklos import choose_model, choose_subagent_model
         self.assertEqual(choose_model("x", {"model": "y"}, {"MODEL": "z"}), ("x", "--model"))
