@@ -1852,7 +1852,7 @@ MIN_DETECTED_CONTEXT = 2048
 
 
 def ollama_cloud_show_url(base_url: str) -> str | None:
-    """The /api/show URL for an Ollama cloud BASE_URL (https://ollama.com/v1), or None for other providers."""
+    """The /api/show URL for an Ollama cloud BASE_URL (https://ollama.com/v1), or None otherwise."""
     return _ollama_cloud_url(base_url, "/api/show")
 
 
@@ -1977,12 +1977,40 @@ def parse_model_info(name: str, show: dict) -> dict:
             "default": effort_label(thinking.get("default"))}
 
 
-def _ollama_cloud_url(base_url: str, path: str) -> str | None:
+# Ollama serves its own richer API beside the OpenAI-compatible one, on the same host and port.
+# Locally it is the default port that identifies it: nothing else is expected on 11434, and a
+# wrong guess costs one refused request that falls back to /v1/models (see fetch_model_catalog).
+OLLAMA_DEFAULT_PORT = 11434
+OLLAMA_LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def _is_local_ollama(base_url: str) -> bool:
     from urllib.parse import urlparse
     u = urlparse(base_url or "")
-    if (u.hostname or "").lower() not in ("ollama.com", "www.ollama.com"):
-        return None
-    return f"{u.scheme or 'https'}://{u.netloc}{path}"
+    return (u.hostname or "").lower() in OLLAMA_LOCAL_HOSTS and (u.port or 0) == OLLAMA_DEFAULT_PORT
+
+
+def _ollama_cloud_url(base_url: str, path: str) -> str | None:
+    """Cloud only. The context window is read through this and must not come from a local server."""
+    url = _ollama_api_url(base_url, path)
+    return None if url is None or _is_local_ollama(base_url) else url
+
+
+def _ollama_api_url(base_url: str, path: str) -> str | None:
+    """The Ollama-native API URL for an Ollama BASE_URL -- cloud or local -- or None for other providers.
+
+    The host check is what keeps API_KEY from reaching a provider that is not Ollama: every caller
+    sends the key as a bearer token, so a URL built here must only ever point at the same host the
+    OpenAI client is already talking to.
+    """
+    from urllib.parse import urlparse
+    u = urlparse(base_url or "")
+    host = (u.hostname or "").lower()
+    if host in ("ollama.com", "www.ollama.com"):
+        return f"{u.scheme or 'https'}://{u.netloc}{path}"
+    if host in OLLAMA_LOCAL_HOSTS and (u.port or 0) == OLLAMA_DEFAULT_PORT:
+        return f"{u.scheme or 'http'}://{u.netloc}{path}"
+    return None
 
 
 def _http_json(url: str, api_key: str, payload=None, timeout: float = 10.0, urlopen=None):
@@ -1997,13 +2025,18 @@ def _http_json(url: str, api_key: str, payload=None, timeout: float = 10.0, urlo
 
 
 def fetch_model_catalog(base_url: str, api_key: str, client=None, urlopen=None) -> list[dict]:
-    """The provider's models that can run Kyklos (they need tool support). Ollama cloud gets the full
+    """The provider's models that can run Kyklos (they need tool support). Ollama gets the full
     description of each model (fetched in parallel); other providers just their /v1/models ids."""
-    tags_url = _ollama_cloud_url(base_url, "/api/tags")
+    tags_url = _ollama_api_url(base_url, "/api/tags")
     if tags_url:
-        names = [m["name"] for m in _http_json(tags_url, api_key, urlopen=urlopen).get("models", [])]
-        show_url = _ollama_cloud_url(base_url, "/api/show")
-
+        try:
+            names = [m["name"] for m in _http_json(tags_url, api_key, urlopen=urlopen).get("models", [])]
+        except Exception:
+            names = None  # something else is on 11434: fall through to the OpenAI-compatible list
+        show_url = _ollama_api_url(base_url, "/api/show")
+    else:
+        names = None
+    if names is not None:
         def describe(name):
             try:
                 return parse_model_info(name, _http_json(show_url, api_key, {"model": name}, urlopen=urlopen))
@@ -2013,6 +2046,15 @@ def fetch_model_catalog(base_url: str, api_key: str, client=None, urlopen=None) 
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=8) as pool:
             models = list(pool.map(describe, names))
+        if _is_local_ollama(base_url):
+            # /api/show reports the model's trained maximum. A local server serves whatever num_ctx
+            # it was started with -- OLLAMA_CONTEXT_LENGTH, often far smaller -- and truncates above
+            # it without saying so, and the API does not expose that number. Carrying the trained
+            # figure here would feed cached_model_info and reach choose_context_window labelled
+            # "detected", which is a worse answer than the default precisely because it looks
+            # authoritative. Names, tool support and effort levels are sound; the window is not.
+            for m in models:
+                m["context"] = None
         return sorted((m for m in models if m["tools"]), key=lambda m: m["name"])
     if client is not None:
         return sorted(({"name": m.id, "context": None, "tools": True, "efforts": list(STANDARD_EFFORTS),

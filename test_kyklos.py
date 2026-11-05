@@ -2294,9 +2294,16 @@ class ContextWindowTests(unittest.TestCase):
         self.assertLessEqual(timeout, 5)  # startup is never held up for long
 
     def test_other_providers_and_local_ollama_are_not_asked(self):
+        """Local Ollama is left out on purpose. /api/show gives the model's trained maximum, while
+        the server answers at whatever num_ctx it was started with and truncates above it in
+        silence, so the number it would hand back is not the one that governs. Other hosts are left
+        out so the bearer token goes nowhere but the provider already in use -- including a local
+        server on another port, which is somebody else's (LM Studio, llama.cpp, vLLM)."""
         from kyklos import detect_context_window
         urlopen = self.fake_urlopen({"model_info": {"x.context_length": 1000000}})
-        for base in ("https://api.deepseek.com", "https://openrouter.ai/api/v1", "http://localhost:11434/v1"):
+        for base in ("https://api.deepseek.com", "https://openrouter.ai/api/v1",
+                     "http://localhost:11434/v1", "http://127.0.0.1:11434/v1",
+                     "http://localhost:1234/v1", "http://evil.example.com:11434/v1"):
             self.assertIsNone(detect_context_window(base, "k", "m", urlopen=urlopen))
         self.assertEqual(self.requests, [])  # the API key never goes anywhere else
 
@@ -2406,6 +2413,32 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual([m["name"] for m in offline], ["kimi-k3", "minimax-m3.1-flash", "mistral-large-3"])
         self.assertEqual(cached_model_info(self.home, "https://ollama.com/v1", "kimi-k3")["context"], 1048576)
         self.assertIsNone(cached_model_info(self.home, "https://other/v1", "kimi-k3"))
+
+    def test_a_local_ollama_lists_its_models_but_never_their_context(self):
+        """Against a local server the catalog is worth having -- real names, tool support and the
+        effort levels each model accepts, instead of bare /v1/models ids. The context length is the
+        one field that does not survive the trip: it is the model's trained maximum, not what the
+        server will actually serve, and carrying it would reach choose_context_window labelled
+        "detected" and quietly outrank the default."""
+        from kyklos import fetch_model_catalog
+        local = fetch_model_catalog("http://127.0.0.1:11434/v1", "ollama", urlopen=self.fake_ollama())
+        self.assertEqual([m["name"] for m in local], ["kimi-k3", "minimax-m3.1-flash", "mistral-large-3"])
+        self.assertTrue(all(m["context"] is None for m in local))
+        self.assertTrue(any(m["efforts"] for m in local))   # effort levels still come through
+
+        # The cloud keeps its context lengths; only the local reading is dropped.
+        cloud = fetch_model_catalog("https://ollama.com/v1", "k", urlopen=self.fake_ollama())
+        self.assertEqual([m["context"] for m in cloud], [1048576, 1000000, 262144])
+
+    def test_something_else_on_11434_falls_back_to_the_openai_list(self):
+        """The port is a guess, not a guarantee. If /api/tags is not Ollama's, the catalog drops to
+        the OpenAI-compatible listing rather than failing the start."""
+        from kyklos import fetch_model_catalog
+        def refuses(request, timeout=None):
+            raise OSError("404 Not Found")
+        client = SimpleNamespace(models=SimpleNamespace(list=lambda: [SimpleNamespace(id="local-model")]))
+        models = fetch_model_catalog("http://localhost:11434/v1", "x", client=client, urlopen=refuses)
+        self.assertEqual([m["name"] for m in models], ["local-model"])
 
     def test_other_providers_list_model_ids_only(self):
         from kyklos import fetch_model_catalog
