@@ -83,6 +83,10 @@ Kyklos works in the folder you launch it from. Set `WORKSPACE` in `.env` to pin 
 | `SUBAGENT_MODEL`, `SUBAGENT_EFFORT` | Route subagents to a faster or cheaper model |
 | `KYKLOS_PASS_ENV` | Secret-named variables to let through to commands anyway |
 
+Running against a local Ollama needs one thing `.env.example` can't express: the server's context
+window is 4096 by default and Kyklos cannot detect it, so it has to be set by hand. See
+[LOCAL-MODELS.md](LOCAL-MODELS.md).
+
 ## Run
 
 ```bash
