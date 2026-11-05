@@ -73,6 +73,13 @@ CONTEXT_WINDOW=32768
 
 `CONTEXT_WINDOW` must match the `num_ctx` you baked in. That is the entire point of step 2.
 
+**`MODEL` is the weakest of the three ways Kyklos decides which model to run.** The order is
+`--model` > the model last picked with `/model` > `MODEL` in `.env`. A `/model` pick is remembered in
+`~/.kyklos/settings.json`, so if you have ever used it, editing `.env` changes nothing and Kyklos
+asks the local server for a model it has never heard of. Either pick the local model with `/model`
+once you are running, or clear `model` and `subagent_model` from `settings.json` first.
+`SUBAGENT_MODEL` works the same way and is just as easy to leave pointing at a cloud model.
+
 `API_KEY` is a placeholder, and `ollama` is the literal value Ollama's own documentation uses. A local
 server does not authenticate: it answers with no `Authorization` header, a garbage one, or an empty
 one. Kyklos still requires the variable to be non-empty at startup, and the OpenAI client rejects an
