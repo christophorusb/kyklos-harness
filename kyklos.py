@@ -1520,6 +1520,18 @@ class Agent:
             self.context_window = context_window
         self.usage_mark = None
 
+    def set_provider(self, client, model: str, effort: str = "default",
+                     context_window: int | None = None) -> None:
+        """Point the conversation at a different provider; the messages carry over unchanged.
+
+        Only the client and the model move. The conversation is just text, and a provider has no
+        memory of it between requests, so the next call carries the same history to a new endpoint
+        exactly as a model switch already does. The running token tally is left alone: it counts
+        what this session spent, and that stays true across a move.
+        """
+        self.client = client
+        self.set_model(model, effort, context_window)
+
     def set_subagent_model(self, model: str | None, effort: str = "default",
                            context_window: int | None = None) -> None:
         """Route subagents (`task`) to a separate model and thinking effort, or None to match the main model."""
@@ -2151,9 +2163,16 @@ def profile_env_name(key: str, profile: str | None) -> str:
     return f"{key}_{re.sub(r'[^A-Za-z0-9]+', '_', profile).strip('_').upper()}"
 
 
-def choose_profile(flag: str | None, env) -> str | None:
-    """(profile, or None for the unsuffixed block): `--profile` > KYKLOS_PROFILE > none."""
-    return ((flag or env.get("KYKLOS_PROFILE") or "").strip().lower()) or None
+DEFAULT_PROFILE_WORDS = {"default", "none", "main", ""}
+
+
+def choose_profile(flag: str | None, settings: dict, env) -> str | None:
+    """(profile, or None for the unsuffixed block): `--profile` > /provider's pick > KYKLOS_PROFILE."""
+    for value in (flag, (settings or {}).get("profile"), env.get("KYKLOS_PROFILE")):
+        if value is not None and str(value).strip():
+            name = str(value).strip().lower()
+            return None if name in DEFAULT_PROFILE_WORDS else name
+    return None
 
 
 def known_profiles(env) -> list[str]:
@@ -2657,6 +2676,90 @@ def _cmd_model(ctx, arg):
     _apply_model(ctx, info, effort if effort in (effort_options(info) or ["default"]) else "default")
 
 
+def _profile_label(profile: str | None) -> str:
+    return profile or "default"
+
+
+@command("provider", "/provider [name]", "Switch to another provider block in .env (remembered)")
+def _cmd_provider(ctx, arg):
+    """Move the conversation to another provider without restarting.
+
+    `/model` only ever lists the provider currently in use, which is right -- offering models that
+    cannot be reached would be worse -- but it left changing provider as a restart. Everything this
+    needs was already in place: set_model moves the model without disturbing the messages, the
+    catalog is cached per BASE_URL, and each profile already remembers its own pick. What was
+    missing was rebinding the client and the catalog to a different block of .env.
+    """
+    available = ["default"] + known_profiles(os.environ)
+    if arg:
+        wanted = arg.strip().lower()
+        wanted = "default" if wanted in DEFAULT_PROFILE_WORDS else wanted
+        if wanted not in available:
+            ctx.say("error", f"No provider named {arg}. Defined: {', '.join(available)}.")
+            return
+    elif not ctx.pick:
+        ctx.say("info", f"Providers: {', '.join(available)}. Use /provider <name>.")
+        return
+    else:
+        current = _profile_label(ctx.profile)
+        rows = [(name, "" if name == "default" else f"{profile_env_name('BASE_URL', name)}",
+                 "in use" if name == current else "") for name in available]
+        choice = ctx.pick("Pick a provider", rows, cursor=available.index(current),
+                          marked=available.index(current), filterable=False)
+        if choice is None:
+            ctx.say("info", f"Kept {current}.")
+            return
+        wanted = available[choice]
+
+    profile = None if wanted == "default" else wanted
+    if profile == ctx.profile:
+        ctx.say("info", f"Already on {_profile_label(profile)}.")
+        return
+    env = profile_env(os.environ, profile)
+    missing = [profile_env_name(k, profile) for k in ("BASE_URL", "API_KEY") if not env.get(k)]
+    if missing:
+        ctx.say("error", f"Can't switch to {_profile_label(profile)}: {', '.join(missing)} not set in .env.")
+        return
+
+    home = kyklos_home()
+    settings = load_settings(home)
+    picks = profile_picks(settings, profile)
+    client = OpenAI(base_url=env["BASE_URL"], api_key=env["API_KEY"])
+    ctx.load_models = lambda refresh=False, _b=env["BASE_URL"], _k=env["API_KEY"], _c=client: \
+        load_model_catalog(home, _b, _k, _c, refresh)
+    ctx.profile = profile
+    ctx.context_override = bool(env.get("CONTEXT_WINDOW"))
+
+    # The model has to come from the new provider: the one in hand belongs to the old one.
+    model, _ = choose_model(None, picks, env)
+    catalog = _model_catalog(ctx)
+    if model and catalog and model not in [m["name"] for m in catalog]:
+        ctx.say("warn", f"{_profile_label(profile)} has no model named {model}.")
+        model = None
+    info = _model_info(catalog, model) if model else None
+    if info is None:
+        ctx.agent.set_provider(client, ctx.agent.model)  # client first, so the picker lists the new list
+        set_explain_provider(env["BASE_URL"])
+        remember_pick(settings, None, "profile", _profile_label(profile))
+        save_settings(home, settings)
+        ctx.say("ok", f"On {_profile_label(profile)} ({env['BASE_URL']}). Pick a model.")
+        _cmd_model(ctx, None)
+        return
+
+    effort = settings.get("efforts", {}).get(info["name"], "default")
+    window, source = choose_context_window(env, info.get("context"))
+    ctx.agent.set_provider(client, info["name"], effort, window)
+    ctx.agent.context_source = source
+    sub_model, _ = choose_subagent_model(None, picks, env)
+    ctx.agent.set_subagent_model(sub_model, settings.get("subagent_efforts", {}).get(sub_model, "default"),
+                                 window if sub_model else None)
+    set_explain_provider(env["BASE_URL"])
+    settings["profile"] = _profile_label(profile)
+    save_settings(home, settings)
+    ctx.say("ok", f"On {_profile_label(profile)} · {info['name']} · {short_tokens(window)} context"
+                  + (f" · subagents {sub_model}" if sub_model else ""))
+
+
 @command("effort", "/effort [level]", "Set the thinking effort for the current model (remembered)")
 def _cmd_effort(ctx, arg):
     info = _model_info(_model_catalog(ctx), ctx.agent.model)
@@ -2854,7 +2957,7 @@ def main() -> None:
         profile_flag = args.pop(idx)
     home = kyklos_home()
     settings = load_settings(home)
-    profile = choose_profile(profile_flag, os.environ)
+    profile = choose_profile(profile_flag, settings, os.environ)
     env = profile_env(os.environ, profile)
     if profile and not env["BASE_URL"]:
         known = known_profiles(os.environ)

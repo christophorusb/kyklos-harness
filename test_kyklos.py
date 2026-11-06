@@ -2499,10 +2499,14 @@ class ModelCatalogTests(unittest.TestCase):
         remember_pick(settings, None, "model", "kimi-k3")
         self.assertEqual(settings["model"], "kimi-k3")
 
-        self.assertEqual(choose_profile("Local", {"KYKLOS_PROFILE": "work"}), "local")
-        self.assertEqual(choose_profile(None, {"KYKLOS_PROFILE": "work"}), "work")
-        self.assertIsNone(choose_profile(None, {}))
-        self.assertIsNone(choose_profile("", {"KYKLOS_PROFILE": "  "}))
+        # --profile > /provider's remembered pick > KYKLOS_PROFILE, mirroring how a model is chosen.
+        self.assertEqual(choose_profile("Local", {"profile": "cloud"}, {"KYKLOS_PROFILE": "work"}), "local")
+        self.assertEqual(choose_profile(None, {"profile": "cloud"}, {"KYKLOS_PROFILE": "work"}), "cloud")
+        self.assertEqual(choose_profile(None, {}, {"KYKLOS_PROFILE": "work"}), "work")
+        self.assertIsNone(choose_profile(None, {}, {}))
+        self.assertIsNone(choose_profile("", {}, {"KYKLOS_PROFILE": "  "}))
+        # "default" names the unsuffixed block, so /provider default can undo a remembered pick.
+        self.assertIsNone(choose_profile(None, {"profile": "default"}, {"KYKLOS_PROFILE": "work"}))
 
     def test_model_priority(self):
         from kyklos import choose_model, choose_subagent_model
@@ -2578,6 +2582,65 @@ class ModelCommandTests(unittest.TestCase):
         self.assertEqual((self.agent.model, self.agent.effort, self.agent.context_window), ("kimi-k3", "high", 1048576))
         self.assertEqual(load_settings(self.home), {"model": "kimi-k3", "efforts": {"kimi-k3": "high"}})
         self.assertIn("Using kimi-k3 · effort high · 1M context.", self.said[-1][1])
+
+    def test_provider_switch_moves_client_model_window_and_the_telemetry_warning(self):
+        """Switching provider has to move five things together, and the easy mistake is moving some.
+        The client decides where requests go; the model and window have to come from the new
+        provider, because the ones in hand belong to the old one; the remembered pick is per
+        profile; and set_explain_provider decides whether command output is flagged as leaving the
+        machine -- which would quietly stop being true if a move to cloud forgot it."""
+        import os
+        from unittest import mock
+        import kyklos
+        from kyklos import run_command, load_settings, parse_model_info
+
+        cloud = [parse_model_info("kimi-k3", KIMI_K3)]
+        built = []
+
+        class FakeOpenAI:
+            def __init__(self, base_url, api_key):
+                self.base_url, self.api_key = base_url, api_key
+                built.append((base_url, api_key))
+
+        env = {"BASE_URL": "http://localhost:11434/v1", "API_KEY": "ollama", "MODEL": "local-m",
+               "BASE_URL_CLOUD": "https://ollama.com/v1", "API_KEY_CLOUD": "cloud-key",
+               "MODEL_CLOUD": "kimi-k3"}
+        kyklos.set_explain_provider("http://localhost:11434/v1")
+        self.assertEqual(kyklos._EXPLAIN_PROVIDER_HOST, "")  # local: nothing leaves the machine
+
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(kyklos, "OpenAI", FakeOpenAI), \
+             mock.patch.object(kyklos, "kyklos_home", lambda *a, **k: self.home), \
+             mock.patch.object(kyklos, "load_model_catalog", lambda *a, **k: cloud):
+            run_command(self.ctx(), "/provider cloud")
+
+        self.assertEqual(built, [("https://ollama.com/v1", "cloud-key")])
+        self.assertEqual(self.agent.client.base_url, "https://ollama.com/v1")
+        self.assertEqual(self.agent.model, "kimi-k3")
+        self.assertEqual(self.agent.context_window, 1048576)       # the new provider's, not the old
+        self.assertEqual(kyklos._EXPLAIN_PROVIDER_HOST, "ollama.com")  # warnings tell the truth again
+        self.assertEqual(load_settings(self.home)["profile"], "cloud")
+        self.assertIn("On cloud · kimi-k3", self.said[-1][1])
+
+    def test_a_half_written_provider_is_refused_without_switching(self):
+        """The same containment the suffix exists for, enforced at the point of use: a profile that
+        names a BASE_URL and no key must not fall back to the one in hand and post it elsewhere."""
+        import os
+        from unittest import mock
+        import kyklos
+        from kyklos import run_command
+
+        before = self.agent.client
+        env = {"BASE_URL": "http://localhost:11434/v1", "API_KEY": "ollama",
+               "BASE_URL_HALF": "https://elsewhere.example/v1"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(kyklos, "kyklos_home", lambda *a, **k: self.home):
+            run_command(self.ctx(), "/provider half")
+            self.assertEqual(self.said[-1][0], "error")
+            self.assertIn("API_KEY_HALF", self.said[-1][1])
+            run_command(self.ctx(), "/provider nope")
+            self.assertIn("No provider named nope", self.said[-1][1])
+        self.assertIs(self.agent.client, before)  # nothing moved
 
     def test_each_model_remembers_its_own_effort(self):
         from kyklos import run_command

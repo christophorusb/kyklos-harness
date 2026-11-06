@@ -73,8 +73,8 @@ CONTEXT_WINDOW=32768
 
 `CONTEXT_WINDOW` must match the `num_ctx` you baked in. That is the entire point of step 2.
 
-If you also use a cloud provider, put the local one in a **profile** instead of swapping these four
-lines back and forth — a suffixed block that `kyklos --profile local` selects, leaving the
+If you also use a cloud provider, put the local one in a **profile** and move between them with
+`/provider`, instead of swapping these four lines back and forth — a suffixed block that `kyklos --profile local` selects, leaving the
 unsuffixed block as your default. Each profile keeps its own remembered model, which is what makes
 the next paragraph survivable:
 

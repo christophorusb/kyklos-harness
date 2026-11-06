@@ -92,9 +92,18 @@ kyklos --profile local        # BASE_URL_LOCAL, API_KEY_LOCAL, MODEL_LOCAL, CONT
 kyklos                        # the unsuffixed block, as before
 ```
 
-`KYKLOS_PROFILE` does the same without the flag. A profile reads **only** its own suffixed names —
-nothing falls back to the default block, so one provider's key can't reach another's host — and each
-profile remembers its own `/model` pick separately.
+`KYKLOS_PROFILE` does the same without the flag, and `/provider` switches without restarting:
+
+```
+/provider              pick from the blocks .env defines
+/provider cloud        switch now; the conversation carries over
+/provider default      back to the unsuffixed block
+```
+
+The choice is remembered, so the next `kyklos` starts where you left off (`--profile` still wins for
+one run). A profile reads **only** its own suffixed names — nothing falls back to the default block,
+so one provider's key can't reach another's host — and each profile remembers its own `/model` pick
+separately.
 
 Running against a local Ollama needs one thing `.env.example` can't express: the server's context
 window is 4096 by default and Kyklos cannot detect it, so it has to be set by hand. See
