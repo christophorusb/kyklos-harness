@@ -9,7 +9,11 @@ titled by commit instead.
 
 ---
 
-## Unreleased
+## v0.4.0 — Enforced Boundaries (2026-11-07)
+
+The theme of this release is Kyklos trusting less of what it used to take on faith. The model's own account of a command, a model file's claim about who the agent is, the filesystem outside the workspace, and the conversation's own growth were each taken at their word somewhere in v0.3.0; each is now checked, denied, or capped. Alongside that, one `.env` can describe several providers and switch between them without a restart, a persona can be chosen per session, and the system prompt arrives already knowing what is in the workspace and which commands the machine has.
+
+The sandbox change is the one to read first if you read only one: approving a single network command used to leave every other repository on the machine, `~/Documents` and `~/Downloads` readable to that command, and reads are how data leaves.
 
 - **Personas: a chosen prompt layer, read only from `KYKLOS_HOME` (`kyklos.py`, `.env.example`, `README.md`, tests):** the motivating case was porting an existing pair of engineering personas (a Chief Engineer, a Code Auditor) onto Kyklos, and the obvious route is a dead end worth recording. An Ollama `Modelfile` `SYSTEM` block is a *default* system prompt, used only when the request carries none; Kyklos always carries one. Verified against Ollama 0.40.14 on the same `/v1/chat/completions` endpoint: with no client system message a probe model answered `ZORBLAX Hi there!`, and with one it answered `AGENT Hi there!` — the baked persona replaced, silently, no error. A persona built with `ollama create` and run through any agent harness is therefore discarded while appearing to work, which is why it travels as a file here and not as a model.
   - **It is a prompt section, so switching is free.** `persona_instructions(name, home)` is the third instruction loader, in the shape of the two already there, and `set_persona` rebuilds `messages[0]` the way `set_plan_mode` does: the conversation carries over untouched and the model reads the new prompt on the next request. `--persona` for one run, `/persona` to pick or switch (remembered per profile), `KYKLOS_PERSONA` in `.env`, in that precedence.

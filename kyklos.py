@@ -27,7 +27,7 @@ from tools import (SAFE_TOOLS, SCHEMAS, SHELL_NAME, ToolError, Tools, command_to
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-__version__ = "0.3.0"  # semver, pre-1.0: breaking changes bump the minor. Cut a release by adding
+__version__ = "0.4.0"  # semver, pre-1.0: breaking changes bump the minor. Cut a release by adding
 #                        a `## v<x.y.z> — <title> (<date>)` section to CHANGELOG.md and bumping this.
 
 DEFAULT_MAX_STEPS = 50  # hard stop so a confused model can't loop forever; MAX_STEPS in .env overrides
