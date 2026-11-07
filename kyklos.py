@@ -220,6 +220,69 @@ def guardrails_instructions(workspace: Path, default_path: Path | None = None) -
     return "".join(sections)
 
 
+# Personas. A persona is a prompt layer the user chooses -- the Chief Engineer, the Code Auditor --
+# kept in ~/.kyklos/personas/<name>.md and named with `--persona`, /persona or KYKLOS_PERSONA.
+#
+# It deliberately reads only from KYKLOS_HOME, never from the workspace. AGENTS.md and GUARDRAILS.md
+# are workspace files and sit behind the folder-trust gate for exactly that reason; a persona is the
+# user's own configuration, so it needs no gate -- and letting a checked-out repository name its own
+# persona would hand a clone the power to redefine who the agent is, which is the one instruction
+# seam that must not be reachable from someone else's commit.
+def persona_instructions(name: str | None, home: Path) -> str:
+    """The chosen persona from ~/.kyklos/personas/<name>.md, as a system-prompt section."""
+    path = persona_path(name, home)
+    if not path:
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    if not text:
+        return ""
+    if len(text) > MAX_INSTRUCTIONS_CHARS:
+        text = text[:MAX_INSTRUCTIONS_CHARS] + "\n... (persona truncated)"
+    return (f"\n\nPersona from {path.name} (adopt this voice and these priorities; the rules above "
+            f"still bind you):\n{text}")
+
+
+def persona_path(name: str | None, home: Path) -> Path | None:
+    """~/.kyklos/personas/<name>.md for a usable name, or None. Rejects anything with a separator,
+    so a remembered or environment-set name can only ever name a file in that one directory."""
+    if not name:
+        return None
+    cleaned = str(name).strip()
+    if not cleaned or cleaned.lower() in PERSONA_OFF_WORDS:
+        return None
+    if cleaned != Path(cleaned).name or cleaned.startswith("."):
+        return None
+    if cleaned.endswith(".md"):
+        cleaned = cleaned[:-3]
+    path = home / "personas" / f"{cleaned}.md"
+    return path if path.is_file() else None
+
+
+def available_personas(home: Path) -> list[str]:
+    """Persona names in ~/.kyklos/personas, by the .md files that are there."""
+    try:
+        return sorted(p.stem for p in (home / "personas").glob("*.md") if p.is_file())
+    except OSError:
+        return []
+
+
+PERSONA_OFF_WORDS = {"off", "none", "default", "plain", ""}
+
+
+def choose_persona(flag: str | None, settings: dict, env) -> tuple[str | None, str]:
+    """(persona, source): `--persona` > /persona in settings.json > KYKLOS_PERSONA in .env > None."""
+    for value, source in ((flag, "--persona"),
+                          (settings.get("persona"), "picked"),
+                          (env.get("KYKLOS_PERSONA"), "KYKLOS_PERSONA")):
+        if value is not None and str(value).strip():
+            cleaned = str(value).strip()
+            return (None if cleaned.lower() in PERSONA_OFF_WORDS else cleaned), source
+    return None, "none"
+
+
 def project_instructions(workspace: Path) -> str:
     """The workspace's AGENTS.md, if any, appended to the system prompt (like CLAUDE.md / GEMINI.md)."""
     path = workspace / "AGENTS.md"
@@ -1369,7 +1432,8 @@ class Agent:
                  before_write=None, on_event=console_observer, sleep=time.sleep, effort: str = "default",
                  max_steps: int = DEFAULT_MAX_STEPS, compact_above: int = DEFAULT_COMPACT_ABOVE,
                  subagent_model: str | None = None, subagent_effort: str | None = None,
-                 subagent_context_window: int | None = None):
+                 subagent_context_window: int | None = None, persona: str | None = None,
+                 home: Path | None = None):
         self.client = client
         self.model = model
         self.active_snapshots: dict[Path, bytes | None] | None = None
@@ -1389,6 +1453,8 @@ class Agent:
         self.subagent_model = subagent_model or None
         self.subagent_effort = (subagent_effort or "default") if self.subagent_model else "default"
         self.subagent_context_window = subagent_context_window if self.subagent_model else None
+        self.persona = persona or None  # a prompt layer from ~/.kyklos/personas; see persona_instructions
+        self.persona_home = home
         # Chosen at startup, for this session only: a relaxation of the permission rules should
         # never outlive the run it was agreed for, the way folder trust deliberately does.
         self.auto_bash = False
@@ -1483,6 +1549,10 @@ class Agent:
             prompt += PLAN_PROMPT
         if self.depth > 0:
             prompt += SUBAGENT_PROMPT + f"\nYour tools: {', '.join(sorted(self.tool_names))}."
+        if self.depth == 0 and self.persona and self.persona_home:
+            # Depth 0 only, for the same reason the repo map is: a subagent is given one focused
+            # charter, and an identity layer it did not ask for would only dilute it.
+            prompt += persona_instructions(self.persona, self.persona_home)
         prompt += guardrails_instructions(self.tools.workspace)
         prompt += project_instructions(self.tools.workspace)
         if self.depth == 0:  # a subagent inherits nothing here; it gets one focused job
@@ -1545,6 +1615,15 @@ class Agent:
             return (self.subagent_model, self.subagent_effort or "default",
                     self.subagent_context_window or self.context_window)
         return (self.model, self.effort, self.context_window)
+
+    def set_persona(self, name: str | None) -> None:
+        """Adopt a persona (or None for the plain agent) mid-conversation; the messages carry over.
+
+        Only messages[0] changes, so what has already been said stays as it is -- the same move
+        /plan makes. The model reads the new prompt on the next request.
+        """
+        self.persona = name or None
+        self._update_mode()
 
     def set_plan_mode(self, enabled: bool) -> None:
         """Switch between read-only plan mode and full execution mode without losing the conversation."""
@@ -2525,6 +2604,79 @@ def _cmd_resume(ctx, arg):
         ctx.say("error", f"{e}.")
 
 
+@command("persona", "/persona [name|off]", "Adopt a persona prompt layer, or 'off' (remembered)")
+def _cmd_persona(ctx, arg):
+    home = ctx.home or kyklos_home()
+    names = available_personas(home)
+    if arg and arg.strip().lower() in PERSONA_OFF_WORDS:
+        _apply_persona(ctx, None)
+        return
+    if not names:
+        ctx.say("warn", f"No personas in {home / 'personas'}. Put a <name>.md file there, "
+                        "or link one: ln -s /path/to/chief-engineer.md "
+                        f"{home / 'personas'}/chief.md")
+        return
+    if arg:
+        wanted = arg.strip()
+        if not persona_path(wanted, home):
+            close = [n for n in names if wanted.lower() in n.lower()]
+            ctx.say("error", f"No persona named {wanted}."
+                             + (f" Did you mean: {', '.join(close[:5])}?" if close
+                                else f" Available: {', '.join(names)}."))
+            return
+        _apply_persona(ctx, wanted)
+        return
+    if not ctx.pick:
+        ctx.say("info", f"Personas: {', '.join(names)}. Use /persona <name> or /persona off.")
+        return
+    rows = [("no persona", "", "the plain Kyklos agent")] + [
+        (n, _persona_size(persona_path(n, home)), _persona_summary(persona_path(n, home))) for n in names
+    ]
+    active = ctx.agent.persona
+    marked = (names.index(active) + 1) if active in names else (0 if active is None else None)
+    choice = ctx.pick("Pick a persona", rows, cursor=marked or 0, marked=marked, filterable=True)
+    if choice is None:
+        ctx.say("info", f"Kept persona ({ctx.agent.persona or 'none'}).")
+        return
+    _apply_persona(ctx, None if choice == 0 else names[choice - 1])
+
+
+def _persona_size(path: Path | None) -> str:
+    """The persona's size as an approximate token count, since it is paid for on every step."""
+    if not path:
+        return ""
+    try:
+        return f"~{max(1, round(len(path.read_text(encoding='utf-8', errors='replace')) / 4 / 100) * 100)} tok"
+    except OSError:
+        return ""
+
+
+def _persona_summary(path: Path | None) -> str:
+    """The persona file's first heading, as a one-line description for the picker."""
+    if not path:
+        return ""
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("#"):
+                return line.lstrip("#").strip()[:60]
+    except OSError:
+        pass
+    return ""
+
+
+def _apply_persona(ctx, name: str | None) -> None:
+    ctx.agent.set_persona(name)
+    if ctx.home:
+        settings = load_settings(ctx.home)
+        remember_pick(settings, ctx.profile, "persona", name or "off")
+        save_settings(ctx.home, settings)
+    if name:
+        ctx.say("ok", f"Persona: {name}. It is in the system prompt from the next request; "
+                      "the conversation carries over.")
+    else:
+        ctx.say("ok", "Persona off. Back to the plain Kyklos agent.")
+
+
 @command("compact", "/compact", "Shrink the conversation now")
 def _cmd_compact(ctx, arg):
     if not ctx.agent.compact():
@@ -2893,10 +3045,12 @@ def plain_repl(agent: "Agent", default_session: Path, **ctx_extras) -> None:
     """The dependency-free REPL, used when output isn't a terminal or KYKLOS_UI=plain."""
     ctx = CommandContext(agent, lambda kind, text: print(text), default_session, pick=pick_plain, **ctx_extras)
     agents_md = " (AGENTS.md loaded)" if (agent.tools.workspace / "AGENTS.md").is_file() else ""
+    persona = f"  persona={agent.persona}" if agent.persona else ""
     source = getattr(agent, "context_source", "default")
     effort = f"  effort={agent.effort}" if agent.effort != "default" else ""
     sub = f"  submodel={agent.subagent_model}" if agent.subagent_model and agent.subagent_model != agent.model else ""
-    print(f"Kyklos ready. model={agent.model}{effort}{sub}  context={short_tokens(agent.context_window)} ({source})  "
+    print(f"Kyklos ready. model={agent.model}{effort}{sub}{persona}  "
+          f"context={short_tokens(agent.context_window)} ({source})  "
           f"workspace={agent.tools.workspace}{agents_md}")
     print("Type /help for commands.\n")
     while True:
@@ -2948,6 +3102,13 @@ def main() -> None:
         if idx >= len(args):
             sys.exit("--submodel needs a model name (or 'same'), e.g. kyklos --submodel kimi-flash")
         submodel_flag = args.pop(idx)
+    persona_flag = None
+    if "--persona" in args:  # use this persona for one run (not remembered)
+        idx = args.index("--persona")
+        args.pop(idx)
+        if idx >= len(args):
+            sys.exit("--persona needs a name (or 'off'), e.g. kyklos --persona chief-engineer")
+        persona_flag = args.pop(idx)
     profile_flag = None
     if "--profile" in args:  # run against one of .env's suffixed provider blocks
         idx = args.index("--profile")
@@ -2966,6 +3127,7 @@ def main() -> None:
     picks = profile_picks(settings, profile)
     model, model_source = choose_model(model_flag, picks, env)
     sub_model, _ = choose_subagent_model(submodel_flag, picks, env)
+    persona, persona_source = choose_persona(persona_flag, picks, os.environ)
     missing = [profile_env_name(k, profile) for k in ("BASE_URL", "API_KEY") if not env.get(k)] \
         + ([] if model else [profile_env_name("MODEL", profile)])
     if missing:
@@ -2994,7 +3156,7 @@ def main() -> None:
                           or detect_context_window(base_url, api_key, sub_model)
                           or DEFAULT_CONTEXT_WINDOW)
     default_session = project_dir(home, workspace) / "last.jsonl"
-    ctx_extras = {"home": None if (model_flag or submodel_flag) else home,  # one-run flags don't overwrite saved picks
+    ctx_extras = {"home": None if (model_flag or submodel_flag or persona_flag) else home,  # one-run flags don't overwrite saved picks
                   "load_models": lambda refresh=False: load_model_catalog(home, base_url, api_key, client, refresh),
                   "context_override": bool(env.get("CONTEXT_WINDOW")),
                   "profile": profile}
@@ -3033,7 +3195,14 @@ def main() -> None:
     agent = Agent(client, model, workspace, context_window=window, plan_mode=plan_mode, effort=effort,
                   max_steps=choose_max_steps(os.environ), compact_above=choose_compact_above(os.environ),
                   subagent_model=sub_model, subagent_effort=sub_effort, subagent_context_window=sub_window,
+                  persona=persona, home=home,
                   **({"permission": ui.permission, "on_event": ui.observer} if ui else {}))
+    if persona and not persona_path(persona, home):
+        # Named but not there: say so rather than starting a plain agent that looks like the persona.
+        print(f"No persona named {persona} in {home / 'personas'} (from {persona_source}); "
+              f"starting without one."
+              + (f" Available: {', '.join(available_personas(home))}." if available_personas(home) else ""))
+        agent.set_persona(None)
     # Asked after trust, and never remembered: unlike trusting a folder, this relaxes the rules that
     # protect every run, so it is agreed once per session or not at all.
     if sys.stdin.isatty() and not preapproved:

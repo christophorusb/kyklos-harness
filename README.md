@@ -81,6 +81,7 @@ Kyklos works in the folder you launch it from. Set `WORKSPACE` in `.env` to pin 
 | `COMPACT_ABOVE` | Compact once the conversation passes this many tokens (default 100000) |
 | `MAX_STEPS` | Model turns one request may take (default 50) |
 | `SUBAGENT_MODEL`, `SUBAGENT_EFFORT` | Route subagents to a faster or cheaper model |
+| `KYKLOS_PERSONA` | A persona to start in, from `~/.kyklos/personas/<name>.md` |
 | `KYKLOS_PASS_ENV` | Secret-named variables to let through to commands anyway |
 
 ### Profiles
@@ -119,6 +120,7 @@ kyklos "create fizzbuzz.py and run it"   # one task, then exit
 kyklos --trust "..."                     # trust this folder for one run (for scripts)
 kyklos --model kimi-k3                   # another model for one run (not remembered)
 kyklos --submodel minimax-m3.1-flash     # another subagent model for one run (or 'same')
+kyklos --persona chief                   # adopt a persona prompt layer for one run (or 'off')
 ```
 
 Type `/help` for the commands; Tab completes them.
@@ -131,6 +133,7 @@ Type `/help` for the commands; Tab completes them.
 | `/model [name]` | Pick the model, then its thinking effort. `--refresh` reloads the list |
 | `/effort [level]` | Change the thinking effort for the current model |
 | `/submodel [name\|same]` | Pick a separate model and effort for subagents |
+| `/persona [name\|off]` | Adopt a persona prompt layer from `~/.kyklos/personas`, or switch it off |
 | `/compact` | Shrink the conversation now |
 | `/tokens` | What fills the context window, the session's billed tokens, when compaction hits |
 | `/tools` | The tools the model can call now, and the rules that auto-approve them |
@@ -198,6 +201,8 @@ The `Agent` never prints: it emits events (`model_start`, `tool_call`, `tool_res
 **Scratch space.** `.kyklos/scratch/` is for throwaway scripts; it's inside the workspace so relative imports and dependencies resolve. Writing there needs no approval; *running* a script still asks. It keeps itself out of git without touching your `.gitignore`.
 
 **Project instructions.** An `AGENTS.md` in the workspace is added to the system prompt, like CLAUDE.md or GEMINI.md elsewhere.
+
+**Personas.** A persona is a prompt layer the user chooses — an architect, a read-only auditor — kept as `~/.kyklos/personas/<name>.md` and selected with `--persona`, `/persona` or `KYKLOS_PERSONA`. It is a system-prompt section, so switching mid-session keeps the conversation and only costs the next request; it is re-sent on every step, so the picker shows each one's token size. Read from `~/.kyklos` only, never from the workspace: a persona defines who the agent is, so a checked-out repository must not be able to name one. It goes into the prompt before the guardrails and `AGENTS.md`, which keeps the harness's own rules the last word, and a subagent doesn't inherit it — it gets a charter instead.
 
 **Models and thinking effort.** `/model` opens an arrow-key picker — ↑/↓, type to filter, Enter, Esc — then a second picker offers *that model's own* effort levels:
 
