@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import sys
+import textwrap
 import time
 from collections import deque
 from pathlib import Path
@@ -28,7 +29,8 @@ from rich.theme import Theme
 from kyklos import (BASH_MODE_CAVEAT, BASH_MODE_EXPLANATION, BROAD_WARNING, EXIT, NO_APPROVER_NOTE,
                     COMMANDS, TRUST_EXPLANATION, CommandContext,
                     __version__, apply_permission_answer, denial_note, ensure_private_dir,
-                    error_detail, has_danger, permission_options, run_command, short_tokens)
+                    error_detail, has_danger, has_opaque, permission_options, run_command, sandbox_warning,
+                    short_tokens)
 from tools import ToolError, _match_edit, sanitize_terminal_text
 
 BASH_FULL_OUTPUT_LINES = 8  # bash output up to this many lines is shown in full; longer shows the last 3
@@ -60,6 +62,11 @@ UNICODE = {"run": "○", "done": "●", "fail": "✗", "denied": "⊘", "compact
 ASCII = {"run": "o", "done": "*", "fail": "x", "denied": "-", "compact": "~", "retry": "r", "prompt": ">",
          "tee": "|", "elbow": "`", "pipe": "|", "dot": "-", "arrow": "->", "on": "#", "off": ".", "rim": "|",
          "rule": "-", "minus": "-", "ellipsis": "..."}
+# How much of a forming answer the live zone shows. The zone has to stay shorter than the terminal,
+# and a tail is the honest shape for it: the top of a long answer scrolling past unreadably is the
+# thing the plan/stage design exists to avoid. The whole answer arrives a moment later, in its box.
+ANSWER_PREVIEW_LINES = 8
+
 BUBBLE = [("·", "deep"), ("∘", "sky"), ("○", "sky"), ("◯", "aqua"), ("○", "sky"), ("∘", "sky")]
 ASCII_BUBBLE = [(".", "deep"), ("o", "sky"), ("O", "aqua"), ("o", "sky")]
 
@@ -94,7 +101,17 @@ class AeroHeading(Heading):
 
 
 class AeroMarkdown(Markdown):
+    """Markdown with terminal escapes taken out of the source before Rich sees it.
+
+    Everything drawn through this is model text -- the answer, the notes between tool calls -- and
+    the model writes what the files and pages it read tell it to. Rich passes ESC through untouched:
+    tested, an OSC 52 clipboard write, an OSC 8 link and `ESC[2J` all reached the terminal intact
+    from both Markdown and Text. Cleaning here, once, means no caller can forget to.
+    """
     elements = {**Markdown.elements, "heading_open": AeroHeading}
+
+    def __init__(self, markup: str, *args, **kwargs):
+        super().__init__(sanitize_terminal_text(markup), *args, **kwargs)
 
 
 # ---- color helpers -------------------------------------------------------------------------
@@ -360,6 +377,7 @@ class AeroUI:
         self.turn_tools = 0
         self._plan: list[str] = []     # the steps the model posted, in order
         self._plan_active = 0          # the 1-based step in progress, 0 when the plan is finished
+        self._answer = ""              # the depth-0 reply streaming in, for the live zone only
 
     # -- layout helpers --
 
@@ -441,6 +459,7 @@ class AeroUI:
         self._running.clear()
         self._pending.clear()
         self._subs.clear()
+        self._answer = ""
 
     def _running_row(self, entry: tuple) -> tuple:
         """(left, right) for a tool that's still running, with a timer once it passes a second,
@@ -498,10 +517,13 @@ class AeroUI:
         if 0 in self._thinking and not self._subs:
             start, purpose = self._thinking[0]
             glyph, color = self._bubble()
-            what = "compacting context" if purpose == "summary" else "thinking"
+            # Once text is arriving, "thinking" is the wrong word for what the wait is.
+            what = "compacting context" if purpose == "summary" else \
+                ("answering" if self._answer else "thinking")
             rows.append(Text("  ") + Text(glyph, style=color) +
                         Text(f" {what} {self.g['dot']} {int(time.monotonic() - start)}s "
                              f"{self.g['dot']} ctrl+c to interrupt", style="frost"))
+            rows.extend(self._answer_preview())
         if self._turn_active and self.agent:  # the status line the prompt's toolbar shows while idle
             rows.append(self.status_text(self.agent))
         return Group(*rows)
@@ -516,9 +538,43 @@ class AeroUI:
 
     def _on_model_start(self, depth, purpose="turn", **_):
         self._thinking[depth] = (time.monotonic(), purpose)
+        if depth == 0:
+            self._answer = ""
 
     def _on_model_end(self, depth, **_):
         self._thinking.pop(depth, None)
+        # Dropped as the reply lands: what happens next is either `answer()` printing the box or
+        # tool rows scrolling past, and neither should sit under a copy of the text.
+        if depth == 0:
+            self._answer = ""
+
+    def _answer_preview(self) -> list:
+        """The reply forming, as a bounded tail of plain text.
+
+        Plain text, not Markdown: half an answer is half a document -- an unclosed fence, a table
+        with one row -- and rendering it would reflow the zone on every chunk. The styled version
+        arrives a moment later from `answer()`, which is also why nothing here is ever committed:
+        the live zone is transient, so a retry that re-streams the same reply redraws rather than
+        appending, and a partial from a connection that died is simply erased.
+        """
+        body = sanitize_terminal_text(self._answer).strip()  # drawn raw, before answer() cleans it
+        if not body:
+            return []
+        lines = []
+        for paragraph in body.splitlines():
+            lines.extend(textwrap.wrap(paragraph, max(20, self.width - 8)) or [""])
+        tail = lines[-ANSWER_PREVIEW_LINES:]
+        rows = [Text(f"    {line}", style="frost") for line in tail]
+        if len(lines) > len(tail):  # say that the top is missing rather than implying this is all
+            rows.insert(0, Text(f"    {self.g['ellipsis']}", style="deep"))
+        return rows
+
+    def _on_answer_delta(self, depth, text="", **_):
+        """Assistant content as it streams. Buffered for the live zone and nothing else: whether it
+        turns out to be the answer or a note before a tool call is not known until the reply ends,
+        and both are drawn properly then -- by `answer()` or by `_on_thought`."""
+        if depth == 0:
+            self._answer += text
 
     def _on_thought(self, depth, text="", **_):
         """Progress notes the model writes between tool calls: a kyklos box with a deep border and frost text,
@@ -628,6 +684,12 @@ class AeroUI:
         what = f"cleared {_plural(pruned, 'old tool result')}" if stage == "pruned" else "summarized older turns"
         self.print(Text(f"{self.g['compact']} context compacted: {what}, ~{before:,} {self.g['arrow']} ~{after:,} tokens",
                         style="frost"), indent=2 + 4 * depth)
+
+    def _on_notice(self, depth, text="", **_):
+        """A standing caveat about this session rather than a step in it: printed once, where the
+        agent raised it, because it changes how the numbers on screen should be read."""
+        if text.strip():
+            self.print(Text(f"{self.g['dot']} {text.strip()}", style="sun"), indent=2 + 4 * depth)
 
     def _on_retry(self, depth, error="", delay=0, attempt=0, max_attempts=0, **_):
         short = error.splitlines()[0][:200] if error else "error"
@@ -760,6 +822,7 @@ class AeroUI:
         indent = 2 + 4 * depth
         touches_secret, prefix, findings = permission_options(name, args)
         danger = has_danger(findings)
+        opaque = has_opaque(findings)  # "can't tell what this does": asks every time, no blanket grant
         width = self.width - indent
         body = []
         title = Text(f"Allow {name}?", style="bold")
@@ -787,7 +850,7 @@ class AeroUI:
         keys = [("y", "yes"), ("n", "no")]
         if prefix:
             keys.append(("p", f"prefix '{prefix}'"))
-        if not touches_secret and not danger:
+        if not touches_secret and not danger and not opaque:
             keys.append(("a", f"always {name}"))
         choices = Text()
         for i, (k, label) in enumerate(keys):
@@ -816,7 +879,7 @@ class AeroUI:
         if key == "p":
             custom = self.edit_line("  prefix: ", default=prefix).strip()
             answer = f"p {custom}" if custom else "p"
-        if apply_permission_answer(name, answer, always_allowed, touches_secret, prefix, danger):
+        if apply_permission_answer(name, answer, always_allowed, touches_secret, prefix, danger, opaque):
             how = {"y": "allowed once", "a": f"allowed {name} for this session",
                    "p": f"allowed commands starting with '{answer[2:].strip() or prefix}'"}[key]
             self.print(Text(f"{self.g['arrow']} {how}", style="frost"), indent=indent + 2)
@@ -935,6 +998,9 @@ class AeroUI:
             choices += Text(k, style="bold sun") + Text(f" {label}")
         body = [Text(BASH_MODE_EXPLANATION, style="frost"), Text(""),
                 Text(f"! {BASH_MODE_CAVEAT}", style="sun")]
+        warning = sandbox_warning()
+        if warning:  # said where the choice is made, since an unconfined host is what it changes
+            body += [Text(""), Text(f"! {warning}", style="coral")]
         self.print()
         self.print(Panel(Group(*body, Text(""), choices),
                          title=Text("How should bash commands be approved?", style="bold"),
@@ -1071,12 +1137,16 @@ class AeroUI:
             meta += f"  {dot}  AGENTS.md loaded"
         self.print(Text(" ") + Text(self.g["run"], style="aqua") + Text(" ") + word + Text(meta, style="frost"))
         self.print(Text(f"   /help for commands {dot} ctrl+c to interrupt", style="frost"))
+        warning = sandbox_warning()
+        if warning:  # stays in scrollback for the session, after the startup choice has scrolled away
+            self.print(Text(f"! {warning}", style="coral"), indent=2)
         self.print()
 
     def say(self, kind: str, text: str) -> None:
         style = {"info": "frost", "ok": "mint", "warn": "sun", "error": "coral"}.get(kind, "frost")
         prefix = {"ok": self.g["done"] + " ", "error": self.g["fail"] + " ", "warn": "! "}.get(kind, "")
-        self.print(Text(prefix + text, style=style), indent=2)
+        # Carries text from outside too: a provider's error body, a file name, a model id.
+        self.print(Text(prefix + sanitize_terminal_text(text), style=style), indent=2)
 
     def answer(self, text: str, footer: Text = None) -> None:
         """The final answer: rendered Markdown in a sky-bordered kyklos box, with the turn's stats

@@ -19,6 +19,12 @@ from pathlib import Path
 MAX_OUTPUT_CHARS = 20_000  # keep tool results from flooding the context window
 MAX_SEARCH_RESULTS = 200
 MAX_SEARCH_FILE_BYTES = 2_000_000
+# Above this, read_file streams to the requested window instead of loading the file: a 1 GB dump
+# read whole would hold the harness's memory for a slice of 2000 lines.
+MAX_READ_WHOLE_BYTES = 10_000_000
+# A model asked for an hour once, and a day is a valid integer. Ten minutes is longer than any
+# test or build Kyklos should wait on in the foreground; Ctrl+C still ends one sooner.
+MAX_BASH_TIMEOUT = 600
 MAX_PLAN_STEPS = 12  # a plan longer than this is a transcript, not a shape the user can hold
 # A step is model-written text that goes straight to the terminal, where an escape sequence is an
 # instruction: recolour the screen, set the window title, or leave an unterminated OSC that eats
@@ -59,7 +65,11 @@ SHELL_NAME = "PowerShell" if IS_WINDOWS else "bash"
 # Commands must not inherit Kyklos's own settings (its API key) or anything named like a secret,
 # and secret values must not reach the model or the screen through tool output.
 SECRET_ENV_NAME_RE = re.compile(
-    r"(^|_)(API_?|ACCESS_?|SECRET_?|PRIVATE_?)?KEY($|_)|TOKEN|SECRET|PASSW(OR)?D|CREDENTIAL", re.IGNORECASE)
+    r"(^|_)(API_?|ACCESS_?|SECRET_?|PRIVATE_?)?KEY($|_)|TOKEN|SECRET|PASSW(OR)?D|CREDENTIAL"
+    # A header value (HTTP_AUTHORIZATION, NPM_CONFIG__AUTH), a Sentry DSN, a session cookie: secrets
+    # named for what they are used for rather than for being secret. Anchored at the end, so
+    # FIREBASE_AUTH_DOMAIN and GIT_AUTHOR_NAME stay what they are.
+    r"|(^|_)(AUTH|AUTHORIZATION|DSN|COOKIE)$", re.IGNORECASE)
 HIDDEN_ENV_NAMES: set[str] = set()  # names from Kyklos's .env; filled by hide_env_names() at startup
 MIN_SECRET_VALUE_LEN = 8  # shorter values ("true", "1") would redact ordinary text
 REDACTED = "[REDACTED]"
@@ -77,9 +87,17 @@ SECRET_VALUE_PATTERNS = [
     re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),  # JWTs
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)"),
 ]
-URI_PASSWORD_RE = re.compile(
-    r"\b((?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqp|amqps)://[^/\s:@]*:)([^@\s/]{4,})(@)"
-)
+# Credentials carried in a URL. Any scheme: a list of database schemes missed `https://user:pass@`,
+# `mssql://`, `clickhouse://` and the rest, and a password in a URL is a password whatever follows.
+URI_PASSWORD_RE = re.compile(r"\b([a-z][a-z0-9+.-]*://[^/\s:@]*:)([^@\s/]{4,})(@)", re.IGNORECASE)
+# A long token standing alone as the user part: a Sentry DSN (https://<key>@o1.ingest.sentry.io/1),
+# or `https://<token>@github.com/...` as CI scripts write it.
+URI_TOKEN_USER_RE = re.compile(r"\b([a-z][a-z0-9+.-]*://)([A-Za-z0-9_-]{20,})(@)", re.IGNORECASE)
+AUTH_HEADER_RE = re.compile(r"\b(authorization:\s*(?:basic|bearer|token)\s+)([^\s\"'`]{8,})()", re.IGNORECASE)
+# A digit is required, so prose ("bearer authentication") is left alone: real tokens nearly always have one.
+BEARER_RE = re.compile(r"\b(bearer\s+)((?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/=-]{16,})()", re.IGNORECASE)
+# Each is (keep, secret, keep): only the middle is redacted, so the output still says what it was.
+CONTEXT_SECRET_PATTERNS = (URI_PASSWORD_RE, URI_TOKEN_USER_RE, AUTH_HEADER_RE, BEARER_RE)
 
 
 def kill_process_tree(process: subprocess.Popen) -> None:
@@ -106,13 +124,19 @@ def is_secret_env_name(name: str) -> bool:
     return bool(SECRET_ENV_NAME_RE.search(name))
 
 
+def is_secret_env(name: str, value: str = "") -> bool:
+    """Secret by its name, or by what it holds: DATABASE_URL is an ordinary name until its value is
+    postgres://app:hunter2@db. Judging the value keeps a password-less local URL usable by tests."""
+    return is_secret_env_name(name) or bool(URI_PASSWORD_RE.search(value) or URI_TOKEN_USER_RE.search(value))
+
+
 def child_env(base=None) -> dict:
     """The environment for commands: everything except Kyklos's .env settings and secret-named variables.
     KYKLOS_PASS_ENV=GITHUB_TOKEN,NPM_TOKEN lets chosen ones through on purpose."""
     base = os.environ if base is None else base
     passthrough = {n.strip().upper() for n in base.get("KYKLOS_PASS_ENV", "").split(",") if n.strip()}
     env = {k: v for k, v in base.items()
-           if k.upper() in passthrough or (k.upper() not in HIDDEN_ENV_NAMES and not is_secret_env_name(k))}
+           if k.upper() in passthrough or (k.upper() not in HIDDEN_ENV_NAMES and not is_secret_env(k, v))}
     env["GIT_TERMINAL_PROMPT"] = "0"  # git fails instead of asking for credentials
     return env
 
@@ -121,7 +145,7 @@ def known_secret_values(base=None) -> list[str]:
     """Values of secret-named variables (like Kyklos's API_KEY), longest first, so they can be redacted
     exactly, whatever their format."""
     base = os.environ if base is None else base
-    values = {v for k, v in base.items() if is_secret_env_name(k) and len(v) >= MIN_SECRET_VALUE_LEN}
+    values = {v for k, v in base.items() if is_secret_env(k, v) and len(v) >= MIN_SECRET_VALUE_LEN}
     return sorted(values, key=len, reverse=True)
 
 
@@ -160,7 +184,7 @@ def workspace_secret_values(workspace: Path | None) -> list[str]:
                     line = line[7:].strip()
                 key, val = line.split("=", 1)
                 key, val = key.strip(), val.strip().strip('"').strip("'")
-                if is_secret_env_name(key) and len(val) >= MIN_SECRET_VALUE_LEN:
+                if is_secret_env(key, val) and len(val) >= MIN_SECRET_VALUE_LEN:
                     values.add(val)
                 for m in URI_PASSWORD_RE.finditer(val):
                     if len(m.group(2)) >= 4 and m.group(2) != REDACTED:
@@ -185,14 +209,15 @@ def scrub_secrets(text: str, values=None, workspace: Path | None = None) -> tupl
         text, n = pattern.subn(REDACTED, text)
         count += n
 
-    def _redact_uri(match: re.Match) -> str:
+    def _redact_middle(match: re.Match) -> str:
         nonlocal count
         if match.group(2) == REDACTED:
             return match.group(0)
         count += 1
         return f"{match.group(1)}{REDACTED}{match.group(3)}"
 
-    text = URI_PASSWORD_RE.sub(_redact_uri, text)
+    for pattern in CONTEXT_SECRET_PATTERNS:
+        text = pattern.sub(_redact_middle, text)
     return text, count
 
 
@@ -549,9 +574,20 @@ def repository_map(workspace: Path, budget_tokens: int = MAP_TOKEN_BUDGET) -> st
 # ---- OS-level kernel sandboxing for bash (macOS Seatbelt / Linux bubblewrap) ----------------
 # Regex parsing is an aid to reading, never a security boundary. Where the OS gives us a real
 # kernel boundary without root or third-party dependencies, wrap child commands in it:
-#   - writes confined to the workspace (excluding .git/hooks), /tmp, and standard caches
+#   - writes confined to the workspace (excluding .git/hooks, .git/config and the files in
+#     SANDBOX_PROTECTED_WORKSPACE_FILES), /tmp, and standard caches
 #   - reads blocked on credential stores (~/.ssh, ~/.aws, Keychains, browser profiles, ~/.kyklos)
 #   - network denied by default unless the user explicitly approved a network/installer command
+
+# Workspace files bash may not write, even though the rest of the workspace is writable. Each one
+# makes something run later, outside the sandbox: AGENTS.md and GUARDRAILS.md steer every future
+# session, and .git/config is as strong as .git/hooks -- core.fsmonitor, core.pager, core.hooksPath
+# and aliases are commands that the user's own `git status` runs, unconfined, the next time they
+# type it. Protecting the hooks folder while leaving the file that can relocate it was half a lock.
+# Workspace folders bash may not write into, for the same reason: hooks, and editor tasks that run on open.
+SANDBOX_PROTECTED_WORKSPACE_DIRS = (".git/hooks", ".husky", ".vscode")
+SANDBOX_PROTECTED_WORKSPACE_FILES = ("AGENTS.md", "GUARDRAILS.md", ".gitmodules", ".pre-commit-config.yaml",
+                                     ".pre-commit-config.yml", ".git/config")
 
 SANDBOX_PROTECTED_HOME_DIRS = (
     ".ssh", ".aws", ".gnupg", ".kube", ".docker", ".kyklos",
@@ -561,10 +597,20 @@ SANDBOX_PROTECTED_HOME_DIRS = (
     "Library/Application Support/Firefox",
     "Library/Application Support/Arc",
     "Library/Application Support/BraveSoftware",
+    # Token stores of the CLIs a developer is already signed in to. These are what an install-time
+    # payload goes for first -- the Miasma npm worm (June 2026) took GitHub, GCP, Azure and Vault
+    # tokens and password-manager stores -- and an open network during installs is what lets the
+    # theft leave. Nothing in a build or a test run needs them.
+    ".config/gh", ".config/gcloud", ".azure",
+    ".config/op", ".op", ".password-store", ".config/gopass", ".local/share/gopass",
 )
 SANDBOX_PROTECTED_HOME_FILES = (
     ".netrc", ".npmrc", ".pypirc", ".git-credentials", ".pgpass", ".my.cnf",
     ".zsh_history", ".bash_history",
+    # Registry and secret-manager tokens: Vault, RubyGems, crates.io, Terraform Cloud, the XDG
+    # git credential store, and yarn's rc, which carries `npmAuthToken` the way ~/.npmrc does.
+    ".vault-token", ".gem/credentials", ".cargo/credentials", ".cargo/credentials.toml",
+    ".terraform.d/credentials.tfrc.json", ".config/git/credentials", ".yarnrc.yml",
 )
 # The folders holding the user's own documents rather than any project's code. Nothing in a build
 # or a test suite reads these, so denying them costs nothing and closes the pair that makes a
@@ -585,7 +631,121 @@ SANDBOX_SCRATCH_ROOTS = (
 # What a kernel refusal looks like by the time it reaches stderr. The kernel does not sign its work,
 # so a denied write reads exactly like a permissions problem on the host -- which is how a model ends
 # up blaming macOS, asking for sudo, or asking the user to loosen something (SEC-12).
-SANDBOX_DENIAL_SIGNATURES = ("operation not permitted", "permission denied", "not permitted")
+SANDBOX_DENIAL_SIGNATURES = ("operation not permitted", "permission denied", "not permitted",
+                             "read-only file system",  # how a bubblewrap read-only bind refuses
+                             "err_access_denied")  # Chrome's name for the same refusal on a connect
+# Words that say a denial was about a port rather than a file, so the hint can name the right wall.
+SANDBOX_NETWORK_SIGNATURES = ("listen", "bind", "connect", "socket", "err_access_denied")
+
+# Why a tool that needs the macOS Keychain misbehaves in the sandbox, and what to do about it. The
+# profile hides ~/Library/Keychains on purpose, so a process that goes looking for it does not find
+# it -- and macOS answers that with a "Keychain Not Found" dialog on the user's screen, whose button
+# offers to "Reset To Defaults" a keychain that is not missing. A test run that launched Chrome by
+# hand under the sandbox raised one: the system log shows the Chrome process calling the Keychain
+# APIs and SecurityAgent, which draws the dialog, starting 0.04s later. The Chrome runs that hung
+# beside it are consistent with a dialog nobody answered, which was not confirmed with the flags in
+# place. Playwright passes both flags by default (read in its source), so it does not hit this.
+SANDBOX_KEYCHAIN_ADVICE = (
+    "this sandbox hides ~/Library/Keychains on purpose, so a tool that needs the Keychain cannot find it, "
+    "and macOS may put a 'Keychain Not Found' dialog on the user's screen. Do not retry it unchanged: a "
+    "repeat can raise another. Have the tool avoid the Keychain (Chrome and Chromium: --use-mock-keychain "
+    "--password-store=basic, which Playwright already passes) or tell the user to run it outside Kyklos. "
+    "If a dialog appeared, the user should click Cancel, never 'Reset To Defaults': nothing is missing.")
+# Flags that mean Chrome was started by hand rather than by a test framework, which sets its own.
+CHROME_DIRECT_FLAGS = ("--headless", "--dump-dom", "--screenshot", "--print-to-pdf", "--remote-debugging",
+                       "--user-data-dir")
+
+
+def _chrome_without_mock_keychain(command: str) -> bool:
+    """True for a command that starts Chrome or Chromium directly and does not ask it to leave the
+    Keychain alone. A heuristic on the command text: it only decides whether to add a sentence to a
+    timeout message, so being wrong costs a line, not a decision."""
+    low = command.lower()
+    return ("chrom" in low and any(flag in low for flag in CHROME_DIRECT_FLAGS)
+            and "--use-mock-keychain" not in low)
+
+# Localhost ports a command may bind and use while the rest of the network stays off (macOS). Off by
+# default and chosen by the user for the run: KYKLOS_SANDBOX_PORTS=5173,4173. A dev server, or a
+# browser test run against one, needs it -- the profile otherwise denies all networking, loopback
+# included, so even `bind` on 127.0.0.1 fails with EPERM.
+#
+# A list of single ports rather than "all of loopback", because loopback is shared with everything
+# else on the machine. Tested against the real sandbox: opening it wholesale lets a command reach a
+# listener outside the sandbox -- a database, a debug port, a local proxy that relays to the
+# internet -- while a listed port reaches nothing but itself. Not a range, because SBPL rejects one
+# ("invalid port in network address"). Not below 1024, where the machine's own services live: an
+# `ssh localhost` with a forwarded agent is not something to opt into with a typo.
+#
+# The second setting, KYKLOS_SANDBOX_CONNECT=5173, is the same list with the listening taken out: a
+# command may connect to a localhost port, and nothing in the sandbox may bind or accept on any. For
+# a server the user runs in their own terminal, and a browser test or `curl` that talks to it, that
+# is all that is needed, and it exposes nothing -- there is no listener in the sandbox to reach.
+# One rule per port, `network-outbound` to localhost:PORT. Tested on the real sandbox: it carries a
+# whole request and reply (a second rule for the reply direction added nothing), covers a server
+# bound to ::1 only as well as 127.0.0.1 (Vite's `localhost` is often the former), runs Chrome
+# against it, and leaves every bind refused.
+SANDBOX_PORTS_ENV = "KYKLOS_SANDBOX_PORTS"
+SANDBOX_CONNECT_ENV = "KYKLOS_SANDBOX_CONNECT"
+SANDBOX_MIN_PORT, SANDBOX_MAX_PORT = 1024, 65535
+SANDBOX_MAX_LOOPBACK_PORTS = 16  # narrow by construction: a project has a handful of servers, not a hundred
+
+
+def parse_sandbox_ports(raw: str | None) -> tuple[list[int], list[str]]:
+    """(ports, problems) from a KYKLOS_SANDBOX_PORTS or KYKLOS_SANDBOX_CONNECT value such as "5173, 4173".
+
+    Anything that is not one plain port from 1024 up is left out and named in `problems`, never
+    guessed at. These settings open a hole in the sandbox, so a typo has to close it rather than
+    widen it: "5173-5180" opens nothing, and the problem says why.
+    """
+    ports: list[int] = []
+    problems: list[str] = []
+    for token in re.split(r"[,\s]+", (raw or "").strip()):
+        if not token:
+            continue
+        if not re.fullmatch(r"\d{1,5}", token):
+            problems.append(f"{token!r} is not a single port number (ranges are not supported)")
+            continue
+        port = int(token)
+        if port < SANDBOX_MIN_PORT:
+            problems.append(f"{port} is below {SANDBOX_MIN_PORT}, where the machine's own services listen")
+        elif port > SANDBOX_MAX_PORT:
+            problems.append(f"{port} is not a port number")
+        elif port in ports:
+            continue
+        elif len(ports) >= SANDBOX_MAX_LOOPBACK_PORTS:
+            problems.append(f"{port} is past the limit of {SANDBOX_MAX_LOOPBACK_PORTS} ports")
+        else:
+            ports.append(port)
+    return sorted(ports), problems
+
+
+def sandbox_port_settings(env=None) -> tuple[list[int], list[int], list[str]]:
+    """(listen, connect_only, problems) from the two settings.
+
+    `listen` ports may run a server and be connected to; `connect_only` ports may only be connected
+    to, and leave out any port already in `listen`, which has that and more. `problems` name the
+    entries that were dropped, each prefixed with the variable it came from.
+    """
+    source = os.environ if env is None else env
+    listen, bad_listen = parse_sandbox_ports(source.get(SANDBOX_PORTS_ENV))
+    connect, bad_connect = parse_sandbox_ports(source.get(SANDBOX_CONNECT_ENV))
+    problems = ([f"{SANDBOX_PORTS_ENV}: {p}" for p in bad_listen]
+                + [f"{SANDBOX_CONNECT_ENV}: {p}" for p in bad_connect])
+    return listen, [p for p in connect if p not in listen], problems
+
+
+def sandbox_loopback_ports(env=None) -> list[int]:
+    """The localhost ports the user opened for a server to run on. Only the macOS seatbelt backend uses them."""
+    return sandbox_port_settings(env)[0]
+
+
+def sandbox_connect_ports(env=None) -> list[int]:
+    """The localhost ports the user opened for connecting only, to a server they run outside Kyklos."""
+    return sandbox_port_settings(env)[1]
+
+
+def _is_loopback_port(port) -> bool:
+    return isinstance(port, int) and not isinstance(port, bool) and SANDBOX_MIN_PORT <= port <= SANDBOX_MAX_PORT
 
 
 def _sbpl_quote(path: str) -> str:
@@ -613,9 +773,33 @@ def _workspace_inside(workspace: Path, target: Path) -> bool:
         return False
 
 
+def _personal_ancestors(workspace: Path, ws: Path, home_dir: Path) -> list[str]:
+    """Folders above the workspace that sit inside a protected personal folder, in both spellings.
+
+    These are the directories the read-deny covers but the workspace allow-back does not: for
+    ~/Desktop/agentic-projects/app they are ~/Desktop and ~/Desktop/agentic-projects. ~ and /Users
+    are not denied, so they are not listed. Checked against the path as given and as resolved, since
+    a process may walk either one.
+    """
+    personal = [home_dir / rel for rel in SANDBOX_PROTECTED_PERSONAL_DIRS]
+    out: list[str] = []
+    for base in (workspace.absolute(), ws):
+        for anc in base.parents:
+            if any(_workspace_inside(anc, p) for p in personal):
+                for v in _canonical_variants(anc):
+                    if v not in out:
+                        out.append(v)
+    return out
+
+
 def seatbelt_profile(workspace: Path, allow_network: bool = False, home: Path | None = None,
-                     allow_scratch_exec: bool = False) -> str:
-    """macOS sandbox-exec (SBPL v1) profile confining writes, execution, credential reads, and network."""
+                     allow_scratch_exec: bool = False, loopback_ports=(), connect_ports=()) -> str:
+    """macOS sandbox-exec (SBPL v1) profile confining writes, execution, credential reads, and network.
+
+    `loopback_ports` are localhost ports opened for a server to run on, `connect_ports` ones opened
+    for connecting to a server that runs outside (see SANDBOX_PORTS_ENV and SANDBOX_CONNECT_ENV), in
+    an otherwise network-less profile. Anything that is not an int in 1024-65535 is dropped here as
+    well, so a caller that skipped the parsing still cannot put a stray string into the profile."""
     ws = workspace.resolve()
     home_dir = (home or Path.home()).resolve()
     writable_subpaths: list[str] = []
@@ -638,10 +822,17 @@ def seatbelt_profile(workspace: Path, allow_network: bool = False, home: Path | 
     lines.append('  (subpath "/dev/fd"))')
 
     # Keep git hooks and repo persistence targets kernel-read-only inside bash.
-    for rel_ro in (".git/hooks", ".husky", ".vscode"):
+    for rel_ro in SANDBOX_PROTECTED_WORKSPACE_DIRS:
         for v in _canonical_variants(ws / rel_ro):
             lines.append(f"(deny file-write* (subpath {_sbpl_quote(v)}))")
-    for rel_file in ("AGENTS.md", "GUARDRAILS.md", ".gitmodules", ".pre-commit-config.yaml", ".pre-commit-config.yml"):
+    # The rules above and below name paths, and a path is only as fixed as its parents. Tested:
+    # `mv .git .g` succeeded under both, after which .g/config and .g/hooks matched no rule, and
+    # `mv .g .git` put a planted hook back where git runs it. The .git entry itself (directory, or
+    # the `gitdir:` file of a worktree) may not be renamed, removed or created; what is inside it
+    # stays writable, which is what commits, branches and fetches need.
+    for v in _canonical_variants(ws / ".git"):
+        lines.append(f"(deny file-write* (literal {_sbpl_quote(v)}))")
+    for rel_file in SANDBOX_PROTECTED_WORKSPACE_FILES:
         for v in _canonical_variants(ws / rel_file):
             lines.append(f"(deny file-write* (literal {_sbpl_quote(v)}))")
 
@@ -675,6 +866,13 @@ def seatbelt_profile(workspace: Path, allow_network: bool = False, home: Path | 
         lines.append(")")
         for v in _canonical_variants(ws):
             lines.append(f"(allow file-read* (subpath {_sbpl_quote(v)}))")
+        # Allowing the workspace back is not enough on its own. realpath() lstat()s every ancestor
+        # of a path, so with ~/Desktop denied, `lstat ~/Desktop` fails with EPERM and Node's
+        # `fs.realpathSync` -- which runs on every entry script -- dies before reading a byte of
+        # its own project. Metadata only, and literal only: that says the workspace's parent
+        # folders exist, which the workspace path already says, and neither lists nor reads them.
+        for v in _personal_ancestors(workspace, ws, home_dir):
+            lines.append(f"(allow file-read-metadata (literal {_sbpl_quote(v)}))")
 
     deny_reads: list[str] = []
     for rel_dir in SANDBOX_PROTECTED_HOME_DIRS:
@@ -700,6 +898,27 @@ def seatbelt_profile(workspace: Path, allow_network: bool = False, home: Path | 
             "(allow network* (local unix-socket))",
             "(allow network-outbound (remote unix-socket))",
         ])
+        # One trio per listed port: listen on it, accept on it, connect to it. What this keeps out is
+        # every other port, and every other host as a destination. What it does NOT do is keep a
+        # server on loopback. The grammar takes only `*` or `localhost` as a host (no IP literals),
+        # and for a listening socket `localhost` matches every local address, so a server that binds
+        # 0.0.0.0 or :: -- the Express and `python -m http.server` default -- is reachable from the
+        # network on that port while it runs. Tested, and no rule changes it: denying inbound from
+        # every peer left connections served, because accept() never consults the peer. Only the
+        # server's own bind address decides, so the model is told to use 127.0.0.1.
+        listening = sorted({p for p in loopback_ports if _is_loopback_port(p)})[:SANDBOX_MAX_LOOPBACK_PORTS]
+        for port in listening:
+            lines.extend([
+                f'(allow network-bind (local ip "localhost:{port}"))',
+                f'(allow network-inbound (local ip "localhost:{port}"))',
+                f'(allow network-outbound (remote ip "localhost:{port}"))',
+            ])
+        # Connect only: the one rule, and nothing that can listen. A server the user runs outside
+        # is reachable and nothing in here can open a port of its own, so no network-bind and no
+        # network-inbound -- which is also why this cannot expose anything to the network.
+        connecting = sorted({p for p in connect_ports if _is_loopback_port(p)} - set(listening))
+        for port in connecting[:SANDBOX_MAX_LOOPBACK_PORTS]:
+            lines.append(f'(allow network-outbound (remote ip "localhost:{port}"))')
     return "\n".join(lines)
 
 
@@ -727,11 +946,16 @@ def bwrap_argv(inner_argv: list[str], workspace: Path, allow_network: bool = Fal
         if target.is_dir():
             cmd += ["--tmpfs", str(target)]
     cmd += ["--bind", str(ws), str(ws)]
-    for rel_ro in (".git/hooks", ".husky", ".vscode"):
+    # A mount point cannot be renamed or removed (EBUSY). Binding .git onto itself, writable, is
+    # what stops `mv .git .old && mv .copy .git` from swapping in a directory whose config and hooks
+    # carry none of the read-only binds below. Seatbelt gets the same from a literal deny on .git.
+    if (ws / ".git").is_dir():
+        cmd += ["--bind", str(ws / ".git"), str(ws / ".git")]
+    for rel_ro in SANDBOX_PROTECTED_WORKSPACE_DIRS:
         ro_dir = ws / rel_ro
         if ro_dir.is_dir():
             cmd += ["--ro-bind", str(ro_dir), str(ro_dir)]
-    for rel_file in ("AGENTS.md", "GUARDRAILS.md", ".gitmodules", ".pre-commit-config.yaml", ".pre-commit-config.yml"):
+    for rel_file in SANDBOX_PROTECTED_WORKSPACE_FILES:
         ro_file = ws / rel_file
         if ro_file.is_file():
             cmd += ["--ro-bind", str(ro_file), str(ro_file)]
@@ -793,14 +1017,33 @@ def probe_sandbox(env=None) -> tuple[str, str]:
     return _probe_host_sandbox()
 
 
+def sandbox_status(env=None) -> str:
+    """The sandbox backend's label for `/tools`, plus the localhost ports opened in it.
+
+    A setting that opens a hole in the sandbox should be visible while it is doing something, and
+    when it was ignored: a typo that silently opened nothing would read as the feature not working.
+    """
+    kind, label = probe_sandbox(env=env)
+    if kind != "seatbelt":
+        return label
+    listen, connect, problems = sandbox_port_settings(env)
+    notes = [f"localhost ports {', '.join(map(str, listen))}"] if listen else []
+    if connect:
+        notes.append(f"connect-only ports {', '.join(map(str, connect))}")
+    notes += [f"{problem}, ignored" for problem in problems]
+    return f"{label} ({'; '.join(notes)})" if notes else label
+
+
 def sandbox_argv(inner_argv: list[str], workspace: Path, allow_network: bool = False,
-                 env=None, allow_scratch_exec: bool = False) -> list[str]:
+                 env=None, allow_scratch_exec: bool = False, loopback_ports=(), connect_ports=()) -> list[str]:
     """Wrap `inner_argv` in the active OS kernel sandbox when available."""
     kind, _ = probe_sandbox(env=env)
     if kind == "seatbelt":
         exe = shutil.which("sandbox-exec") or "/usr/bin/sandbox-exec"
         return [exe, "-p", seatbelt_profile(workspace, allow_network=allow_network,
-                                            allow_scratch_exec=allow_scratch_exec), *inner_argv]
+                                            allow_scratch_exec=allow_scratch_exec,
+                                            loopback_ports=loopback_ports,
+                                            connect_ports=connect_ports), *inner_argv]
     if kind == "bwrap":
         # No scratch-exec equivalent here: bubblewrap binds mounts but cannot remount one noexec,
         # so SEC-11 is a seatbelt-only guarantee today. Saying so beats implying parity.
@@ -855,12 +1098,28 @@ class Tools:
         if is_secret_file(p):
             raise ToolError(f"Refusing to read {path}: it likely contains secrets such as API keys. "
                             "If you need to know what settings exist, read the .env.example file instead.")
-        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+        try:
+            size = p.stat().st_size
+            with p.open("rb") as f:
+                head = f.read(8192)
+        except OSError as e:
+            raise ToolError(f"Couldn't read {path}: {e}")
+        if b"\0" in head:  # the same test grep uses; UTF-16 text has NULs too, and is rare in a repo
+            raise ToolError(f"{path} looks binary ({size:,} bytes): as text it would be replacement "
+                            "characters. Inspect it with bash instead (`file`, `xxd | head`, `sqlite3`, `unzip -l`).")
         start = max(offset, 1) - 1
-        chunk = lines[start : start + limit]
+        if size <= MAX_READ_WHOLE_BYTES:
+            lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+            total, chunk = len(lines), lines[start : start + limit]
+        else:  # stream to the window; memory stays at one window, whatever the file's size
+            chunk, total = [], 0
+            with p.open(encoding="utf-8", errors="replace") as f:
+                for total, line in enumerate(f, 1):
+                    if start < total <= start + limit:
+                        chunk.append(line.rstrip("\r\n"))
         numbered = "\n".join(f"{i:>6}\t{line}" for i, line in enumerate(chunk, start + 1))
-        if start + limit < len(lines):
-            numbered += f"\n... ({len(lines) - start - limit} more lines; use offset to read on)"
+        if start + limit < total:
+            numbered += f"\n... ({total - start - limit} more lines; use offset to read on)"
         return self._truncate(numbered or "(empty file)")
 
     def write_file(self, path: str, content: str) -> str:
@@ -908,6 +1167,17 @@ class Tools:
                 raise TypeError(f"bash() got an unexpected keyword argument {unknown[0]!r}")
             if "command" not in args or not isinstance(args["command"], str):
                 raise TypeError("bash() missing 1 required string argument: 'command'")
+            if "timeout" in args:
+                timeout = args["timeout"]
+                if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+                    raise TypeError(f"bash() timeout must be a number of seconds, not {timeout!r}")
+                if not 1 <= timeout <= MAX_BASH_TIMEOUT:
+                    # Refused rather than quietly capped, so the model knows the wait it asked for
+                    # is not the one it would get.
+                    longer = (" For longer work, split it into steps or give the user the command to "
+                              "run in their own terminal." if timeout > MAX_BASH_TIMEOUT else "")
+                    raise ToolError(f"bash timeout must be between 1 and {MAX_BASH_TIMEOUT} seconds "
+                                    f"(got {timeout}).{longer}")
 
     def _rel(self, p: Path) -> str:
         return p.relative_to(self.workspace).as_posix()
@@ -955,15 +1225,21 @@ class Tools:
         patterns = expand_braces(pattern)
         if any(Path(p).is_absolute() or ".." in Path(p).parts for p in patterns):
             raise ToolError("Pattern must be relative to the workspace, without '..'")
-        files = []
+        files, hidden = [], 0
         matches = {m for p in patterns for m in self.workspace.glob(p)}
         for p in sorted(matches):
             if not p.is_file() or SKIP_DIRS.intersection(p.relative_to(self.workspace).parts):
+                continue
+            if is_secret_file(p):  # as read_file and grep already refuse: not even where they are
+                hidden += 1
                 continue
             files.append(self._rel(p))
             if len(files) >= MAX_SEARCH_RESULTS:
                 files.append(f"... (stopped at {MAX_SEARCH_RESULTS} files; narrow the pattern)")
                 break
+        if hidden:  # a count, not names: otherwise "No files matched" would be a lie the model acts on
+            files.append(f"({hidden} matching file{'' if hidden == 1 else 's'} not listed: "
+                         f"{'it' if hidden == 1 else 'they'} likely hold{'s' if hidden == 1 else ''} secrets)")
         return "\n".join(files) or "No files matched."
 
     def _sandbox_note(self, out: str) -> str:
@@ -974,29 +1250,87 @@ class Tools:
         is in the way and reaches for the fix that works on a real OS problem: sudo, or asking the
         user to grant something. Both are worse than the original failure. Saying which wall was hit
         costs one line and removes the reason to go looking for a way around it.
+
+        Two walls that an ordinary job walks into get the way through named as well, because the
+        generic line alone cost a model a turn each time: `git init` copies sample hooks into
+        .git/hooks, which the profile keeps read-only on purpose, and a dev server cannot listen
+        because loopback is off unless the user opened the port.
+
+        A third needs no denial at all to show up: a tool that goes looking for the Keychain fails
+        with its own wording ("the specified keychain could not be found"), so on macOS any output
+        that mentions it gets the explanation, and the warning about the dialog's wrong button.
         """
         kind, label = probe_sandbox()
         if kind not in {"seatbelt", "bwrap"} or not out:
             return ""
         low = out.lower()
-        if not any(sig in low for sig in SANDBOX_DENIAL_SIGNATURES):
+        denied = any(sig in low for sig in SANDBOX_DENIAL_SIGNATURES)
+        keychain = kind == "seatbelt" and "keychain" in low
+        if not denied and not keychain:
             return ""
-        return (f"\n\n[harness] bash runs under {label}. If that was a write outside the workspace "
-                f"or a scratch dir, or running a file from {SANDBOX_SCRATCH_ROOTS[0]} and friends, "
-                "this sandbox refused it -- not the host OS, and not a missing privilege. Escalating "
-                "will not change it: work inside the workspace, or tell the user what has to happen "
-                "outside it and let them do it.")
+        note = f"\n\n[harness] bash runs under {label}."
+        if denied:
+            note += (" If that was a write outside the workspace "
+                     "or a scratch dir, a change to a path the sandbox keeps read-only (.git/hooks, "
+                     ".git/config, .husky, .vscode, AGENTS.md), or running a file from "
+                     f"{SANDBOX_SCRATCH_ROOTS[0]} and friends, this sandbox refused it -- not the host OS, "
+                     "and not a missing privilege.")
+            if ".git/config" in low or "could not write config file" in low:
+                # Settings are what make git run programs (core.fsmonitor, core.hooksPath, aliases),
+                # so they are the user's to change. Commits, branches, merges and tags still work.
+                note += (" Git settings in .git/config are read-only here on purpose: `git config`, "
+                         "`git remote add`, `git push -u` and `git branch -u` cannot change them from inside "
+                         "the sandbox. Commits, branches, merges and tags still work. Give the user the exact "
+                         "command to run in their own terminal, for one-off values use `git -c name=value`, "
+                         "and push with an explicit `git push origin <branch>` instead of setting upstream.")
+            elif ".git" in low and "operation not permitted" in low:
+                note += (" The workspace's .git entry and .git/hooks are read-only here on purpose, so "
+                         "`git init` and `git clone` into the workspace itself fail: ask the user to run "
+                         "`git init` in their own terminal. Cloning into a new subfolder still works.")
+            if any(sig in low for sig in SANDBOX_NETWORK_SIGNATURES):
+                note += self._network_note(kind)
+        if keychain:
+            note += f" If it used the macOS Keychain: {SANDBOX_KEYCHAIN_ADVICE}"
+        return note + (" Escalating will not change it: work inside the workspace, or tell the user what "
+                       "has to happen outside it and let them do it.")
 
-    def _timed_out(self, timeout: int, stdout: str | None, stderr: str | None) -> str:
+    @staticmethod
+    def _network_note(kind: str) -> str:
+        """What to say when a denial reads like a port rather than a file."""
+        if kind != "seatbelt":
+            return (" If it was a network connection: the network is cut off in this sandbox, so tell the "
+                    "user rather than looking for another route.")
+        listen, connect, _ = sandbox_port_settings()
+        opened = []
+        if listen:
+            opened.append(f"Localhost ports open for this run: {', '.join(map(str, listen))}; use one of those, "
+                          "listening on 127.0.0.1 (a server on every interface is reachable from the network).")
+        if connect:
+            opened.append(f"Connect-only localhost ports: {', '.join(map(str, connect))}; the user runs a server "
+                          "there outside Kyklos, and nothing in here can listen.")
+        return (" If it was listening on or connecting to a port: the network is off here, loopback included, "
+                "so a dev server (or a browser test against one) cannot start. "
+                f"{' '.join(opened) or 'No ports are open.'} The user can open specific ones by restarting "
+                f"Kyklos with {SANDBOX_PORTS_ENV}=<port> (the sandbox may run the server) or "
+                f"{SANDBOX_CONNECT_ENV}=<port> (it may only connect to a server the user runs outside "
+                "Kyklos), or run that command themselves outside it.")
+
+    def _timed_out(self, timeout: int, stdout: str | None, stderr: str | None, command: str = "") -> str:
         """What a command managed to say before it hung, kept rather than thrown away.
 
         Discarding it costs more than it looks. A command that prints as it goes has usually done
         most of the work by the time it hangs, and without its output the only way to read the
         numbers it already produced is to run the whole thing again -- which hangs again. Printing
         nothing at all is itself worth saying: that is the shape of a command waiting for input.
+
+        One hang has a cause nobody at the keyboard would guess, so it is named when the command
+        gives it away: Chrome started by hand under the macOS sandbox goes to the Keychain, and the
+        dialog that answers waits for a person. It prints nothing, so no failure hint could catch it.
         """
         note = (f"Command timed out after {timeout}s. If it waits for input, pass the answer as "
                 "a flag instead (e.g. -Force, --yes); if it's just slow, use a larger timeout.")
+        if command and probe_sandbox()[0] == "seatbelt" and _chrome_without_mock_keychain(command):
+            note += f" This command starts Chrome without --use-mock-keychain, and {SANDBOX_KEYCHAIN_ADVICE}"
         out = ((stdout or "") + (stderr or "")).rstrip()
         if not out:
             return f"{note}\nIt printed nothing before it was stopped."
@@ -1018,7 +1352,9 @@ class Tools:
         effective_net = allow_network or os.environ.get("KYKLOS_SANDBOX_NET", "").strip() == "1"
         scratch_exec = os.environ.get("KYKLOS_SANDBOX_EXEC_TMP", "").strip() == "1"
         argv = sandbox_argv(base_argv, self.workspace, allow_network=effective_net,
-                            allow_scratch_exec=scratch_exec)
+                            allow_scratch_exec=scratch_exec, loopback_ports=sandbox_loopback_ports(),
+                            connect_ports=sandbox_connect_ports())
+        watch = self._absent_protected_paths() if probe_sandbox()[0] == "bwrap" else []
         process = subprocess.Popen(
             argv, cwd=self.workspace, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
             text=True, encoding="utf-8", errors="replace", env=child_env(),
@@ -1032,14 +1368,70 @@ class Tools:
                 stdout, stderr = process.communicate()
             except (ValueError, OSError):
                 stdout, stderr = "", ""
-            raise ToolError(self._timed_out(timeout, stdout, stderr))
+            raise ToolError(self._timed_out(timeout, stdout, stderr, command) + self._quarantine(watch))
         except KeyboardInterrupt:  # Ctrl+C: stop everything the command started, then let the turn end
             kill_process_tree(process)
+            self._quarantine(watch)
             raise
         out = (stdout or "") + (stderr or "")
         if process.returncode != 0:
             out += self._sandbox_note(out)
+        out += self._quarantine(watch)
         return self._truncate(f"exit code {process.returncode}\n{out}".rstrip())
+
+    # ---- protected paths that did not exist yet (bubblewrap) ---------------------------------
+    # Seatbelt refuses by path, so a deny on .git/config or AGENTS.md holds whether or not the file
+    # exists. Bubblewrap can only hold an existing file read-only, by binding it onto itself; and a
+    # placeholder bound where a missing one would go is no answer, because bwrap creates the mount
+    # point on the real disk and leaves it there -- every command would litter the repo with empty
+    # AGENTS.md, .gitmodules and .pre-commit-config.yaml files, the last of which breaks pre-commit.
+    # So the protected paths absent before a command are checked after it, and any that appeared
+    # are moved out of the workspace's way. The outcome matches seatbelt's (the path stays absent);
+    # the difference is that it existed while the command ran, which is inside the sandbox anyway.
+
+    def _absent_protected_paths(self) -> list[str]:
+        rels = (".git", *SANDBOX_PROTECTED_WORKSPACE_DIRS, *SANDBOX_PROTECTED_WORKSPACE_FILES)
+        return [rel for rel in rels if not os.path.lexists(self.workspace / rel)]
+
+    def _quarantine(self, absent: list[str]) -> str:
+        """Move the paths in `absent` that a command created into .kyklos/quarantine/, and say so.
+        `.git` comes first, so a repository made by `git init` moves whole, hooks and config with it."""
+        appeared = [rel for rel in absent if os.path.lexists(self.workspace / rel)]
+        if not appeared:
+            return ""
+        import tempfile
+        import time
+        root = self.workspace / ".kyklos" / "quarantine"
+        try:
+            ensure_scratch(self.workspace)  # .kyklos/.gitignore, so none of this reaches git
+            root.mkdir(parents=True, exist_ok=True)
+            batch = Path(tempfile.mkdtemp(prefix=time.strftime("%Y%m%d-%H%M%S-"), dir=root))
+        except OSError as e:
+            return (f"\n\n[harness] This command created {', '.join(appeared)}, which bash may not create, "
+                    f"and Kyklos could not move it aside ({e}). Tell the user.")
+        moved, failed = [], []
+        for rel in appeared:
+            src = self.workspace / rel
+            if not os.path.lexists(src):
+                continue  # went with .git
+            dest = batch / rel
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                os.rename(src, dest)  # same filesystem: a rename, which moves symlinks as links
+                moved.append(rel)
+            except OSError:
+                failed.append(rel)
+        shown = batch.relative_to(self.workspace).as_posix()
+        note = ""
+        if moved:
+            note += (f"\n\n[harness] This command created {', '.join(moved)}, which bash may not create here: "
+                     f"they control git hooks and settings, persistent instructions, or editor tasks. Kyklos "
+                     f"moved {'it' if len(moved) == 1 else 'them'} to {shown}/. If one is really needed, give "
+                     "the user what to create and let them do it.")
+        if failed:
+            note += (f"\n\n[harness] This command also created {', '.join(failed)}, which Kyklos could not move "
+                     "aside. Tell the user.")
+        return note
 
     # ---- the plan ----------------------------------------------------------
     # The one tool that changes nothing: it exists so the model's intent reaches the user as
@@ -1210,8 +1602,8 @@ SCHEMAS = [
                 "type": "object",
                 "properties": {
                     "command": {"type": "string"},
-                    "timeout": {"type": "integer", "description": "Seconds, default 120. Bound a "
-                                "command that might hang with this, not with a shell timeout command."},
+                    "timeout": {"type": "integer", "description": f"Seconds, default 120, at most {MAX_BASH_TIMEOUT}. "
+                                "Bound a command that might hang with this, not with a shell timeout command."},
                 },
                 "required": ["command"],
             },

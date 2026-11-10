@@ -14,8 +14,8 @@ from rich.console import Console
 
 from kyklos import EXIT, Agent, CommandContext, __version__, run_command, wants_aero_ui
 from test_kyklos import FakeClient, TransientAPIError, reply, tool_call
-from ui import (LARGE_WORDMARK_LINES, AeroUI, describe_call, diff_counts, diff_ops, summarize_result,
-                trim_context)
+from ui import (ANSWER_PREVIEW_LINES, LARGE_WORDMARK_LINES, AeroUI, describe_call, diff_counts, diff_ops,
+                summarize_result, trim_context)
 
 WORDMARK_ROW = LARGE_WORDMARK_LINES[1].strip()  # asserted against the real art, so it can't drift
 
@@ -239,6 +239,32 @@ class AeroTurnTests(unittest.TestCase):
         ui.turn(agent, "run tests", self.session)
         self.assertIn("bash:py -m unittest", agent.always_allowed)
         self.assertIn("allowed commands starting with 'py -m unittest'", output(ui))
+
+    def test_opaque_command_is_not_offered_always_and_a_is_ignored(self):
+        """The yellow "can't read" prompt had `a always bash`, which then ran every later unreadable
+        script unasked. The key is gone, so pressing it does nothing and the call stays pending."""
+        ui = make_ui(self.ws, keys=["a", "n"])
+        agent = self.agent(ui, [
+            reply(tool_calls=[tool_call("1", "bash", command='node -e "console.log(1)"')]),
+            reply(content="Denied."),
+        ])
+        ui.turn(agent, "probe", self.session)
+        out = output(ui)
+        self.assertIn("Allow bash?", out)
+        self.assertIn("which Kyklos can't read", out)
+        self.assertNotIn("always bash", out)
+        self.assertEqual(agent.always_allowed, set())
+        self.assertIn("denied", [m for m in agent.messages if m["role"] == "tool"][-1]["content"].lower())
+
+    def test_readable_command_still_offers_always(self):
+        ui = make_ui(self.ws, keys=["a"])
+        agent = self.agent(ui, [
+            reply(tool_calls=[tool_call("1", "bash", command="git status")]),
+            reply(content="Done."),
+        ])
+        ui.turn(agent, "status", self.session)
+        self.assertIn("always bash", output(ui))
+        self.assertEqual(agent.always_allowed, {"bash"})
 
     def test_no_keyboard_denies(self):
         ui = make_ui(self.ws)  # read_key returns None
@@ -703,12 +729,154 @@ class SecurityUITests(unittest.TestCase):
         self.assertIn("hidden", res_out)
         self.assertIn("shown", res_out)
 
+    # A clipboard write, a link whose target is not its text, and a screen clear: what a prompt
+    # injection in a file the model read would ask it to repeat. Checked in the raw bytes written to
+    # the terminal, since export_text() is not what the terminal receives.
+    ESCAPES = "a\x1b]52;c;cHduZWQ=\x07b \x1b]8;;https://evil.example\x1b\\docs\x1b]8;;\x1b\\ c\x1b[2Jd\x9b2J"
+    SEQUENCES = ("\x1b]52", "\x1b]8;;https://evil", "\x1b[2J", "\x9b")
+
+    def assert_no_escapes(self, raw: str):
+        for seq in self.SEQUENCES:
+            self.assertNotIn(seq, raw)
+
+    def test_the_answer_and_the_notes_between_tool_calls_cannot_write_escapes(self):
+        ui = make_ui(self.ws)
+        agent = Agent(FakeClient([
+            reply(content=f"Note {self.ESCAPES}", tool_calls=[tool_call("1", "glob", pattern="*.py")]),
+            reply(content=f"# Done\n\nAnswer {self.ESCAPES}"),
+        ]), "fake", self.ws, permission=ui.permission, on_event=ui.observer)
+        ui.turn(agent, "go", self.ws / "last.jsonl")
+        raw = ui.console.file.getvalue()
+        self.assert_no_escapes(raw)
+        out = output(ui)
+        self.assertIn("Note ab", out)  # only the sequence goes; the text around it survives
+        self.assertIn("docs", out)
+        self.assertIn("Answer", out)
+
+    def test_the_live_preview_cannot_write_escapes(self):
+        ui = make_ui(self.ws)
+        ui.observer("model_start", depth=0, purpose="turn")
+        ui.observer("answer_delta", depth=0, text=f"partial {self.ESCAPES}")
+        live = "".join(r.plain for r in ui._render_live().renderables)
+        self.assert_no_escapes(live)
+        self.assertIn("partial ab", live)
+
+    def test_say_cannot_write_escapes(self):
+        """say() carries text Kyklos did not write: a provider's error body, a file name, a model id."""
+        ui = make_ui(self.ws)
+        ui.say("error", f"API error: {self.ESCAPES}")
+        self.assert_no_escapes(ui.console.file.getvalue())
+        self.assertIn("API error: ab", output(ui))
+
+    def test_an_unconfined_host_is_warned_about_in_the_bash_mode_panel_and_the_banner(self):
+        from unittest import mock
+        import kyklos as kyklos_mod
+        agent = Agent(FakeClient([]), "fake", self.ws, on_event=None)
+        for kind, warned in (("unavailable", True), ("seatbelt", False)):
+            with self.subTest(kind=kind), mock.patch.object(kyklos_mod, "probe_sandbox",
+                                                            return_value=(kind, "no native OS sandbox")):
+                ui = make_ui(self.ws, keys=["u"])
+                self.assertTrue(ui.ask_bash_mode())
+                ui.banner(agent)
+                self.assertEqual(output(ui).count("No OS sandbox is available here"), 2 if warned else 0)
+
     def test_tools_view_displays_sandbox_status(self):
         ui = make_ui(self.ws)
         agent = Agent(FakeClient([]), "fake", self.ws, on_event=None)
         ctx = CommandContext(agent, ui.say, self.ws / "last.jsonl", render=ui.render_view)
         run_command(ctx, "/tools")
         self.assertIn("sandbox", output(ui))
+
+
+class StreamingAnswerTests(unittest.TestCase):
+    """The answer drawn as it arrives. It lives in the transient zone, never in scrollback, which is
+    what lets a partial from a dead connection or a retried reply be erased instead of duplicated."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def live_text(self, ui) -> str:
+        return "".join(r.plain for r in ui._render_live().renderables)
+
+    def test_text_appears_in_the_live_zone_as_it_arrives(self):
+        ui = make_ui(self.ws)
+        ui.observer("model_start", depth=0, purpose="turn")
+        ui.observer("answer_delta", depth=0, text="The failing case ")
+        ui.observer("answer_delta", depth=0, text="is row 42.")
+        self.assertIn("The failing case is row 42.", self.live_text(ui))
+
+    def test_the_label_stops_saying_thinking_once_text_arrives(self):
+        ui = make_ui(self.ws)
+        ui.observer("model_start", depth=0, purpose="turn")
+        self.assertIn("thinking", self.live_text(ui))
+        ui.observer("answer_delta", depth=0, text="Here goes.")
+        live = self.live_text(ui)
+        self.assertIn("answering", live)
+        self.assertNotIn("thinking", live)
+
+    def test_a_compaction_summary_is_not_drawn_as_an_answer(self):
+        """The summary call passes no sink, so nothing should arrive -- but the label must not claim
+        to be answering even if something did."""
+        ui = make_ui(self.ws)
+        ui.observer("model_start", depth=0, purpose="summary")
+        ui.observer("answer_delta", depth=0, text="Summary text")
+        self.assertIn("compacting context", self.live_text(ui))
+
+    def test_only_a_tail_is_shown_and_the_cut_is_admitted(self):
+        ui = make_ui(self.ws)
+        ui.observer("model_start", depth=0, purpose="turn")
+        for n in range(ANSWER_PREVIEW_LINES + 6):
+            ui.observer("answer_delta", depth=0, text=f"line {n}\n")
+        live = self.live_text(ui)
+        self.assertNotIn("line 0", live)
+        self.assertIn(f"line {ANSWER_PREVIEW_LINES + 5}", live)
+        self.assertIn(ui.g["ellipsis"], live)
+
+    def test_deltas_print_nothing_permanent(self):
+        ui = make_ui(self.ws)
+        ui.observer("model_start", depth=0, purpose="turn")
+        ui.observer("answer_delta", depth=0, text="not for scrollback")
+        self.assertNotIn("not for scrollback", output(ui))
+
+    def test_a_subagents_reply_is_not_drawn_as_the_answer(self):
+        ui = make_ui(self.ws)
+        ui.observer("model_start", depth=0, purpose="turn")
+        ui.observer("answer_delta", depth=1, text="the subagent's own words")
+        self.assertNotIn("subagent's own words", self.live_text(ui))
+
+    def test_the_buffer_is_dropped_when_the_reply_lands(self):
+        """Otherwise the tool rows that follow a note before a tool call would scroll under a copy
+        of it, and `_on_thought` draws that text properly a moment later."""
+        ui = make_ui(self.ws)
+        ui.observer("model_start", depth=0, purpose="turn")
+        ui.observer("answer_delta", depth=0, text="Checking the plumbing.")
+        ui.observer("model_end", depth=0)
+        self.assertNotIn("Checking the plumbing.", self.live_text(ui))
+
+    def test_the_next_call_starts_from_blank(self):
+        ui = make_ui(self.ws)
+        ui.observer("model_start", depth=0, purpose="turn")
+        ui.observer("answer_delta", depth=0, text="first reply")
+        ui.observer("model_start", depth=0, purpose="turn")
+        ui.observer("answer_delta", depth=0, text="second reply")
+        live = self.live_text(ui)
+        self.assertIn("second reply", live)
+        self.assertNotIn("first reply", live)
+
+    def test_the_whole_answer_still_lands_in_its_box(self):
+        """End to end: the preview is a preview, and the committed render is unchanged."""
+        ui = make_ui(self.ws)
+        client = FakeClient([reply(content="# Heading\n\nThe whole answer, in full.")])
+        agent = Agent(client, "fake", self.ws, on_event=ui.observer, permission=lambda *a: (True, ""))
+        answer = agent.send("go")
+        ui.answer(answer)
+        out = output(ui)
+        self.assertIn("The whole answer, in full.", out)
+        self.assertIn("Heading", out)
 
 
 if __name__ == "__main__":

@@ -107,7 +107,17 @@ Commands decide *what* to show (`context_breakdown`, `tool_overview`, `workspace
 The split is labelled as an estimate because it is one: providers report a single number for the whole prompt, never a breakdown, so only the total can be exact — and only once the API has reported usage at least once. The subtotal is shown so the two figures can be compared rather than silently conflated.
 
 ### Spinner line
-`◯ thinking · 12s · ctrl+c to interrupt`, in frost with the bubble animating. It's replaced in place when output arrives, and it **stops before any permission prompt**.
+`◯ thinking · 12s · ctrl+c to interrupt`, in frost with the bubble animating. It's replaced in place when output arrives, and it **stops before any permission prompt**. Once text starts arriving the word becomes `answering`, because by then the wait isn't thinking.
+
+### Answer preview (the reply forming)
+Under the spinner, the last `ANSWER_PREVIEW_LINES` (8) lines of the reply as it streams, in frost, indented four, with a `…` in `deep` on top when earlier lines have scrolled out of the preview.
+
+Three choices worth stating, because each is the opposite of the obvious one:
+- **Plain text, not Markdown.** Half an answer is half a document — an unclosed fence, a table with one row — and rendering it would reflow the whole zone on every chunk.
+- **A tail, not the whole thing.** The zone has to stay shorter than the terminal, and the top of a long answer scrolling past unreadably is the thing the plan/stage design exists to avoid.
+- **Nothing here is ever committed.** The zone is transient, so a retried reply redraws rather than appending, and the partial from a connection that died is simply erased. The styled version arrives a moment later from `answer()`.
+
+Reasoning is still not drawn. `collect_stream` calls the sink for `content` only; `reasoning_content` goes to the transcript unprinted, as in v0.4.0.
 
 ### Kyklos boxes (the model's words)
 Everything the model says to you appears in a rounded box shaped like the permission panel, titled with the wordmark (`○ kyklos`, the `○` in aqua and `kyklos` as the gradient), spanning the full terminal width:
@@ -134,7 +144,7 @@ Everything the model says to you appears in a rounded box shaped like the permis
 | any failure | — | a coral `✗` line with the reason |
 
 ### Permission panel
-A rounded box (`╭╮╰╯`) with a sun-colored border. The title reads `Allow <tool>?` plus the target. For edits the body is the diff (§4, "Diff blocks"); for `bash` it's the `$ command` followed by what that command would do, in words. The last line holds single-key choices, accepted without pressing Enter: `y yes · n no · p prefix '<prefix>' · a always <tool>`.
+A rounded box (`╭╮╰╯`) with a sun-colored border. The title reads `Allow <tool>?` plus the target. For edits the body is the diff (§4, "Diff blocks"); for `bash` it's the `$ command` followed by what that command would do, in words. The last line holds single-key choices, accepted without pressing Enter: `y yes · n no · p prefix '<prefix>' · a always <tool>`. `a` is absent when the command carries a red finding, names a secret, or is one Kyklos can't read (a yellow "can't read" finding); `p` is absent for the red and secret cases only.
 
 Findings come from `explain_command` in `kyklos.py` and read at four levels: **danger** in coral with `!`, **warn** in sun with `!`, and **opaque** and **note** in frost, indented. `opaque` looks like a note but means something sharper — Kyklos cannot say what this does (an unknown program, or a script it can't see) — and it is never auto-approved by the startup bash mode. They sort worst first. Any danger finding turns the border coral and withholds `p` and `a`, so a destructive command can only ever be approved one run at a time — the rule that used to apply to secret files alone.
 ```
