@@ -8,10 +8,15 @@ may not escape it.
 import os
 import platform
 import ast
+import difflib
+import json
 import re
 import shutil
 import subprocess
+import sys
 import textwrap
+import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
@@ -25,6 +30,13 @@ MAX_READ_WHOLE_BYTES = 10_000_000
 # A model asked for an hour once, and a day is a valid integer. Ten minutes is longer than any
 # test or build Kyklos should wait on in the foreground; Ctrl+C still ends one sooner.
 MAX_BASH_TIMEOUT = 600
+EDIT_CONTEXT_LINES = 2  # unchanged lines shown either side of an edit, in its result
+EDIT_SHOWN_LINES = 30   # past this, the middle of the edited region is elided
+# Output past MAX_OUTPUT_CHARS is cut in the middle for the model, and the whole of it is kept in
+# the scratch directory so the cut part can be searched instead of produced again.
+SPILL_DIR = ".kyklos/scratch/output"
+SPILL_MAX_BYTES = 5_000_000
+SPILL_KEEP = 20
 MAX_PLAN_STEPS = 12  # a plan longer than this is a transcript, not a shape the user can hold
 # A step is model-written text that goes straight to the terminal, where an escape sequence is an
 # instruction: recolour the screen, set the window title, or leave an unterminated OSC that eats
@@ -342,7 +354,7 @@ def _match_edit(text: str, old_string: str, new_string: str) -> tuple[str, str]:
     old_lines = old_string.splitlines()
     n = len(old_lines)
     if n == 0 or n > len(file_lines):
-        raise ToolError("old_string not found. Re-read the file and copy the text exactly.")
+        raise ToolError(_not_found_note(file_lines, old_lines))
 
     def span_at(i: int) -> str:
         span = "".join(file_lines[i : i + n])
@@ -379,7 +391,101 @@ def _match_edit(text: str, old_string: str, new_string: str) -> tuple[str, str]:
                     reindented.append(file_ind + line.lstrip(" \t"))
             return span, "".join(reindented)
 
-    raise ToolError("old_string not found. Re-read the file and copy the text exactly.")
+    raise ToolError(_not_found_note(file_lines, old_lines))
+
+
+# A failed edit used to say only "re-read the file", which costs a whole step to learn what one
+# line of diff says. The file is already in hand here, so the nearest text and the first line
+# where it parts from old_string go back with the error.
+CLOSEST_SHOWN_LINES = 30
+CLOSEST_LINE_CHARS = 240
+
+
+def _closest_start(file_lines: list[str], old_lines: list[str]) -> int | None:
+    """The file line where old_string most plausibly belongs, or None when nothing resembles it.
+
+    Each old line that also appears in the file votes for the start that would put it there, and
+    the start with the most votes wins. Only when no line matches at all is the first non-blank
+    line matched loosely, since that is the one fuzzy comparison worth its cost on a large file.
+    """
+    stripped = [l.strip() for l in file_lines]
+    where: dict[str, list[int]] = {}
+    for i, line in enumerate(stripped):
+        if line:
+            where.setdefault(line, []).append(i)
+    votes: dict[int, int] = {}
+    for j, line in enumerate(l.strip() for l in old_lines):
+        for i in where.get(line, ())[:50]:  # a line as common as `}` shouldn't decide anything
+            if i - j >= 0:
+                votes[i - j] = votes.get(i - j, 0) + 1
+    if votes:
+        return max(sorted(votes), key=votes.get)
+    first = next(((j, l.strip()) for j, l in enumerate(old_lines) if l.strip()), None)
+    if first is None:
+        return None
+    close = difflib.get_close_matches(first[1], list(where), n=1, cutoff=0.6)
+    return max(where[close[0]][0] - first[0], 0) if close else None
+
+
+def _not_found_note(file_lines: list[str], old_lines: list[str]) -> str:
+    base = "old_string not found."
+    start = _closest_start(file_lines, old_lines)
+    if start is None:
+        return f"{base} Nothing in the file resembles it. Re-read the file and copy the text exactly."
+    span = file_lines[start : start + len(old_lines)]
+    shown = span[:CLOSEST_SHOWN_LINES]
+    numbered = "\n".join(f"{n:>6}\t{line.rstrip()[:CLOSEST_LINE_CHARS]}" for n, line in enumerate(shown, start + 1))
+    if len(span) > len(shown):
+        numbered += f"\n... ({len(span) - len(shown)} more lines)"
+    note = f"{base} The closest text in the file is at lines {start + 1}-{start + len(span)}:\n{numbered}"
+    for offset, old in enumerate(old_lines):
+        actual = span[offset].rstrip("\r\n") if offset < len(span) else None
+        if actual is None:
+            note += f"\nThe file ends at line {start + len(span)}, before your old_string does."
+            break
+        if actual.rstrip() != old.rstrip():
+            note += (f"\nFirst difference, at line {start + offset + 1}:\n"
+                     f"  yours: {old[:CLOSEST_LINE_CHARS]!r}\n  file:  {actual[:CLOSEST_LINE_CHARS]!r}")
+            break
+    return note + "\nCopy the file's text exactly (without the line-number prefixes)."
+
+
+# After a write, the cheapest check there is: does the file still parse? Done in-process and only
+# for formats Python can read itself, so nothing the model wrote is ever executed to find out.
+JSONC_NAMES = ("tsconfig", "jsconfig", ".eslintrc", "devcontainer", ".babelrc", "settings", "launch", "tasks")
+
+
+def syntax_problem(path: Path, text: str) -> str:
+    """Why `text` doesn't parse as the format its name says, or "" when it does or isn't checked."""
+    suffix = path.suffix.lower()
+    try:
+        if suffix == ".py":
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")  # an invalid escape is a warning, not a broken file
+                ast.parse(text, filename=path.name)
+        elif suffix == ".json" and not path.name.lower().startswith(JSONC_NAMES):
+            json.loads(text)
+        elif suffix == ".toml":
+            import tomllib  # Python 3.11+; on 3.10 the check is simply skipped
+            tomllib.loads(text)
+        else:
+            return ""
+    except SyntaxError as e:
+        version = f"{sys.version_info.major}.{sys.version_info.minor}"
+        return f"line {e.lineno}: {e.msg} (parsed as Python {version})"
+    except ImportError:
+        return ""
+    except ValueError as e:  # json.JSONDecodeError and tomllib.TOMLDecodeError are both ValueErrors
+        return str(e)
+    return ""
+
+
+def _syntax_note(path: Path, rel: str, text: str) -> str:
+    problem = syntax_problem(path, text)
+    if not problem:
+        return ""
+    return (f"\n\n[Kyklos: {rel} was saved, but it does not parse — {problem}. "
+            "Fix it before running anything that loads it.]")
 
 
 MAX_BRACE_EXPANSIONS = 64
@@ -1089,6 +1195,47 @@ class Tools:
         cut = len(text) - MAX_OUTPUT_CHARS
         return f"{text[:half]}\n\n... [{cut} chars truncated] ...\n\n{text[-half:]}"
 
+    def _spill(self, text: str) -> str:
+        """Save output too long to return whole, and give back its workspace-relative path ("" if
+        it could not be saved).
+
+        The middle of a long build or test log is exactly where the first error sits, and the cut
+        used to throw it away: the only way back was to run the command again and hope to filter
+        it. Kept on disk it is one grep away. Secrets are scrubbed before it is written, since the
+        loop's own scrubbing only sees what comes back through a tool result.
+        """
+        try:
+            ensure_scratch(self.workspace)
+            directory = self.workspace / SPILL_DIR
+            directory.mkdir(parents=True, exist_ok=True)
+            old = sorted(directory.glob("bash-*.log"), key=lambda f: f.stat().st_mtime)
+            for stale in old[:max(len(old) - SPILL_KEEP + 1, 0)]:
+                stale.unlink(missing_ok=True)
+            body = scrub_secrets(text, workspace=self.workspace)[0].encode("utf-8", errors="replace")
+            if len(body) > SPILL_MAX_BYTES:
+                body = body[:SPILL_MAX_BYTES] + f"\n... [stopped at {SPILL_MAX_BYTES:,} bytes]\n".encode()
+            # Nanoseconds, not a counter: a subagent has its own Tools and would count from one again.
+            target = directory / f"bash-{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 1_000_000_000:09d}.log"
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(body)
+            return self._rel(target)
+        except OSError:
+            return ""
+
+    def _truncate_spilling(self, text: str) -> str:
+        """_truncate for command output: the part cut from the middle stays reachable on disk."""
+        if len(text) <= MAX_OUTPUT_CHARS:
+            return text
+        saved = self._spill(text)
+        if not saved:
+            return self._truncate(text)
+        half = MAX_OUTPUT_CHARS // 2
+        lines = text.count("\n") + 1
+        return (f"{text[:half]}\n\n... [{len(text) - MAX_OUTPUT_CHARS} chars truncated here. The full output "
+                f"({lines:,} lines) is saved at {saved}: grep it, or read_file it with offset and limit, "
+                f"instead of running the command again] ...\n\n{text[-half:]}")
+
     # ---- tools -------------------------------------------------------------
 
     def read_file(self, path: str, offset: int = 1, limit: int = 2000) -> str:
@@ -1132,7 +1279,7 @@ class Tools:
             ensure_scratch(self.workspace)  # also writes the .gitignore that keeps it out of git
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
-        return f"Wrote {len(content)} chars to {path}"
+        return f"Wrote {len(content)} chars to {path}" + _syntax_note(p, path, content)
 
     def _prepare_edit(self, path: str, old_string: str, new_string: str) -> tuple[Path, str, str, str]:
         p = self._resolve_writable(path, "edit")
@@ -1148,8 +1295,27 @@ class Tools:
         p, text, matched_old, adjusted_new = self._prepare_edit(path, old_string, new_string)
         if self.before_write:
             self.before_write(p)
-        p.write_text(text.replace(matched_old, adjusted_new, 1), encoding="utf-8")
-        return f"Edited {path}"
+        updated = text.replace(matched_old, adjusted_new, 1)
+        p.write_text(updated, encoding="utf-8")
+        # "Edited path" left the model working from its own picture of the file, which is wrong
+        # whenever the match was a tolerant one: the text on disk then differs from both strings it
+        # sent. The region as it now stands goes back instead, numbered like read_file's output.
+        how = ""
+        if matched_old != old_string.replace("\r\n", "\n") and matched_old != old_string:
+            how = (" (old_string matched after ignoring whitespace differences"
+                   + (", and new_string was re-indented to fit"
+                      if adjusted_new not in (new_string, new_string.replace("\r\n", "\n")) else "") + ")")
+        first = text.count("\n", 0, text.index(matched_old)) + 1
+        last = first + adjusted_new.count("\n") - (1 if adjusted_new.endswith("\n") else 0)
+        lines = updated.splitlines()
+        lo, hi = max(first - EDIT_CONTEXT_LINES, 1), min(last + EDIT_CONTEXT_LINES, len(lines))
+        shown = [(n, lines[n - 1]) for n in range(lo, hi + 1)]
+        if len(shown) > EDIT_SHOWN_LINES:  # a long replacement: its edges are what the next edit needs
+            head, tail = EDIT_SHOWN_LINES * 2 // 3, EDIT_SHOWN_LINES // 3
+            shown = shown[:head] + [(None, f"... ({len(shown) - head - tail} lines not shown)")] + shown[-tail:]
+        region = "\n".join(line if n is None else f"{n:>6}\t{line}" for n, line in shown)
+        result = f"Edited {path}{how}. Lines {lo}-{hi} now read:\n{region}" if shown else f"Edited {path}{how}."
+        return self._truncate(result) + _syntax_note(p, path, updated)
 
     def check(self, name: str, args: dict) -> None:
         """Validate tool arguments before asking the user for permission."""
@@ -1187,8 +1353,13 @@ class Tools:
         if root.is_file():
             yield root
             return
+        # Saved command output is searched only when asked for by path: a workspace-wide grep that
+        # also matched every log Kyklos kept would bury the code under its own build output.
+        spill = self.workspace / SPILL_DIR
+        skip_spill = root != spill and spill not in root.parents
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+            dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS
+                                 and not (skip_spill and Path(dirpath) / d == spill))
             for name in sorted(filenames):
                 yield Path(dirpath) / name
 
@@ -1334,8 +1505,8 @@ class Tools:
         out = ((stdout or "") + (stderr or "")).rstrip()
         if not out:
             return f"{note}\nIt printed nothing before it was stopped."
-        return self._truncate(f"{note}\nIt printed this before it was stopped, and there may have "
-                              f"been more to come:\n{out}")
+        return self._truncate_spilling(f"{note}\nIt printed this before it was stopped, and there may have "
+                                       f"been more to come:\n{out}")
 
     def bash(self, command: str, timeout: int = 120) -> str:
         """Public bash tool callable by the model. Network stays off unless `run_bash` is called
@@ -1377,7 +1548,7 @@ class Tools:
         if process.returncode != 0:
             out += self._sandbox_note(out)
         out += self._quarantine(watch)
-        return self._truncate(f"exit code {process.returncode}\n{out}".rstrip())
+        return self._truncate_spilling(f"exit code {process.returncode}\n{out}".rstrip())
 
     # ---- protected paths that did not exist yet (bubblewrap) ---------------------------------
     # Seatbelt refuses by path, so a deny on .git/config or AGENTS.md holds whether or not the file

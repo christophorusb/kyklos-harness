@@ -22,7 +22,8 @@ from types import SimpleNamespace
 from openai import APIConnectionError, APITimeoutError, InternalServerError, OpenAI, RateLimitError
 
 from tools import (SAFE_TOOLS, SCHEMAS, SHELL_NAME, ToolError, Tools, command_touches_secret, hide_env_names,
-                   is_scratch_path, MISSING_TOOL_ADVICE, missing_unix_tools, probe_commands, probe_sandbox,
+                   is_scratch_path, MISSING_TOOL_ADVICE, missing_unix_tools, plain_line, probe_commands,
+                   probe_sandbox,
                    repository_map, sandbox_port_settings, sandbox_status, sanitize_terminal_text,
                    scrub_secrets, SCRATCH_DIR)
 
@@ -1588,6 +1589,51 @@ def _canonical_args(raw: str) -> str:
         return raw or ""
 
 
+# A stopped subagent used to hand its parent the note written for a person at a keyboard ("send
+# continue"), and everything it had found went with it. One last call, with no tool run whatever
+# it answers, turns up to MAX_STEPS of reading into a report the parent can use.
+STOPPED_REPORT_PROMPT = (
+    "[Kyklos: you have been stopped because {reason}. No further tool call will run. Reply now with "
+    "your report for the agent that delegated this task: what you established, with exact file paths "
+    "and line numbers; what you changed, if anything; and what is still unknown or unfinished. Report "
+    "only what your tool results showed.]")
+
+# Replies that end a turn without being an answer. Each is something the harness can tell for
+# certain from the reply and its own state, so each gets one nudge -- one per turn in total, since
+# a model that ignores the first will not be moved by a second.
+TEXT_TOOL_CALL_RE = re.compile(r"<tool_call>|<\|tool_call|<function_calls>|<function=\w+|<invoke\b", re.I)
+EMPTY_REPLY_MARK = "(empty reply)"
+
+
+def text_tool_call(content: str, tool_names) -> str:
+    """The tool a reply tried to call by writing the call out as text, or "".
+
+    Models served through a template that doesn't match the server's parser do this: the call
+    arrives as prose, nothing runs, and the turn ends looking finished. Only shapes that name a
+    tool on offer count, so an answer that merely discusses tool calls is left alone.
+    """
+    body = content.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", body, re.S)
+    candidate = fenced.group(1) if fenced else body
+    if candidate.startswith("{"):
+        try:
+            obj = json.loads(candidate)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict):
+            fn = obj["function"] if isinstance(obj.get("function"), dict) else obj
+            name = fn.get("name") or obj.get("tool")
+            if isinstance(name, str) and name in tool_names and ("arguments" in fn or "parameters" in fn):
+                return name
+    match = TEXT_TOOL_CALL_RE.search(body)
+    if match:
+        nearby = body[match.start():match.end() + 200]
+        for name in sorted(tool_names, key=len, reverse=True):
+            if re.search(rf"\b{re.escape(name)}\b", nearby):
+                return name
+    return ""
+
+
 def collect_stream(chunks, on_content=None) -> SimpleNamespace:
     """Reassemble a streamed completion into the object a non-streaming call would have returned.
 
@@ -1940,6 +1986,30 @@ class Agent:
         self.current_request = None  # the user message this turn is answering; never summarized away
         self.turn_log: list[tuple[str, str]] = []  # (request, final answer) of finished turns
         self.undo_stack: list[tuple[list, tuple | None, list, dict[Path, bytes | None]]] = []
+        self.last_bash: tuple[str, str] | None = None  # the newest command that ran, and its result
+        self.tools.plan_steps, self.tools.plan_active = [], 0  # a plan belongs to its conversation
+
+    def working_state(self) -> str:
+        """Where the work stands, from what the harness recorded rather than what a model recalls.
+
+        A summary is a model's account and can drop any of this; the plan in particular reached
+        the model only through old tool results, which summarising replaces. These are the same
+        facts read off the tools themselves, so they outlive compaction whatever the summary says.
+        """
+        parts = []
+        if self.tools.plan_steps:
+            parts.append(self.tools.plan_text())
+        touched = sorted({self.tools._rel(p) for *_, snapshots in self.undo_stack for p in snapshots})
+        if touched:
+            more = f" and {len(touched) - 30} more" if len(touched) > 30 else ""
+            parts.append("Files you have written or edited this session: " + ", ".join(touched[:30]) + more)
+        if self.last_bash and not _succeeded(self.last_bash[1]):
+            command, result = self.last_bash
+            lines = result.strip().splitlines()
+            tail = "\n".join(lines[:1] + lines[1:][-8:])[:1000]
+            parts.append(f"The last command you ran failed, and no command has run since:\n"
+                         f"$ {command[:300]}\n{tail}")
+        return "\n\n".join(parts)
 
     def undo(self) -> list[str] | None:
         """Revert the last turn's conversation and any file changes it made via write_file/edit_file.
@@ -1961,7 +2031,8 @@ class Agent:
         """Write the conversation (excluding the system prompt, which is rebuilt on load) to JSONL."""
         lines = [json.dumps(m, ensure_ascii=False) for m in self.messages[1:]]
         meta = {"_meta": "state", "turn_log": self.turn_log, "usage_mark": self.usage_mark,
-                "plan_mode": self.plan_mode, "session_tokens": self.session_tokens}
+                "plan_mode": self.plan_mode, "session_tokens": self.session_tokens,
+                "plan": {"steps": self.tools.plan_steps, "active": self.tools.plan_active}}
         lines.append(json.dumps(meta, ensure_ascii=False))
         write_private_text(path, "\n".join(lines) + "\n")
 
@@ -1979,6 +2050,11 @@ class Agent:
                 self.usage_mark = tuple(obj["usage_mark"]) if obj.get("usage_mark") else None
                 self.session_tokens = int(obj.get("session_tokens", 0))  # older sessions have none
                 self.set_plan_mode(bool(obj.get("plan_mode", False)))
+                plan = obj.get("plan") or {}  # older sessions have none
+                steps, active = plan.get("steps") or [], plan.get("active", 0)
+                if (isinstance(steps, list) and all(isinstance(s, str) for s in steps)
+                        and isinstance(active, int) and 0 <= active <= len(steps)):
+                    self.tools.plan_steps, self.tools.plan_active = [plain_line(s) for s in steps], active
             elif "role" in obj and obj["role"] != "system":
                 self.messages.append(obj)
         self.repair_after_interrupt()
@@ -2067,6 +2143,10 @@ class Agent:
                               max_chars=int(self.context_window * 0.1) * 4)
         if log:
             note += f"\n\nEarlier requests and your answers, verbatim (long ones clipped):\n{log}"
+        state = self.working_state()
+        if state:
+            note += ("\n\nWhere the work stands, as Kyklos recorded it from the tools themselves (trust this "
+                     f"over the summary where they differ):\n{state}")
         note += "\n\nContext is limited: prefer grep and read_file with offset/limit over re-reading whole files."
         if tail and tail[0]["role"] == "user":  # avoid two user messages in a row
             tail[0] = {**tail[0], "content": f"{note}\n\n{tail[0]['content']}"}
@@ -2189,6 +2269,8 @@ class Agent:
         self.last_claims = []
         commands_run: list[tuple[str, str]] = []  # (command, result), to check the answer's story
         last_signature, repeats = None, 0  # (tool, arguments, result) of the previous call, and its run
+        nudged = False  # the false-stop nudge, like the delegation hint, is once per turn
+        plan_touched = False  # whether this turn set or advanced the plan
         for step in range(1, self.max_steps + 1):
             self.last_steps = step
             if self.context_tokens() > self.compaction_trigger():
@@ -2222,6 +2304,18 @@ class Agent:
             self.messages.append(entry)
 
             if not msg.tool_calls:
+                stop = None if nudged or truncated or step >= self.max_steps else \
+                    self._false_stop(msg.content or "", plan_touched)
+                if stop:
+                    nudged = True
+                    to_model, to_user = stop
+                    if (msg.content or "").strip():
+                        self._emit("thought", text=msg.content)
+                    else:  # an assistant message with no content is refused by several servers
+                        entry["content"] = EMPTY_REPLY_MARK
+                    self._emit("notice", text=to_user)
+                    self.messages.append({"role": "user", "content": f"[Kyklos: {to_model}]"})
+                    continue
                 self.turn_log.append((user_text, msg.content or ""))
                 self.last_claims = unsupported_claims(msg.content or "", commands_run)
                 if truncated:  # an answer that stops mid-sentence should not look finished
@@ -2233,6 +2327,7 @@ class Agent:
                 self._emit("thought", text=msg.content)
             for n, tc in enumerate(msg.tool_calls):
                 tools_run += 1
+                plan_touched = plan_touched or tc.function.name == "plan"
                 bash_command = ""
                 if tc.function.name == "bash":
                     try:
@@ -2256,6 +2351,8 @@ class Agent:
                     hinted = True
                 if bash_command:
                     commands_run.append((bash_command, result))
+                    if EXIT_CODE_RE.match(result) or "timed out" in result[:60]:  # it ran; a denial didn't
+                        self.last_bash = (bash_command, result)
                 signature = (tc.function.name, _canonical_args(tc.function.arguments), result)
                 repeats = repeats + 1 if signature == last_signature else 1
                 last_signature = signature
@@ -2271,11 +2368,63 @@ class Agent:
                     for skipped in msg.tool_calls[n + 1:]:
                         self.messages.append({"role": "tool", "tool_call_id": skipped.id,
                                               "content": "Not run: Kyklos stopped the turn."})
+                    if self.depth > 0:
+                        return self._stopped_report(f"the same {tc.function.name} call returned the same "
+                                                    f"result {repeats} times in a row")
                     return (f"(Stopped: the same {tc.function.name} call returned the same result {repeats} "
                             f"times in a row, so the turn was going nowhere. The conversation is kept: say "
                             f'how to proceed, or send "continue" to let it try again.)')
 
+        if self.depth > 0:
+            return self._stopped_report(f"you reached the limit of {self.max_steps} steps")
         return self._step_limit_note(tools_run)
+
+    def _stopped_report(self, reason: str) -> str:
+        """A stopped subagent's account of what it found, for the agent that delegated to it.
+
+        The tools are still offered, because several servers refuse a conversation that contains
+        tool calls when the request declares none; any call in the reply is simply not run.
+        """
+        self.messages.append({"role": "user", "content": STOPPED_REPORT_PROMPT.format(reason=reason)})
+        report = ""
+        try:
+            response = self._complete(model=self.model, messages=self.messages, tools=self.schemas)
+            report = (response.choices[0].message.content or "").strip()
+        except Exception:  # the stop already happened; a failed report must not turn it into a crash
+            report = ""
+        told = reason.replace("you reached", "it reached")
+        if not report:
+            self.messages.pop()  # leave the conversation ending on its tool results, as before
+            return (f"(The subagent was stopped because {told}, and gave no report. Give it a narrower "
+                    f"task, or do this part yourself.)")
+        self.messages.append({"role": "assistant", "content": report})
+        return (f"[The subagent was stopped because {told}, so this is a partial report of what it "
+                f"found, not a finished answer.]\n{report}")
+
+    def _false_stop(self, content: str, plan_touched: bool) -> tuple[str, str] | None:
+        """(what to tell the model, what to tell the user) if this reply ends the turn by accident."""
+        if not content.strip():
+            return ("your last reply was empty: no text and no tool call. If the task is finished, reply "
+                    "with a short summary of what you did and what you verified. Otherwise carry on with "
+                    "the next tool call.",
+                    "The model sent an empty reply; Kyklos asked it to carry on or sum up.")
+        name = text_tool_call(content, self.tool_names)
+        if name:
+            return (f"you wrote a {name} call as text in your reply, so nothing ran: text is never "
+                    f"executed. Make the call through the tool-calling interface, or if you are finished, "
+                    f"answer in plain prose.",
+                    f"The model wrote a {name} call as text, so nothing ran; Kyklos asked it to call the tool.")
+        steps, active = self.tools.plan_steps, self.tools.plan_active
+        # Only a plan with a step never started: a model on its last step that forgets to close the
+        # plan has finished, and a question is a deliberate stop.
+        if (self.depth == 0 and not self.plan_mode and plan_touched and 0 < active < len(steps)
+                and "?" not in content):
+            return (f"your reply ends the turn, but your plan has steps not started:\n{self.tools.plan_text()}\n"
+                    f"If work remains, carry on with it now. If you are finished or stopping on purpose, "
+                    f"update the plan (active 0, or new steps) and say what is left and why.",
+                    f"The answer stopped at step {active} of {len(steps)}; Kyklos asked the model to finish "
+                    f"or say why.")
+        return None
 
     def _should_hint_delegation(self) -> bool:
         """Once the conversation is half way to compaction, further reading here is expensive.

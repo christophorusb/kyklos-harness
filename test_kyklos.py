@@ -1025,7 +1025,8 @@ class PlanToolTests(unittest.TestCase):
     def test_posting_a_plan_never_asks_for_permission(self):
         """It writes nothing, so a prompt here would be friction with nothing behind it."""
         client = FakeClient([reply(tool_calls=[tool_call("1", "plan", steps=["look", "fix"])]),
-                             reply(content="Posted.")])
+                             reply(content="Posted."),
+                             reply(content="Posted.")])  # the second answers the unfinished-plan nudge
         agent = Agent(client, "fake", self.ws, permission=deny_all, on_event=lambda *a, **k: None)
         self.assertEqual(agent.send("go"), "Posted.")
         said = [m["content"] for m in agent.messages if m["role"] == "tool"][0]
@@ -1037,7 +1038,8 @@ class PlanToolTests(unittest.TestCase):
         events = []
         client = FakeClient([reply(tool_calls=[tool_call("1", "plan", steps=["look", "fix", "check"])]),
                              reply(tool_calls=[tool_call("2", "plan", active=2)]),
-                             reply(content="Done.")])
+                             reply(content="Done."),
+                             reply(content="Done.")])  # the second answers the unfinished-plan nudge
         agent = Agent(client, "fake", self.ws, permission=allow_all,
                       on_event=lambda e, **d: events.append((e, d)) if e == "plan" else None)
         agent.send("go")
@@ -4837,6 +4839,348 @@ class StreamSettingTests(unittest.TestCase):
     def test_nonsense_is_refused_rather_than_guessed(self):
         with self.assertRaises(ValueError):
             choose_stream({"STREAM": "sometimes"})
+
+
+def quiet(*args, **kwargs):
+    return None
+
+
+class StoppedSubagentTests(unittest.TestCase):
+    """A subagent that is stopped reports what it found instead of handing back a note for a person."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        (self.ws / "app.py").write_text("def main():\n    return 42\n")
+
+    def run_parent(self, sub_replies, max_steps=2):
+        task = tool_call("t1", "task", description="find main", prompt="Find main.")
+        client = FakeClient([reply(tool_calls=[task]), *sub_replies, reply(content="Parent done.")])
+        parent = Agent(client, "fake", self.ws, permission=allow_all, on_event=quiet, max_steps=max_steps)
+        self.assertEqual(parent.send("where is main?"), "Parent done.")
+        return client, [m for m in client.calls[-1] if m["role"] == "tool"][-1]["content"]
+
+    def test_the_step_cap_yields_a_report_not_a_note_for_the_user(self):
+        client, result = self.run_parent([
+            reply(tool_calls=[tool_call("s1", "grep", pattern="def main")]),
+            reply(tool_calls=[tool_call("s2", "grep", pattern="return")]),
+            reply(content="main is in app.py line 1; I did not check callers."),
+        ])
+        self.assertIn("partial report", result)
+        self.assertIn("limit of 2 steps", result)
+        self.assertIn("main is in app.py line 1", result)
+        self.assertNotIn('"continue"', result)
+        report_call = client.calls[3]  # parent, sub, sub, then the report request
+        self.assertIn("No further tool call will run", report_call[-1]["content"])
+        assert_tool_results_paired(self, report_call)
+
+    def test_a_tool_call_in_the_report_reply_is_not_run(self):
+        (self.ws / "gone.txt").write_text("x")
+        _, result = self.run_parent([
+            reply(tool_calls=[tool_call("s1", "grep", pattern="def main")]),
+            reply(tool_calls=[tool_call("s2", "grep", pattern="return")]),
+            reply(content="Found main.", tool_calls=[tool_call("s3", "bash", command="rm gone.txt")]),
+        ])
+        self.assertIn("Found main.", result)
+        self.assertTrue((self.ws / "gone.txt").exists())
+
+    def test_no_report_says_so_to_the_parent(self):
+        _, result = self.run_parent([
+            reply(tool_calls=[tool_call("s1", "grep", pattern="def main")]),
+            reply(tool_calls=[tool_call("s2", "grep", pattern="return")]),
+            reply(content=None),
+        ])
+        self.assertIn("gave no report", result)
+        self.assertIn("narrower", result)
+        self.assertNotIn('"continue"', result)
+
+    def test_a_repeating_subagent_reports_too(self):
+        same = [reply(tool_calls=[tool_call(f"s{i}", "grep", pattern="nothing-here")]) for i in range(5)]
+        _, result = self.run_parent([*same, reply(content="No match for nothing-here anywhere.")], max_steps=20)
+        self.assertIn("5 times in a row", result)
+        self.assertIn("No match for nothing-here", result)
+
+    def test_the_main_agent_keeps_its_own_note(self):
+        calls = [reply(tool_calls=[tool_call(str(i), "grep", pattern=f"p{i}")]) for i in range(3)]
+        agent = Agent(FakeClient(calls), "fake", self.ws, permission=allow_all, on_event=quiet, max_steps=3)
+        self.assertIn('"continue"', agent.send("go"))
+
+
+class EditFeedbackTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.tools = Tools(self.ws)
+        (self.ws / "m.py").write_text("import os\n\n\ndef area(w, h):\n    total = w * h\n    return total\n\n\nx = 1\n")
+
+    def test_a_miss_names_the_closest_lines_and_the_first_difference(self):
+        with self.assertRaises(ToolError) as caught:
+            self.tools.edit_file("m.py", "def area(w, h):\n    total = w + h\n    return total", "pass")
+        note = str(caught.exception)
+        self.assertTrue(note.startswith("old_string not found."))
+        self.assertIn("lines 4-6", note)
+        self.assertIn("     5\t    total = w * h", note)
+        self.assertIn("First difference, at line 5", note)
+        self.assertIn("w + h", note)
+
+    def test_a_miss_with_no_line_in_common_falls_back_to_a_loose_match(self):
+        with self.assertRaises(ToolError) as caught:
+            self.tools.edit_file("m.py", "def area(w, h, d):", "pass")
+        self.assertIn("lines 4-4", str(caught.exception))
+
+    def test_a_miss_that_resembles_nothing_says_so(self):
+        with self.assertRaises(ToolError) as caught:
+            self.tools.edit_file("m.py", "zzzz qqqq 9999", "pass")
+        self.assertIn("Nothing in the file resembles it", str(caught.exception))
+
+    def test_a_miss_running_past_the_end_of_the_file_says_so(self):
+        with self.assertRaises(ToolError) as caught:
+            self.tools.edit_file("m.py", "x = 1\ny = 2\n", "pass")
+        self.assertIn("The file ends at line 9", str(caught.exception))
+
+    def test_success_returns_the_region_as_it_now_reads(self):
+        result = self.tools.edit_file("m.py", "    total = w * h\n", "    total = w * h\n    total += 1\n")
+        self.assertTrue(result.startswith("Edited m.py. Lines 3-8 now read:"))
+        self.assertIn("     6\t    total += 1", result)
+        self.assertIn("     7\t    return total", result)
+        self.assertNotIn("import os", result)  # two lines of context, not the file
+
+    def test_a_tolerant_match_says_the_text_was_adjusted(self):
+        result = self.tools.edit_file("m.py", "total = w * h\nreturn total", "total = w * h * 2\nreturn total")
+        self.assertIn("re-indented to fit", result)
+        self.assertIn("     5\t    total = w * h * 2", result)
+
+    def test_a_long_replacement_shows_its_edges(self):
+        body = "".join(f"    v{i} = {i}\n" for i in range(80))
+        result = self.tools.edit_file("m.py", "    total = w * h\n", body)
+        self.assertIn("lines not shown", result)
+        self.assertIn("v0 = 0", result)
+        self.assertIn("v79 = 79", result)
+        self.assertLess(len(result.splitlines()), 40)
+
+    def test_a_file_left_unparseable_is_flagged(self):
+        result = self.tools.edit_file("m.py", "def area(w, h):", "def area(w, h:")
+        self.assertIn("does not parse", result)
+        self.assertIn("line 4", result)
+        written = self.tools.write_file("bad.json", '{"a": 1,}')
+        self.assertIn("does not parse", written)
+
+    def test_sound_files_and_unchecked_formats_are_quiet(self):
+        self.assertNotIn("Kyklos", self.tools.write_file("ok.py", "x = 1\n"))
+        self.assertNotIn("Kyklos", self.tools.write_file("ok.json", '{"a": 1}'))
+        self.assertNotIn("Kyklos", self.tools.write_file("tsconfig.json", '{/* comments are legal here */}'))
+        self.assertNotIn("Kyklos", self.tools.write_file("notes.md", "def broken(:\n"))
+        self.assertNotIn("Kyklos", self.tools.write_file("esc.py", 'p = "\\d"\n'))  # a warning, not an error
+
+
+class OutputSpillTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name).resolve()
+        self.addCleanup(self.tmp.cleanup)
+        self.tools = Tools(self.ws)
+
+    def saved_path(self, result):
+        import re
+        return re.search(r"saved at (\S+\.log)", result).group(1)
+
+    @unittest.skipIf(__import__("platform").system() == "Windows", "uses seq")
+    def test_long_output_is_cut_for_the_model_and_kept_whole_on_disk(self):
+        result = self.tools.bash("seq 1 6000")
+        self.assertTrue(result.startswith("exit code 0"))
+        self.assertNotIn("\n3000\n", result)  # the middle is what gets cut
+        saved = self.ws / self.saved_path(result)
+        self.assertIn("\n3000\n", saved.read_text())
+        self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
+        self.assertIn("  3000\t2999", self.tools.read_file(self.saved_path(result), offset=3000, limit=1))
+
+    def test_short_output_is_not_saved(self):
+        self.assertEqual(self.tools._truncate_spilling("exit code 0\nok"), "exit code 0\nok")
+        self.assertFalse((self.ws / ".kyklos").exists())
+
+    def test_saved_output_stays_out_of_a_workspace_search_but_can_be_searched_by_path(self):
+        (self.ws / "code.py").write_text("NEEDLE = 1\n")
+        rel = self.saved_path(self.tools._truncate_spilling("NEEDLE in a log\n" + "pad\n" * 6000))
+        hits = self.tools.grep("NEEDLE")
+        self.assertIn("code.py", hits)
+        self.assertNotIn(".log", hits)
+        self.assertIn("NEEDLE in a log", self.tools.grep("NEEDLE", path=rel))
+        self.assertIn("NEEDLE in a log", self.tools.grep("NEEDLE", path=".kyklos/scratch/output"))
+
+    def test_secrets_are_scrubbed_before_the_output_is_written(self):
+        token = "ghp_" + "a1B2" * 9
+        rel = self.saved_path(self.tools._truncate_spilling(f"token {token}\n" + "pad\n" * 6000))
+        self.assertNotIn(token, (self.ws / rel).read_text())
+
+    def test_only_the_newest_logs_are_kept(self):
+        from tools import SPILL_KEEP
+        for _ in range(SPILL_KEEP + 5):
+            self.tools._truncate_spilling("pad\n" * 6000)
+        self.assertEqual(len(list((self.ws / ".kyklos/scratch/output").glob("bash-*.log"))), SPILL_KEEP)
+
+
+class WorkingStateTests(unittest.TestCase):
+    BLOAT = "y" * 26_000
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_the_plan_changed_files_and_failing_command_survive_a_summary(self):
+        client = FakeClient([
+            reply(tool_calls=[tool_call("1", "plan", steps=["write it", "test it", "tidy"])], prompt_tokens=100),
+            reply(tool_calls=[tool_call("2", "write_file", path="a.py", content="x = 1\n")], prompt_tokens=100),
+            reply(tool_calls=[tool_call("3", "plan", active=2)], prompt_tokens=100),
+            reply(content=self.BLOAT, tool_calls=[tool_call("4", "bash", command="echo boom; exit 3")],
+                  prompt_tokens=100),
+            reply(tool_calls=[tool_call("5", "read_file", path="a.py")], prompt_tokens=10_000),
+            reply(content="A summary that forgot the plan."),  # the summary call
+            reply(content="Stopping to ask: is exit 3 expected?"),
+        ])
+        agent = Agent(client, "fake", self.ws, permission=allow_all, context_window=12_000, on_event=quiet)
+        agent.send("build it")
+        self.assertIn(False, client.used_tools)  # a summary call happened
+        after = json.dumps(client.calls[-1])
+        self.assertIn("A summary that forgot the plan.", after)
+        self.assertIn("step 2 of 3 in progress", after)
+        self.assertIn("[>] 2. test it", after)
+        self.assertIn("written or edited this session: a.py", after)
+        self.assertIn("The last command you ran failed", after)
+        self.assertIn("echo boom; exit 3", after)
+        self.assertIn("exit code 3", after)
+
+    def test_a_command_that_later_passes_is_not_reported_as_failing(self):
+        client = FakeClient([
+            reply(tool_calls=[tool_call("1", "bash", command="exit 3")]),
+            reply(tool_calls=[tool_call("2", "bash", command="echo fine")]),
+            reply(content="Done."),
+        ])
+        agent = Agent(client, "fake", self.ws, permission=allow_all, on_event=quiet)
+        agent.send("go")
+        self.assertEqual(agent.working_state(), "")
+
+    def test_a_denied_command_is_not_a_failed_one(self):
+        client = FakeClient([reply(tool_calls=[tool_call("1", "bash", command="make")]), reply(content="Denied.")])
+        agent = Agent(client, "fake", self.ws, permission=deny_all, on_event=quiet)
+        agent.send("go")
+        self.assertIsNone(agent.last_bash)
+
+    def test_the_plan_round_trips_through_a_saved_session_and_reset_clears_it(self):
+        client = FakeClient([
+            reply(tool_calls=[tool_call("1", "plan", steps=["one", "two", "three"])]),
+            reply(tool_calls=[tool_call("2", "plan", active=3)]),
+            reply(content="On the last step."),
+        ])
+        agent = Agent(client, "fake", self.ws, permission=allow_all, on_event=quiet)
+        agent.send("go")
+        session = self.ws / "s.jsonl"
+        agent.save_session(session)
+        fresh = Agent(FakeClient([]), "fake", self.ws, on_event=quiet)
+        fresh.load_session(session)
+        self.assertEqual((fresh.tools.plan_steps, fresh.tools.plan_active), (["one", "two", "three"], 3))
+        fresh.reset()
+        self.assertEqual((fresh.tools.plan_steps, fresh.tools.plan_active), ([], 0))
+
+    def test_a_malformed_saved_plan_is_ignored(self):
+        session = self.ws / "s.jsonl"
+        session.write_text(json.dumps({"_meta": "state", "plan": {"steps": ["a"], "active": 9}}) + "\n")
+        agent = Agent(FakeClient([]), "fake", self.ws, on_event=quiet)
+        agent.load_session(session)
+        self.assertEqual(agent.tools.plan_steps, [])
+
+
+class FalseStopTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.notices = []
+
+    def agent(self, replies, **kwargs):
+        self.client = FakeClient(replies)
+        # Only the nudges: the fake provider reports no usage, which raises a notice of its own.
+        watch = lambda e, **d: (self.notices.append(d["text"])
+                                if e == "notice" and "Kyklos asked" in d["text"] else None)
+        return Agent(self.client, "fake", self.ws, permission=allow_all, on_event=watch, **kwargs)
+
+    def nudge(self):
+        return self.client.calls[-1][-1]["content"]
+
+    def test_an_empty_reply_is_asked_to_carry_on(self):
+        agent = self.agent([reply(content=None), reply(content="Here is the answer.")])
+        self.assertEqual(agent.send("go"), "Here is the answer.")
+        self.assertIn("your last reply was empty", self.nudge())
+        self.assertTrue(self.nudge().startswith("[Kyklos:"))
+        self.assertEqual(self.client.calls[-1][-2]["content"], "(empty reply)")  # never an empty message
+        self.assertEqual(len(self.notices), 1)
+        self.assertEqual(agent.turn_log, [("go", "Here is the answer.")])
+
+    def test_a_tool_call_written_as_text_is_sent_back(self):
+        shapes = ['{"name": "read_file", "arguments": {"path": "a.py"}}',
+                  '```json\n{"name": "bash", "parameters": {"command": "ls"}}\n```',
+                  '<tool_call>\n{"name": "grep", "arguments": {"pattern": "x"}}\n</tool_call>',
+                  'Let me look.\n<function=read_file>{"path": "a.py"}</function>']
+        for shape in shapes:
+            with self.subTest(shape=shape):
+                agent = self.agent([reply(content=shape), reply(content="Done properly.")])
+                self.assertEqual(agent.send("go"), "Done properly.")
+                self.assertIn("call as text", self.nudge())
+
+    def test_prose_about_tool_calls_is_an_answer(self):
+        for answer in ('The model emits <tool_call> tags, which your parser then reads.',
+                       '{"name": "not_a_tool", "arguments": {}}',
+                       '{"name": "read_file"}',
+                       'Use `read_file` to open it.'):
+            with self.subTest(answer=answer):
+                self.assertEqual(self.agent([reply(content=answer)]).send("go"), answer)
+
+    def test_an_answer_with_plan_steps_never_started_is_questioned(self):
+        agent = self.agent([reply(tool_calls=[tool_call("1", "plan", steps=["look", "fix", "check"])]),
+                            reply(content="I looked at it."),
+                            reply(content="Stopped: the fix needs a decision from you.")])
+        self.assertEqual(agent.send("go"), "Stopped: the fix needs a decision from you.")
+        self.assertIn("steps not started", self.nudge())
+        self.assertIn("[>] 1. look", self.nudge())
+
+    def test_a_plan_on_its_last_step_or_closed_is_left_alone(self):
+        for active in (3, 0):
+            with self.subTest(active=active):
+                agent = self.agent([reply(tool_calls=[tool_call("1", "plan", steps=["a", "b", "c"])]),
+                                    reply(tool_calls=[tool_call("2", "plan", active=active)]),
+                                    reply(content="All done.")])
+                self.assertEqual(agent.send("go"), "All done.")
+
+    def test_a_question_is_a_deliberate_stop(self):
+        agent = self.agent([reply(tool_calls=[tool_call("1", "plan", steps=["look", "fix"])]),
+                            reply(content="Which of the two files did you mean?")])
+        self.assertEqual(agent.send("go"), "Which of the two files did you mean?")
+
+    def test_a_plan_from_an_earlier_turn_does_not_question_this_one(self):
+        agent = self.agent([reply(tool_calls=[tool_call("1", "plan", steps=["look", "fix"])]),
+                            reply(content="Is this the right file?"),
+                            reply(content="Yes, that one.")])
+        agent.send("go")
+        self.assertEqual(agent.send("unrelated question"), "Yes, that one.")
+
+    def test_one_nudge_per_turn(self):
+        agent = self.agent([reply(content=None), reply(content=None)])
+        self.assertEqual(agent.send("go"), "")
+        self.assertEqual(len(self.notices), 1)
+
+    def test_a_cut_off_answer_is_not_also_nudged(self):
+        agent = self.agent([reply(content='{"name": "read_file", "arguments": {"pa', finish_reason="length")])
+        agent.send("go")
+        self.assertEqual(len(self.client.calls), 1)
+
+    def test_subagents_are_nudged_for_an_empty_reply(self):
+        task = tool_call("t1", "task", description="find it", prompt="Find it.")
+        agent = self.agent([reply(tool_calls=[task]), reply(content=None), reply(content="Found it."),
+                            reply(content="Done.")])
+        agent.send("go")
+        self.assertEqual([m for m in self.client.calls[-1] if m["role"] == "tool"][-1]["content"], "Found it.")
 
 
 if __name__ == "__main__":
