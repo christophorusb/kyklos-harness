@@ -1,0 +1,5 @@
+{
+  "prompt": "Answer three separate questions about this codebase, giving the file path for each. (1) Which module actually sends the password-reset email? (2) Where is the maximum number of attempts for delivering a webhook defined, and what is its value? (3) Which function computes the tax on an invoice, and in which file? Don't change any files.",
+  "summary": "three independent lookups among decoys; a model may delegate them side by side",
+  "timeout": 600
+}

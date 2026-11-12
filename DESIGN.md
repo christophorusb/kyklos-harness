@@ -188,6 +188,8 @@ While a subagent runs, a **live block** updates in place, showing its last 3 ste
 ```
 When it finishes, the block **collapses** to one line: `● task  explore · Find compaction constants   12 steps · 41s`. Its permission prompts still appear, indented under it.
 
+Explore subagents started together run at the same time, but are still drawn one after another: the live block shows the one in front, and each of the others appears when the one before it collapses, replaying its steps and then carrying on live. The `Ns` on each collapsed line is how long that subagent really ran, so lines that overlapped in time will add up to more than the wall clock.
+
 ### Answer
 Rendered Markdown in a `sky`-bordered kyklos box. Inline code is aqua; code blocks use Rich's terminal-color syntax theme. Headings are modest: bold and left-aligned, with no full-width rules.
 

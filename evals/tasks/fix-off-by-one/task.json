@@ -1,0 +1,5 @@
+{
+  "prompt": "The tests in test_pager.py fail. Find the bug and fix it in the code, not in the tests, then run the tests to confirm.",
+  "summary": "a failing test, one wrong line",
+  "timeout": 600
+}

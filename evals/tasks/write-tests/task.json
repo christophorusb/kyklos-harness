@@ -1,0 +1,5 @@
+{
+  "prompt": "Write unit tests for slugify in a new file test_slug.py, using unittest, covering accented letters, punctuation, runs of separators, leading and trailing spaces, and a custom sep. Run them to make sure they pass. Don't change slug.py.",
+  "summary": "tests judged by whether they catch four broken versions of the code",
+  "timeout": 600
+}

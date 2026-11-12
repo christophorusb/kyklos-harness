@@ -191,6 +191,18 @@ class AeroTurnTests(unittest.TestCase):
         self.assertRegex(out, r"● edit_file  app\.py  ~1 +✓ applied")
         self.assertIn("return 43", (self.ws / "app.py").read_text())
 
+    def test_diff_source_for_several_edits_is_the_file_before_and_after(self):
+        (self.ws / "multi.py").write_text("a = 1\nb = 2\nc = 3\n")
+        ui = make_ui(self.ws)
+        info = ui._diff_source("edit_file", {"path": "multi.py", "edits": [
+            {"old_string": "a = 1", "new_string": "a = 10"}, {"old_string": "c = 3", "new_string": "c = 30"}]})
+        self.assertEqual((info["old"], info["new"]), ("a = 1\nb = 2\nc = 3\n", "a = 10\nb = 2\nc = 30\n"))
+        every = ui._diff_source("edit_file", {"path": "multi.py", "old_string": " = ", "new_string": " := ",
+                                              "replace_all": True})
+        self.assertEqual(every["new"].count(":="), 3)
+        broken = ui._diff_source("edit_file", {"path": "multi.py", "edits": [{"old_string": "zzz"}]})
+        self.assertEqual((broken["old"], broken["new"]), ("", ""))  # the tool will refuse it; draw nothing
+
     def test_diff_source_resolves_indent_shifted_and_whitespace_tolerant_edits(self):
         (self.ws / "cls.py").write_text("# header\nclass C:\n    def m(self):   \n        return 1\n")
         ui = make_ui(self.ws)

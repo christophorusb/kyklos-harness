@@ -48,3 +48,6 @@ sandbox/
 
 # Naming deliberation notes: working notes, kept local
 /NAMING.md
+
+# Eval results: one file per eval.py run, compared locally
+/evals/results/

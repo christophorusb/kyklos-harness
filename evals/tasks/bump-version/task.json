@@ -1,0 +1,5 @@
+{
+  "prompt": "Release version 1.5.0: update the version number everywhere the current release is named, and turn the Unreleased heading in CHANGELOG.md into the 1.5.0 heading. The entries for earlier releases in the changelog must stay as they are.",
+  "summary": "four files to change, and a replace-all that would rewrite history",
+  "timeout": 600
+}

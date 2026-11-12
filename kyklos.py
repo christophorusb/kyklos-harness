@@ -14,14 +14,17 @@ import os
 import platform
 import re
 import sys
+import tempfile
 import textwrap
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
 from openai import APIConnectionError, APITimeoutError, InternalServerError, OpenAI, RateLimitError
 
-from tools import (SAFE_TOOLS, SCHEMAS, SHELL_NAME, ToolError, Tools, command_touches_secret, hide_env_names,
+from tools import (SAFE_TOOLS, SCHEMAS, SHELL_NAME, ToolError, Tools, command_touches_secret, edit_list,
+                   hide_env_names,
                    is_scratch_path, MISSING_TOOL_ADVICE, missing_unix_tools, plain_line, probe_commands,
                    probe_sandbox,
                    repository_map, sandbox_port_settings, sandbox_status, sanitize_terminal_text,
@@ -111,7 +114,9 @@ TASK_SCHEMA = {
             "Only its final answer comes back to you, which keeps your own context small. "
             "Good for broad codebase searches, investigating a question across many files, or a "
             "well-defined change. mode 'explore' is read-only (read_file, grep, glob); "
-            "mode 'general' can also edit files and run commands, with the user's approval."
+            "mode 'general' can also edit files and run commands, with the user's approval. "
+            "Several explore tasks sent in one message run at the same time, so give independent "
+            "questions a task each rather than one after another."
         ),
         "parameters": {
             "type": "object",
@@ -961,6 +966,107 @@ def _nested_shell_findings(tokens: list[str], depth: int) -> list[tuple[str, str
     return [(level, f"{text} (via {stem})") for level, text in explain_command(body, depth + 1)]
 
 
+# Three readings that were red and shouldn't have been, found by eval.py: every one made an
+# unattended run refuse an ordinary command and a person in `u` mode stop to approve one. Each is
+# relaxed only where the explainer can see the whole of what happens. It does not follow `cd`, so
+# a command that changes directory keeps the louder reading: `cd sub && echo x > f` writes sub/f,
+# and the explainer would be judging ./f instead.
+CHDIR_RE = re.compile(r"(?:^|[\s;&|(`{])(?:cd|pushd|popd|chdir|set-location)(?=$|[\s;&|)`}])", re.I)
+# What a shell or interpreter reads as its program when it is given one this way; stdin then
+# carries the program too, which is the danger `… | python3` exists to name.
+STDIN_PROGRAM_OPERANDS = {"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"}
+STDIN_PROGRAM_FLAGS = {"-s", "--stdin"}
+PLAIN_PATH_RE = re.compile(r"^[A-Za-z0-9_.@+,/-]+$")  # no variable, glob, home or substitution
+# Every relaxation here is judged against the disk as it stands before the command runs, and
+# where a path leads is decided by the symlinks along it. A command that can make a link or move
+# a folder can change that between the check and the write, `ln -s ../../src .kyklos/scratch/l
+# && rm -rf .kyklos/scratch/l/*`, so it keeps the louder reading. Searched for anywhere in the
+# command, quoted inline code included: a false match only means being asked.
+LINK_MAKER_RE = re.compile(r"(?:^|[\s;&|(`{'\"])(?:[^\s;&|(`{'\"]*/)?"
+                           r"(?:ln|link|mv|cp|rsync|ditto|install|tar|unzip)(?=$|[\s;&|)`}'\"])")
+
+
+def _changes_directory(command: str) -> bool:
+    return bool(CHDIR_RE.search(_unquoted(command)))
+
+
+def _within(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def _new_workspace_file(target: str) -> bool:
+    """True if a redirect to `target` would create a file in the workspace rather than replace one:
+    a plain relative path that doesn't exist yet, in a folder that really is inside the workspace
+    (`link/new.txt` through a symlink to elsewhere is not), and isn't one of the files that make
+    something run later (hooks, CI, AGENTS.md and the rest), which stay red however they're written."""
+    if _EXPLAIN_WORKSPACE is None or not PLAIN_PATH_RE.match(target) or target.startswith("/"):
+        return False
+    if ".." in Path(target).parts or _protected_workspace_target(target):
+        return False
+    try:
+        base = _EXPLAIN_WORKSPACE.resolve()
+        if not _within(Path(os.path.realpath((base / target).parent)), base):
+            return False
+        return not os.path.lexists(base / target)
+    except (OSError, ValueError):
+        return False
+
+
+def _inside_scratch(path: str, glob_leaf: bool = False) -> bool:
+    """True if `path` lands in the scratch directory, read the way the shell will expand it and
+    checked against where it really leads.
+
+    Lexically: no variable, `~`, absolute path or `..`, and no brace expansion, which can spell
+    `..` (`{..,x}`). A glob only where `glob_leaf` allows one, only in the last part, and never
+    one that can match a dot entry: bash before 5.2 expands `.*` to `..` too, so
+    `.kyklos/scratch/.*/.*/src` was the project's src. A glob in a middle part would walk through
+    any symlink it matched, so that's refused as well. Then on disk: what the path names (for a
+    glob, the folder it matches in) must resolve inside the real scratch directory, so a symlink
+    there, or a symlinked .kyklos, can't aim a delete or a write back at the project.
+    """
+    if _EXPLAIN_WORKSPACE is None:
+        return False
+    clean = path.replace("\\", "/")
+    while clean.startswith("./"):
+        clean = clean[2:]
+    clean = clean.rstrip("/")
+    if not clean or clean.startswith(("/", "~")) or any(c in clean for c in "$`{}[]"):
+        return False
+    parts = clean.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        return False
+    if not (clean == SCRATCH_DIR or clean.startswith(SCRATCH_DIR + "/")):
+        return False
+    globbed = any(c in parts[-1] for c in "*?")
+    if any(c in p for p in parts[:-1] for c in "*?"):
+        return False
+    if globbed and (not glob_leaf or parts[-1].startswith(".")):
+        return False
+    try:
+        base = _EXPLAIN_WORKSPACE.resolve()
+        root = base / SCRATCH_DIR
+        if Path(os.path.realpath(root)) != root:  # .kyklos or scratch itself is a link
+            return False
+        named = base / clean
+        return _within(Path(os.path.realpath(named.parent if globbed else named)), root)
+    except (OSError, ValueError):
+        return False
+
+
+def _program_from_elsewhere(tokens: list[str]) -> bool:
+    """True if this shell or interpreter is given its program by a flag or a script file, so
+    what it reads on stdin is data: `… | python3 -c '…'`, `… | python3 -m json.tool`,
+    `… | python3 check.py`. `python3`, `python3 -`, `bash -s` and `sh /dev/stdin` all still run
+    stdin as code."""
+    rest = [t.strip("\"'") for t in tokens[1:]]
+    if any(t in STDIN_PROGRAM_OPERANDS or t.lower() in STDIN_PROGRAM_FLAGS for t in rest):
+        return False
+    if _has_inline_code(tokens) or (_stem(tokens[0]) in PYTHON_STEMS and "-m" in rest):
+        return True
+    operand = next((t for t in rest if not t.startswith("-")), "")
+    return bool(operand) and _looks_like_script(operand)
+
+
 def explain_command(command: str, depth: int = 0) -> list[tuple[str, str]]:
     """Plain-language findings about what a shell command would do, highest concern first.
 
@@ -975,19 +1081,32 @@ def explain_command(command: str, depth: int = 0) -> list[tuple[str, str]]:
         findings.append(("note", f"writes {heredocs} block{'' if heredocs == 1 else 's'} of inline "
                                  f"text (heredoc); that text is data, not commands"))
 
+    # The relaxations below read paths against the disk as it is now and from where the command
+    # starts; one that changes directory, or can make a link, could put them somewhere else.
+    steady = not _changes_directory(command) and not LINK_MAKER_RE.search(command)
     for i, (op, tokens) in enumerate(segments):
         if op == "|" and i and _stem(tokens[0]) in SHELL_STEMS | PYTHON_STEMS:
             source = _stem(segments[i - 1][1][0])
             if source in {"curl", "wget"}:
                 findings.append(("danger", f"pipes downloaded content straight into {_stem(tokens[0])}, "
                                            f"which runs it immediately"))
+            elif _program_from_elsewhere(tokens):
+                # The program is the -c code or the script, and is judged as that; stdin is input.
+                findings.append(("note", f"feeds what {source} prints to {_stem(tokens[0])} as input"))
             else:  # base64 -d | sh, echo … | sh: still handing another command's output to a shell
                 findings.append(("danger", f"runs whatever {source} prints, through {_stem(tokens[0])}"))
         # `sudo rm -rf /srv` is an escalation *and* a recursive delete; `env X=1 rm -rf build` is a
         # delete wearing a disguise. Examine each layer, or a wrapper silences the real command.
         layer = tokens
         for _ in range(6):
-            findings += _command_findings(layer)
+            found = _command_findings(layer)
+            if (_stem(layer[0]) == "rm" and steady and _operands(layer)
+                    and all(_inside_scratch(o, glob_leaf=True) for o in _operands(layer))):
+                # Deleting what the scratch directory holds, which writing there already needs no
+                # approval for. The danger it replaces is for the user's files, and these aren't.
+                found = [("note", text) if text.startswith("deletes ") else (level, text)
+                         for level, text in found]
+            findings += found
             if _stem(layer[0]) in SHELL_STEMS and _has_inline_code(layer):
                 findings += _nested_shell_findings(layer, depth)
             peeled = _peel(layer)
@@ -1001,8 +1120,13 @@ def explain_command(command: str, depth: int = 0) -> list[tuple[str, str]]:
         target = _bare(target)
         if target.lower() in NULL_SINKS:
             continue  # discarding output, not writing a file
-        if SCRATCH_DIR in target.replace("\\", "/"):
-            continue  # the scratch directory exists to be written over
+        if steady and _inside_scratch(target):
+            # The scratch directory exists to be written over. Once this matched any target that
+            # merely contained the name, so `.kyklos/scratch/../../src/app.py` was never mentioned.
+            continue
+        if steady and _new_workspace_file(target):
+            findings.append(("note", f"creates {target}"))  # nothing there yet, so nothing to lose
+            continue
         findings.append(("danger", f"{'appends to' if op == '>>' else 'overwrites'} {target}"))
     if command_touches_secret(command):
         findings.append(("danger", "names a secret file, so it can only ever be allowed once"))
@@ -1498,10 +1622,17 @@ NO_APPROVER_NOTE = ("The {name} call was denied: nobody is available to approve 
 def ask_permission(name: str, args: dict, always_allowed: set) -> tuple[bool, str]:
     """Plain terminal prompt before a risky tool runs. Returns (allowed, note_for_model)."""
     print(f"\n\033[33m? {name}\033[0m")
-    if name == "edit_file" and "old_string" in args and "new_string" in args:
+    if name == "edit_file" and ("edits" in args or ("old_string" in args and "new_string" in args)):
         print(f"  path: {sanitize_terminal_text(str(args.get('path', '')))}")
-        print(format_diff(sanitize_terminal_text(str(args["old_string"])),
-                          sanitize_terminal_text(str(args["new_string"]))))
+        try:
+            edits = edit_list(args)
+        except ToolError:
+            edits = []
+        for edit in edits:
+            if edit["replace_all"]:
+                print("  (every occurrence)")
+            print(format_diff(sanitize_terminal_text(edit["old_string"]),
+                              sanitize_terminal_text(edit["new_string"])))
     elif name == "write_file" and "content" in args:
         print(f"  path: {sanitize_terminal_text(str(args.get('path', '')))}")
         print(format_diff("", sanitize_terminal_text(str(args["content"]))))
@@ -1587,6 +1718,84 @@ def _canonical_args(raw: str) -> str:
         return json.dumps(json.loads(raw or "{}"), sort_keys=True)
     except ValueError:
         return raw or ""
+
+
+# Explore subagents asked for in one message run at the same time: they are read-only, never ask
+# permission, and each spends most of its life waiting on the API. More than this at once mostly
+# buys rate-limit errors.
+MAX_PARALLEL_SUBAGENTS = 4
+# The workspace sketch in the system prompt is frozen for the conversation, because every provider
+# that caches prompts keys the cache on the prefix: rewriting messages[0] after each turn that
+# edited a file made the whole conversation a cache miss, every time. Changes go out as a short
+# note on the next request instead, unless there are too many for a note to be the cheaper way.
+MAP_DELTA_MAX_ROWS = 25
+
+
+class Cancelled(BaseException):
+    """Raised inside a parallel subagent once the user has interrupted the turn. A BaseException,
+    so none of the loop's own `except Exception` handlers can mistake it for a tool failure."""
+
+
+class EventLanes:
+    """Lets several subagents run at once while the front end still sees one at a time.
+
+    Every observer was written for a strictly nested stream: a task starts, its steps arrive, it
+    ends. Rather than teach each of them to draw interleaved trees, one lane at a time is passed
+    straight through and the rest are held back; when the lane in front finishes, the next one's
+    backlog is replayed and it carries on live. The stream keeps its shape and only the clock
+    differs, which is why `subagent_end` carries its own duration.
+    """
+
+    def __init__(self, sink, count: int):
+        self.sink, self.lock = sink, threading.Lock()
+        self.backlog = [[] for _ in range(count)]
+        self.done = [False] * count
+        self.front, self.closed = 0, False
+
+    def emitter(self, lane: int):
+        def emit(event: str, depth: int = 0, **data) -> None:
+            with self.lock:
+                if self.closed or not self.sink:
+                    return
+                if lane == self.front:
+                    self.sink(event, depth=depth, **data)
+                elif event != "answer_delta":  # nothing draws a subagent's reply forming
+                    self.backlog[lane].append((event, depth, data))
+        return emit
+
+    def finish(self, lane: int) -> None:
+        with self.lock:
+            self.done[lane] = True
+            while self.front < len(self.done) and self.done[self.front]:
+                self.front += 1
+                if self.front < len(self.done) and not self.closed and self.sink:
+                    for event, depth, data in self.backlog[self.front]:
+                        self.sink(event, depth=depth, **data)
+                    self.backlog[self.front].clear()
+
+    def close(self) -> None:
+        with self.lock:
+            self.closed = True
+
+
+def _map_rows(sketch: str) -> dict[str, str]:
+    """A workspace sketch as {path: its row}, leaving out the `... and N more files` tail."""
+    rows = {}
+    for row in sketch.splitlines():
+        path, sep, _ = row.partition(": ")
+        if sep and not row.startswith("... "):
+            rows[path] = row
+    return rows
+
+
+def cached_prompt_tokens(usage) -> int | None:
+    """How many prompt tokens the provider says it read from its cache, or None if it doesn't say.
+    OpenAI-compatible servers put it under prompt_tokens_details; DeepSeek has its own field."""
+    details = getattr(usage, "prompt_tokens_details", None)
+    cached = details.get("cached_tokens") if isinstance(details, dict) else getattr(details, "cached_tokens", None)
+    if cached is None:
+        cached = getattr(usage, "prompt_cache_hit_tokens", None)
+    return cached if isinstance(cached, int) and not isinstance(cached, bool) else None
 
 
 # A stopped subagent used to hand its parent the note written for a person at a keyboard ("send
@@ -1730,6 +1939,195 @@ def console_observer(event: str, depth: int = 0, **data) -> None:
               f"[{data['attempt']}/{data['max_attempts']}])\033[0m")
 
 
+# ---- the trace ------------------------------------------------------------------------------
+# A record of what a session did, kept so a change to the loop can be judged by what it changed
+# rather than by argument: tokens and cache reads per call, what each tool call came to and how
+# long it took, and every time the harness stepped in (a nudge, a budget warning, a repeat).
+# It is content-free by construction -- numbers, flags and fixed labels only, never a path, a
+# command, a prompt or an answer -- so keeping it costs no privacy and it can be shared as it is.
+
+TRACE_KEEP = 50  # trace files kept per project; the oldest go first
+TRACE_LABEL_RE = re.compile(r"^[A-Za-z0-9_.:-]{0,40}$")
+TRACE_FIELDS = {  # event -> the data fields copied into its row, each still checked by _trace_value
+    "model_start": ("purpose",),
+    "model_end": ("purpose", "secs", "prompt_tokens", "completion_tokens", "cached_tokens",
+                  "finish_reason", "error"),
+    "tool_call": (),
+    "tool_result": ("secs",),
+    "compact": ("stage", "before", "after", "pruned"),
+    "retry": ("attempt", "delay"),
+    "subagent_start": ("mode", "routed"),
+    "subagent_end": ("mode", "steps", "secs", "routed"),
+    "signal": ("kind", "reason", "left", "repeats", "size", "report", "count"),
+    "turn_start": (),
+    "turn_end": ("steps", "outcome", "answer_chars", "claims"),
+    "plan": ("active",),
+}
+
+
+def _trace_value(value):
+    """`value` if it is safe to keep -- a number, a flag, or a short fixed label -- else None."""
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return round(value, 3)
+    if isinstance(value, str) and TRACE_LABEL_RE.match(value):
+        return value
+    return None
+
+
+def result_status(result: str) -> tuple[str, int | None]:
+    """(what a tool result came to, the exit code if a command ran). Read off the result's own
+    first words, which the loop writes, so the classification can't drift from the behaviour."""
+    head = (result or "")[:200]
+    match = EXIT_CODE_RE.match(head)
+    if match:
+        code = int(match.group(1))
+        return ("ok" if code == 0 else "exit_nonzero"), code
+    if head.startswith("Error: Command timed out"):
+        return "timeout", None
+    if head.startswith("Error:"):
+        return "error", None
+    if "was denied" in head or head.startswith("The user denied"):
+        return "denied", None
+    if head.startswith(("Interrupted by the user", "Not run:")):
+        return "not_run", None
+    return "ok", None
+
+
+def call_metrics(response) -> dict:
+    """What one API call cost and how it ended, for the model_end event."""
+    choices = getattr(response, "choices", None) or []
+    finish = getattr(choices[0], "finish_reason", None) if choices else None
+    out = {"finish_reason": finish if isinstance(finish, str) else None}
+    usage = getattr(response, "usage", None)
+    if usage:
+        out.update(prompt_tokens=getattr(usage, "prompt_tokens", None),
+                   completion_tokens=getattr(usage, "completion_tokens", None),
+                   cached_tokens=cached_prompt_tokens(usage))
+    return out
+
+
+class Trace:
+    """Appends one JSON row per Agent event to a private file, then hands the event on.
+
+    Rows from subagents run side by side arrive in the order the front end sees them (see
+    EventLanes), so their `t` is when they were shown, not when they happened; durations are
+    carried in the events themselves for that reason.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.start = time.monotonic()
+        self.lock = threading.Lock()
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        self.file = os.fdopen(fd, "a", encoding="utf-8")
+
+    def write(self, row: dict) -> None:
+        try:
+            with self.lock:
+                self.file.write(json.dumps(row, ensure_ascii=False) + "\n")
+                self.file.flush()
+        except (OSError, ValueError, TypeError):
+            pass  # a trace that can't be written must never cost the user a turn
+
+    def record(self, event: str, depth: int = 0, **data) -> None:
+        if event not in TRACE_FIELDS:
+            return  # answer_delta, thought, notice: words, which a trace does not keep
+        row = {"t": round(time.monotonic() - self.start, 3), "event": event, "depth": depth}
+        for key in TRACE_FIELDS[event]:
+            value = _trace_value(data.get(key))
+            if value is not None:
+                row[key] = value
+        if event in ("tool_call", "tool_result"):
+            name = _trace_value(data.get("name"))
+            row["tool"] = name if name else "?"
+        if event == "tool_call":
+            row["args_chars"] = len(str(data.get("arguments") or ""))
+        elif event == "tool_result":
+            result = str(data.get("result") or "")
+            row["status"], code = result_status(result)
+            row["chars"] = len(result)
+            if code is not None:
+                row["exit"] = code
+        elif event == "plan":
+            row["steps"] = len(data.get("steps") or ())
+        self.write(row)
+
+    def observe(self, inner):
+        """An on_event callback that records, then calls `inner` (which may be None)."""
+        def on_event(event, depth=0, **data):
+            self.record(event, depth, **data)
+            if inner:
+                inner(event, depth=depth, **data)
+        return on_event
+
+    def close(self) -> None:
+        with self.lock:
+            self.file.close()
+
+
+def choose_trace(env, home: Path, workspace: Path) -> Path | None:
+    """Where this session's trace goes. KYKLOS_TRACE=0 turns it off and a path picks the file;
+    otherwise it is a new file in the project's own folder under KYKLOS_HOME, beside last.jsonl."""
+    raw = (env.get("KYKLOS_TRACE") or "").strip()
+    if raw.lower() in {"0", "off", "false", "no", "none"}:
+        return None
+    if raw:
+        return Path(raw).expanduser()
+    folder = ensure_private_dir(project_dir(home, workspace) / "traces")
+    old = sorted(folder.glob("*.jsonl"), key=lambda f: f.stat().st_mtime)
+    for stale in old[:max(len(old) - TRACE_KEEP + 1, 0)]:
+        stale.unlink(missing_ok=True)
+    return folder / f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.jsonl"
+
+
+# ---- unattended evaluation runs --------------------------------------------------------------
+# eval.py runs Kyklos on a throwaway copy of a fixture with nobody at the keyboard, which the
+# permission rules deliberately make useless: with no one to ask, everything that asks is denied.
+# --eval swaps the person for a fixed policy, and is refused unless three things hold that make
+# the swap tolerable: the workspace is a directory eval.py made inside the system temp folder, and
+# says so with a marker file, and the kernel sandbox is on, so whatever the model runs can write
+# only there and reach no network.
+
+EVAL_MARKER = ".kyklos-eval"
+
+
+def eval_workspace_problem(workspace: Path, env=None) -> str:
+    """Why --eval may not run in `workspace`, or "" when it may."""
+    env = os.environ if env is None else env
+    raw = env.get("KYKLOS_EVAL_ROOT")
+    if not raw:
+        return "--eval is for eval.py, which sets KYKLOS_EVAL_ROOT; it can't be used by hand."
+    root = Path(raw).resolve()
+    temp = Path(tempfile.gettempdir()).resolve()
+    if temp not in root.parents:
+        return f"--eval refused: {root} is not inside the system temp folder {temp}."
+    if not (root / EVAL_MARKER).is_file():
+        return f"--eval refused: {root} has no {EVAL_MARKER} marker, so eval.py didn't make it."
+    workspace = workspace.resolve()
+    if workspace != root and root not in workspace.parents:
+        return f"--eval refused: the workspace {workspace} is outside the eval folder {root}."
+    kind, label = probe_sandbox(env=env)
+    if kind not in ("seatbelt", "bwrap"):
+        return (f"--eval refused: bash isn't sandboxed here ({label}), and approving the model's commands "
+                "unattended without a sandbox would run them directly on this machine.")
+    return ""
+
+
+def eval_permission(name: str, args: dict, always_allowed: set) -> tuple[bool, str]:
+    """The approval policy for --eval: what a person in `u` mode would let through, plus edits and
+    commands Kyklos can't read (the sandbox is the backstop for those) -- but never a red finding
+    or a secret, which no amount of sandbox makes a good idea."""
+    touches_secret, _, findings = permission_options(name, args)
+    why = ("it names a secret file" if touches_secret
+           else next((text for level, text in findings if level == "danger"), ""))
+    if why:
+        return False, (f"The {name} call was denied: this is an unattended evaluation run, which never "
+                       f"approves a call when {why}. Find a way that stays inside the workspace.")
+    return True, ""
+
+
 class Agent:
     def __init__(self, client, model: str, workspace: Path, permission=ask_permission,
                  context_window: int = DEFAULT_CONTEXT_WINDOW, tool_names: set = None,
@@ -1776,15 +2174,23 @@ class Agent:
         self.always_allowed: set[str] = always_allowed if always_allowed is not None else set()
         self.last_steps = 0
         self.last_claims: list[tuple[str, str]] = []  # answer claims this turn didn't back up
-        self._repo_map: str | None = None
-        self._map_dirty = True  # a written file makes the sketch stale, and a stale map misleads
+        self._repo_map: str | None = None  # the sketch frozen into the system prompt; None = scan again
+        self._map_known = ""  # the newest sketch the model has been told about: the prompt's, plus notes
+        self._map_dirty = False  # a file was written since _map_known was taken
+        self.cancel: threading.Event | None = None  # set by a parent that runs this agent on a thread
         # Billed tokens for the whole session: prompt + completion over every API call, including
         # compaction summaries and subagents. Set here rather than in reset(), so /reset clears the
         # conversation without forgetting what has already been spent.
         self.session_tokens = 0
+        # Of the prompt tokens sent on calls where the provider reported its cache: how many, and
+        # how many of those it read from the cache. The ratio is what prefix stability buys.
+        self.cache_seen_tokens = 0
+        self.cache_read_tokens = 0
         self.reset()
 
     def _emit(self, event: str, **data) -> None:
+        if self.cancel is not None and self.cancel.is_set():
+            raise Cancelled()
         if self.on_event:
             self.on_event(event, depth=self.depth, **data)
 
@@ -1792,6 +2198,7 @@ class Agent:
         """Call chat.completions.create, retrying transient rate-limit, 5xx, and connection errors.
         Emits model_start / model_end around the wait (purpose: "turn" or "summary"), so a UI can show a spinner."""
         self._emit("model_start", purpose=purpose)
+        started, metrics = time.monotonic(), {}
         try:
             for attempt in range(1, MAX_API_RETRIES + 1):
                 try:
@@ -1813,6 +2220,7 @@ class Agent:
                         response = collect_stream(response, on_content=self._answer_delta(purpose))
                     self._count_usage(response)  # every API call lands here, so the tally is complete
                     self._note_missing_usage(response)
+                    metrics = call_metrics(response)
                     return response
                 except Exception as e:
                     if attempt >= MAX_API_RETRIES or not is_retryable_error(e):
@@ -1821,8 +2229,11 @@ class Agent:
                     self._emit("retry", attempt=attempt, max_attempts=MAX_API_RETRIES, delay=delay,
                                error=error_detail(e))
                     self.sleep(delay)
+        except BaseException as e:
+            metrics = {"error": type(e).__name__}
+            raise
         finally:
-            self._emit("model_end", purpose=purpose)
+            self._emit("model_end", purpose=purpose, secs=time.monotonic() - started, **metrics)
 
     def _count_usage(self, response) -> None:
         """Add one call's billed tokens to the session tally. Providers that report no usage are
@@ -1832,6 +2243,10 @@ class Agent:
             return
         self.session_tokens += ((getattr(usage, "prompt_tokens", 0) or 0)
                                 + (getattr(usage, "completion_tokens", 0) or 0))
+        cached = cached_prompt_tokens(usage)
+        if cached is not None:
+            self.cache_seen_tokens += getattr(usage, "prompt_tokens", 0) or 0
+            self.cache_read_tokens += cached
 
     def _answer_delta(self, purpose: str):
         """A sink for assistant content as it streams, or None when nothing should watch it.
@@ -1893,7 +2308,9 @@ class Agent:
             prompt += ("\n- Every step re-sends this whole conversation, so each file you read here "
                        "is paid for again on every step that follows. If answering something will "
                        "take more than two or three reads or searches, delegate it with the task "
-                       "tool (mode 'explore'): only its answer comes back, not every file it read.")
+                       "tool (mode 'explore'): only its answer comes back, not every file it read. "
+                       "Independent questions can go out as several task calls in one message; "
+                       "explore subagents then run at the same time.")
         if self.plan_mode:
             prompt += PLAN_PROMPT
         if self.depth > 0:
@@ -1912,23 +2329,62 @@ class Agent:
             self.messages = [{"role": "system", "content": prompt}]
 
     def repo_map_section(self) -> str:
-        """The workspace sketch for the system prompt, rebuilt when files have changed.
+        """The workspace sketch for the system prompt.
 
         It goes in the system prompt for the same reason AGENTS.md does: it's context about the
         project, not about a turn. That costs its size on every call, which is why it's names only
         and capped — measured at ~340 tokens for this repository, well under a percent of a long
         session's bill, against the three to six exploratory turns it saves at the start.
+
+        Scanned once and then left alone until something else rewrites the prompt anyway (/reset,
+        a resumed session, compaction): see MAP_DELTA_MAX_ROWS for why, and _map_update for how
+        the model hears about files that changed in between.
         """
-        if self._repo_map is None or self._map_dirty:
-            try:
-                self._repo_map = repository_map(self.tools.workspace)
-            except OSError:
-                self._repo_map = ""
-            self._map_dirty = False
-        if not self._repo_map:
+        if self._repo_map is None:
+            self._repo_map = self._scan_map()
+            self._map_known, self._map_dirty = self._repo_map, False
+        return self._map_section(self._repo_map)
+
+    def _scan_map(self) -> str:
+        try:
+            return repository_map(self.tools.workspace)
+        except OSError:
+            return ""
+
+    @staticmethod
+    def _map_section(sketch: str) -> str:
+        if not sketch:
             return ""
         return ("\n\nWhat's in this workspace (names only, generated — read a file to confirm "
-                f"anything before relying on it):\n{self._repo_map}")
+                f"anything before relying on it):\n{sketch}")
+
+    def _map_update(self) -> str:
+        """What changed in the workspace sketch since the model was last told, as a note for the
+        next request ("" when nothing did, or when the prompt was rebuilt instead)."""
+        self._map_dirty = False
+        old, new_sketch = _map_rows(self._map_known), self._scan_map()
+        new = _map_rows(new_sketch)
+        changed = [row for path, row in new.items() if old.get(path) != row]
+        removed = [path for path in old if path not in new]
+        self._map_known = new_sketch
+        if not changed and not removed:
+            return ""
+        if not self._repo_map or len(changed) + len(removed) > MAP_DELTA_MAX_ROWS:
+            self._repo_map = None  # a note this long costs more than the cache it protects
+            self._update_mode()
+            return ""
+        note = ("[Kyklos: files have changed since the workspace sketch in your instructions was "
+                "generated. These entries replace the ones there:\n" + "\n".join(changed))
+        if removed:
+            note += "\nNo longer present: " + ", ".join(removed)
+        return note + "]"
+
+    def _settle_map(self) -> None:
+        """Fold outstanding sketch changes into the system prompt. Called when the conversation
+        has just been rewritten anyway, so the prompt cache is already lost and this is free."""
+        if self.depth == 0 and (self._map_dirty or self._map_known != self._repo_map):
+            self._repo_map = None
+            self._update_mode()
 
     def set_model(self, model: str, effort: str = "default", context_window: int | None = None) -> None:
         """Switch model (and its thinking effort) mid-conversation; the messages carry over unchanged.
@@ -1981,6 +2437,7 @@ class Agent:
 
     def reset(self) -> None:
         self.messages = []
+        self._repo_map = None  # a new conversation has no cached prefix to protect
         self._update_mode()
         self.usage_mark = None  # (prompt_tokens the API reported, message count at that call)
         self.current_request = None  # the user message this turn is answering; never summarized away
@@ -2032,7 +2489,8 @@ class Agent:
         lines = [json.dumps(m, ensure_ascii=False) for m in self.messages[1:]]
         meta = {"_meta": "state", "turn_log": self.turn_log, "usage_mark": self.usage_mark,
                 "plan_mode": self.plan_mode, "session_tokens": self.session_tokens,
-                "plan": {"steps": self.tools.plan_steps, "active": self.tools.plan_active}}
+                "plan": {"steps": self.tools.plan_steps, "active": self.tools.plan_active},
+                "cache": [self.cache_read_tokens, self.cache_seen_tokens]}
         lines.append(json.dumps(meta, ensure_ascii=False))
         write_private_text(path, "\n".join(lines) + "\n")
 
@@ -2050,6 +2508,9 @@ class Agent:
                 self.usage_mark = tuple(obj["usage_mark"]) if obj.get("usage_mark") else None
                 self.session_tokens = int(obj.get("session_tokens", 0))  # older sessions have none
                 self.set_plan_mode(bool(obj.get("plan_mode", False)))
+                cache = obj.get("cache") or [0, 0]
+                if isinstance(cache, list) and len(cache) == 2 and all(isinstance(n, int) for n in cache):
+                    self.cache_read_tokens, self.cache_seen_tokens = cache
                 plan = obj.get("plan") or {}  # older sessions have none
                 steps, active = plan.get("steps") or [], plan.get("active", 0)
                 if (isinstance(steps, list) and all(isinstance(s, str) for s in steps)
@@ -2114,6 +2575,7 @@ class Agent:
             self.messages = [self.messages[0]] + pruned_body
             self.usage_mark = None
             if self.context_tokens() <= budget * PRUNE_TARGET:
+                self._settle_map()
                 self._emit("compact", stage="pruned", pruned=pruned, before=before, after=self.context_tokens())
                 return True
 
@@ -2154,6 +2616,7 @@ class Agent:
             tail.insert(0, {"role": "user", "content": note})
         self.messages = [self.messages[0]] + tail
         self.usage_mark = None
+        self._settle_map()
         self._emit("compact", stage="summarized", before=before, after=self.context_tokens())
         return True
 
@@ -2224,28 +2687,119 @@ class Agent:
             return f"Error: mode must be one of {', '.join(SUBAGENT_TOOLS)}"
         if self.plan_mode and mode != "explore":
             return "Error: in plan mode, subagents must use mode 'explore'."
+        sub, routed = self._spawn(mode)
+        answer = self._run_spawned(sub, routed, description, prompt, mode)
+        self._bill(sub)
+        return answer
+
+    def _spawn(self, mode: str, on_event=None, cancel=None) -> tuple["Agent", bool]:
         sub_model, sub_effort, sub_window = self.effective_subagent_config()
         routed = bool(self.subagent_model and (sub_model != self.model or sub_effort != self.effort))
         sub = Agent(self.client, sub_model, self.tools.workspace, permission=self.permission,
                     context_window=sub_window, tool_names=SUBAGENT_TOOLS[mode],
                     depth=self.depth + 1, always_allowed=self.always_allowed,
-                    before_write=self._before_write, on_event=self.on_event, sleep=self.sleep,
+                    before_write=self._before_write, on_event=on_event or self.on_event, sleep=self.sleep,
                     effort=sub_effort, max_steps=self.max_steps, compact_above=self.compact_above,
                     stream=self.stream, notices_seen=self.notices_seen)
         sub.auto_bash = self.auto_bash
-        sub._emit("subagent_start", description=description, mode=mode, model=sub_model, effort=sub_effort,
-                  routed=routed)
-        answer = sub.send(prompt)
-        self.session_tokens += sub.session_tokens  # a subagent's calls are billed to this session too
-        sub._emit("subagent_end", description=description, mode=mode, steps=sub.last_steps, model=sub_model,
-                  effort=sub_effort, routed=routed)
+        sub.cancel = cancel
+        return sub, routed
+
+    def _run_spawned(self, sub: "Agent", routed: bool, description: str, prompt: str, mode: str) -> str:
+        shown = dict(description=description, mode=mode, model=sub.model, effort=sub.effort, routed=routed)
+        sub._emit("subagent_start", **shown)
+        started = time.monotonic()
+        try:
+            answer = sub.send(prompt)
+        except Exception as e:
+            # A subagent's API failure used to end the parent's turn with its task call left
+            # unanswered, which the next request is then refused for. It is a failed tool call
+            # like any other: the parent hears why and decides what to do about it.
+            answer = f"Error: the subagent failed before it could answer: {error_detail(e)}"
+        sub._emit("subagent_end", steps=sub.last_steps, secs=time.monotonic() - started, **shown)
         return answer or "(The subagent finished without an answer.)"
+
+    def _bill(self, sub: "Agent") -> None:
+        """A subagent's calls are billed to this session too."""
+        self.session_tokens += sub.session_tokens
+        self.cache_seen_tokens += sub.cache_seen_tokens
+        self.cache_read_tokens += sub.cache_read_tokens
+
+    def _explore_task(self, tc) -> dict | None:
+        """The arguments of a task call that can run beside others, or None if it can't: only a
+        well-formed explore task, which reads and never asks. Anything else takes the ordinary
+        path, where its mistakes get their ordinary error."""
+        if tc.function.name != "task" or "task" not in self.tool_names:
+            return None
+        try:
+            args = json.loads(tc.function.arguments or "{}")
+        except ValueError:
+            return None
+        if (not isinstance(args, dict) or set(args) - {"description", "prompt", "mode"}
+                or not isinstance(args.get("description"), str) or not isinstance(args.get("prompt"), str)
+                or args.get("mode", "explore") != "explore"):
+            return None
+        return args
+
+    def _run_explore_batch(self, batch: list[tuple]) -> list[str]:
+        """Run several explore tasks at once and return their results in the order asked for.
+
+        Each lane emits the parent's own tool_call and tool_result around its subagent's events,
+        so what reaches the front end, one lane after another, is exactly the stream a serial run
+        would have produced.
+        """
+        lanes = EventLanes(self.on_event, len(batch))
+        cancel, slots = threading.Event(), threading.Semaphore(MAX_PARALLEL_SUBAGENTS)
+        results: list[str | None] = [None] * len(batch)
+        subs: list[Agent | None] = [None] * len(batch)
+
+        def work(i: int, tc, args: dict) -> None:
+            emit = lanes.emitter(i)
+            try:
+                with slots:
+                    if cancel.is_set():
+                        return
+                    emit("tool_call", depth=self.depth, name="task", arguments=tc.function.arguments)
+                    started = time.monotonic()
+                    subs[i], routed = self._spawn("explore", on_event=emit, cancel=cancel)
+                    result = self._run_spawned(subs[i], routed, args["description"], args["prompt"], "explore")
+                    emit("tool_result", depth=self.depth, name="task",
+                         result=scrub_secrets(result, workspace=self.tools.workspace)[0],
+                         secs=time.monotonic() - started)
+                    results[i] = result
+            except Cancelled:
+                pass
+            finally:
+                lanes.finish(i)
+
+        threads = [threading.Thread(target=work, args=(i, tc, args), daemon=True)
+                   for i, (tc, args) in enumerate(batch)]
+        for thread in threads:
+            thread.start()
+        try:
+            for thread in threads:
+                while thread.is_alive():  # a bare join() can't be interrupted on Windows
+                    thread.join(0.1)
+        except KeyboardInterrupt:
+            # The threads can't be killed, only told: each stops at its next event, and nothing
+            # they emit from here on reaches the screen.
+            cancel.set()
+            lanes.close()
+            raise
+        for sub in subs:
+            if sub is not None:
+                self._bill(sub)
+        return [result if result is not None else "Interrupted by the user." for result in results]
 
     def send(self, user_text: str) -> str:
         """Run one user turn through the agent loop and return the final answer."""
+        self._emit("turn_start")
+        preface = ""
         if self.depth == 0:
-            if self._map_dirty:  # last turn changed files; refresh the sketch before relying on it
-                self._update_mode()
+            if self._map_dirty:  # last turn changed files: say which, without touching the prompt
+                preface = self._map_update()
+                if preface:
+                    self._emit("signal", kind="map_note")
             snapshots: dict[Path, bytes | None] = {}
             self.undo_stack.append((
                 json.loads(json.dumps(self.messages)),
@@ -2254,14 +2808,24 @@ class Agent:
                 snapshots,
             ))
             self.active_snapshots = snapshots
+        answer, self.last_outcome = None, "error"
         try:
-            return self._send_turn(user_text)
+            answer = self._send_turn(user_text, preface)
+            return answer
+        except KeyboardInterrupt:
+            self.last_outcome = "interrupted"
+            raise
         finally:
             if self.depth == 0:
                 self.active_snapshots = None
+            if self.cancel is None or not self.cancel.is_set():
+                self._emit("turn_end", steps=self.last_steps, outcome=self.last_outcome,
+                           answer_chars=len(answer or ""), claims=len(self.last_claims))
 
-    def _send_turn(self, user_text: str) -> str:
-        self.messages.append({"role": "user", "content": user_text})
+    def _send_turn(self, user_text: str, preface: str = "") -> str:
+        # The preface is Kyklos's, not the user's: it rides in front, so the message still ends
+        # with the request verbatim, which is what compaction and the turn log go by.
+        self.messages.append({"role": "user", "content": f"{preface}\n\n{user_text}" if preface else user_text})
         self.current_request = user_text
         compactions = 0
         tools_run = 0
@@ -2269,12 +2833,15 @@ class Agent:
         self.last_claims = []
         commands_run: list[tuple[str, str]] = []  # (command, result), to check the answer's story
         last_signature, repeats = None, 0  # (tool, arguments, result) of the previous call, and its run
+        # A fifth of the budget from the end, and never fewer than two steps: enough room to act on it.
+        budget_warning = self.max_steps - max(2, self.max_steps // 5)
         nudged = False  # the false-stop nudge, like the delegation hint, is once per turn
         plan_touched = False  # whether this turn set or advanced the plan
         for step in range(1, self.max_steps + 1):
             self.last_steps = step
             if self.context_tokens() > self.compaction_trigger():
                 if compactions >= MAX_COMPACTIONS_PER_TURN:
+                    self.last_outcome = "compaction_stop"
                     return (f"(Stopped: compacted {compactions} times in one turn and the conversation keeps "
                             f"outgrowing its {self.compaction_trigger():,}-token working limit. Raise "
                             f"COMPACT_ABOVE (or CONTEXT_WINDOW, if that's what's binding) to carry more "
@@ -2308,7 +2875,8 @@ class Agent:
                     self._false_stop(msg.content or "", plan_touched)
                 if stop:
                     nudged = True
-                    to_model, to_user = stop
+                    to_model, to_user, reason = stop
+                    self._emit("signal", kind="nudge", reason=reason)
                     if (msg.content or "").strip():
                         self._emit("thought", text=msg.content)
                     else:  # an assistant message with no content is refused by several servers
@@ -2317,6 +2885,7 @@ class Agent:
                     self.messages.append({"role": "user", "content": f"[Kyklos: {to_model}]"})
                     continue
                 self.turn_log.append((user_text, msg.content or ""))
+                self.last_outcome = "cut_off" if truncated else "answer"
                 self.last_claims = unsupported_claims(msg.content or "", commands_run)
                 if truncated:  # an answer that stops mid-sentence should not look finished
                     self._emit("notice", text="This answer was cut off: the model reached its output "
@@ -2325,7 +2894,19 @@ class Agent:
 
             if msg.content:
                 self._emit("thought", text=msg.content)
+            prefetched: dict[int, str] = {}  # results of explore tasks that ran side by side
             for n, tc in enumerate(msg.tool_calls):
+                if n not in prefetched and not truncated:
+                    batch = []
+                    for later in msg.tool_calls[n:]:  # the run of explore tasks starting here
+                        args = self._explore_task(later)
+                        if args is None:
+                            break
+                        batch.append((later, args))
+                    if len(batch) > 1:
+                        self._emit("signal", kind="parallel_batch", size=len(batch))
+                        prefetched.update(zip(range(n, n + len(batch)), self._run_explore_batch(batch)))
+                ran_already = n in prefetched  # and so did its tool_call and tool_result events
                 tools_run += 1
                 plan_touched = plan_touched or tc.function.name == "plan"
                 bash_command = ""
@@ -2334,20 +2915,27 @@ class Agent:
                         bash_command = str(json.loads(tc.function.arguments).get("command", ""))
                     except (ValueError, AttributeError):
                         bash_command = ""
-                self._emit("tool_call", name=tc.function.name, arguments=tc.function.arguments)
-                if truncated and not _is_json_object(tc.function.arguments):
+                if not ran_already:
+                    self._emit("tool_call", name=tc.function.name, arguments=tc.function.arguments)
+                started = time.monotonic()
+                if ran_already:
+                    result = prefetched[n]
+                elif truncated and not _is_json_object(tc.function.arguments):
                     # "Not valid JSON, send valid JSON" was true and useless: the model resent the same
                     # oversized write and was cut off at the same place.
                     result = TRUNCATED_CALL_NOTE
+                    self._emit("signal", kind="truncated_call")
                 else:
                     result = self.run_tool(tc.function.name, tc.function.arguments)
                 # SEC-04: secrets never reach the model (or the screen) through tool output.
                 result, redacted = scrub_secrets(result, workspace=self.tools.workspace)
                 if redacted:
+                    self._emit("signal", kind="redacted", count=redacted)
                     result += (f"\n\n[Kyklos redacted {redacted} secret value{'s' if redacted > 1 else ''} "
                                "from this output. Don't try to recover them.]")
                 if not hinted and self._should_hint_delegation():
                     result += f"\n\n{self._delegation_hint()}"
+                    self._emit("signal", kind="delegation_hint")
                     hinted = True
                 if bash_command:
                     commands_run.append((bash_command, result))
@@ -2357,13 +2945,29 @@ class Agent:
                 repeats = repeats + 1 if signature == last_signature else 1
                 last_signature = signature
                 if repeats >= REPEAT_WARN:
+                    self._emit("signal", kind="repeat_warn", repeats=repeats)
                     result += (f"\n\n[Kyklos: this exact call has returned this exact result {repeats} times in a "
                                f"row. Repeating it will not change the outcome: re-read the result, check what "
                                f"you assumed (the file's current text, the path, the command), or take another "
                                f"approach. At {REPEAT_STOP} the turn stops.]")
-                self._emit("tool_result", name=tc.function.name, result=result)
+                if step == budget_warning and n == len(msg.tool_calls) - 1:
+                    # The model sees the files it read, not the cap it is working under: without
+                    # this it walks into the limit mid-task with nothing wrapped up.
+                    left = self.max_steps - step
+                    self._emit("signal", kind="budget_warning", left=left)
+                    result += (f"\n\n[Kyklos: {left} step{'' if left == 1 else 's'} left of this turn's "
+                               f"{self.max_steps}. Finish what matters most, then "
+                               + ("give your final answer, saying what is done and what is not.]"
+                                  if self.depth else
+                                  "answer with what is done and what remains; the user can send "
+                                  "\"continue\" for more.]"))
+                if not ran_already:
+                    self._emit("tool_result", name=tc.function.name, result=result,
+                               secs=time.monotonic() - started)
                 self.messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
                 if repeats >= REPEAT_STOP:
+                    self.last_outcome = "repeat_stop"
+                    self._emit("signal", kind="repeat_stop", repeats=repeats)
                     # Every call in the message needs a result, or the next request is rejected.
                     for skipped in msg.tool_calls[n + 1:]:
                         self.messages.append({"role": "tool", "tool_call_id": skipped.id,
@@ -2375,6 +2979,7 @@ class Agent:
                             f"times in a row, so the turn was going nowhere. The conversation is kept: say "
                             f'how to proceed, or send "continue" to let it try again.)')
 
+        self.last_outcome = "step_limit"
         if self.depth > 0:
             return self._stopped_report(f"you reached the limit of {self.max_steps} steps")
         return self._step_limit_note(tools_run)
@@ -2392,6 +2997,7 @@ class Agent:
             report = (response.choices[0].message.content or "").strip()
         except Exception:  # the stop already happened; a failed report must not turn it into a crash
             report = ""
+        self._emit("signal", kind="stopped_report", report=bool(report))
         told = reason.replace("you reached", "it reached")
         if not report:
             self.messages.pop()  # leave the conversation ending on its tool results, as before
@@ -2401,19 +3007,21 @@ class Agent:
         return (f"[The subagent was stopped because {told}, so this is a partial report of what it "
                 f"found, not a finished answer.]\n{report}")
 
-    def _false_stop(self, content: str, plan_touched: bool) -> tuple[str, str] | None:
-        """(what to tell the model, what to tell the user) if this reply ends the turn by accident."""
+    def _false_stop(self, content: str, plan_touched: bool) -> tuple[str, str, str] | None:
+        """(what to tell the model, what to tell the user, a label for the trace) if this reply ends
+        the turn by accident."""
         if not content.strip():
             return ("your last reply was empty: no text and no tool call. If the task is finished, reply "
                     "with a short summary of what you did and what you verified. Otherwise carry on with "
                     "the next tool call.",
-                    "The model sent an empty reply; Kyklos asked it to carry on or sum up.")
+                    "The model sent an empty reply; Kyklos asked it to carry on or sum up.", "empty")
         name = text_tool_call(content, self.tool_names)
         if name:
             return (f"you wrote a {name} call as text in your reply, so nothing ran: text is never "
                     f"executed. Make the call through the tool-calling interface, or if you are finished, "
                     f"answer in plain prose.",
-                    f"The model wrote a {name} call as text, so nothing ran; Kyklos asked it to call the tool.")
+                    f"The model wrote a {name} call as text, so nothing ran; Kyklos asked it to call the tool.",
+                    "text_call")
         steps, active = self.tools.plan_steps, self.tools.plan_active
         # Only a plan with a step never started: a model on its last step that forgets to close the
         # plan has finished, and a question is a deliberate stop.
@@ -2423,7 +3031,7 @@ class Agent:
                     f"If work remains, carry on with it now. If you are finished or stopping on purpose, "
                     f"update the plan (active 0, or new steps) and say what is left and why.",
                     f"The answer stopped at step {active} of {len(steps)}; Kyklos asked the model to finish "
-                    f"or say why.")
+                    f"or say why.", "plan")
         return None
 
     def _should_hint_delegation(self) -> bool:
@@ -3005,6 +3613,8 @@ def context_breakdown(agent: "Agent") -> dict:
                   ("Messages", estimate_tokens(talk)),
                   ("Tool results", estimate_tokens(results))],
         "session_tokens": agent.session_tokens,
+        "cache_read": agent.cache_read_tokens,
+        "cache_seen": agent.cache_seen_tokens,
         "compact_at": agent.compaction_trigger(),
         "compact_capped": agent.compaction_trigger() < int(agent.context_window * COMPACT_AT),
     }
@@ -3221,14 +3831,18 @@ def _cmd_tokens(ctx, arg):
     lines.append(f"  {'subtotal:':<15}~{sum(n for _, n in data['parts']):,}")
     lines.append(f"Session billed: {data['session_tokens']:,}" if data["session_tokens"]
                  else "Session billed: not reported by this provider")
+    lines.append(f"Prompt cache:   {data['cache_read'] / data['cache_seen']:.0%} of {data['cache_seen']:,} "
+                 f"prompt tokens read from cache" if data["cache_seen"]
+                 else "Prompt cache:   not reported by this provider")
     lines.append(f"Compacts at:    {data['compact_at']:,}")
     ctx.show("tokens", data, "\n".join(lines))
 
 
 @command("map", "/map", "Show the workspace sketch the model starts each turn with")
 def _cmd_map(ctx, arg):
-    ctx.agent._map_dirty = True  # always show what's on disk now, not a cached view
-    sketch = ctx.agent.repo_map_section().strip()
+    # What's on disk now. The model's copy is the one from the start of the conversation plus
+    # the change notes it has been sent since, which add up to the same thing.
+    sketch = ctx.agent._map_section(ctx.agent._scan_map()).strip()
     ctx.say("info", sketch or "No source files recognised here; the model starts with no sketch.")
 
 
@@ -3645,6 +4259,15 @@ def main() -> None:
         if idx >= len(args):
             sys.exit("--profile needs a name, e.g. kyklos --profile local")
         profile_flag = args.pop(idx)
+    # Refused before anything else happens, network included: --eval is for eval.py, never by hand.
+    eval_mode = "--eval" in args  # unattended approval; see eval_workspace_problem
+    if eval_mode:
+        args.remove("--eval")
+        problem = eval_workspace_problem(Path(os.environ.get("WORKSPACE") or Path.cwd()))
+        if problem:
+            sys.exit(problem)
+        if not args:
+            sys.exit("--eval runs one task: give it as the argument.")
     home = kyklos_home()
     settings = load_settings(home)
     profile = choose_profile(profile_flag, settings, os.environ)
@@ -3699,6 +4322,8 @@ def main() -> None:
     if "--plan" in args:
         args.remove("--plan")
         plan_mode = True
+    if eval_mode:
+        preapproved = True  # eval.py made this folder a moment ago, from the project's own fixtures
     if "--resume" in args:
         idx = args.index("--resume")
         args.pop(idx)
@@ -3708,7 +4333,7 @@ def main() -> None:
             resume_path = default_session
 
     ui = None
-    if wants_aero_ui(sys.stdin.isatty(), sys.stdout.isatty(), os.environ):
+    if not eval_mode and wants_aero_ui(sys.stdin.isatty(), sys.stdout.isatty(), os.environ):
         # ui.py imports `kyklos`; point that name at this running script instead of loading a second copy.
         sys.modules.setdefault("kyklos", sys.modules[__name__])
         try:
@@ -3721,11 +4346,22 @@ def main() -> None:
                          ask=ui.ask_trust if ui else ask_trust_plain):
         sys.exit(f"Kyklos isn't trusted to work in {workspace}. Run kyklos there in a terminal to decide, "
                  "or pass --trust to allow it for one run.")
+    # In --eval the trace is the record and stdout carries the answer alone, so nothing is drawn.
+    observer = None if eval_mode else (ui.observer if ui else console_observer)
+    trace = None
+    trace_path = choose_trace(os.environ, home, workspace)
+    if trace_path:
+        try:
+            trace = Trace(trace_path)
+            observer = trace.observe(observer)
+        except OSError as e:
+            print(f"! No trace this session: {e}", file=sys.stderr)
+    permission = eval_permission if eval_mode else (ui.permission if ui else ask_permission)
     agent = Agent(client, model, workspace, context_window=window, plan_mode=plan_mode, effort=effort,
                   max_steps=choose_max_steps(os.environ), compact_above=choose_compact_above(os.environ),
                   subagent_model=sub_model, subagent_effort=sub_effort, subagent_context_window=sub_window,
                   persona=persona, home=home, stream=choose_stream(os.environ),
-                  **({"permission": ui.permission, "on_event": ui.observer} if ui else {}))
+                  permission=permission, on_event=observer)
     if persona and not persona_path(persona, home):
         # Named but not there: say so rather than starting a plain agent that looks like the persona.
         print(f"No persona named {persona} in {home / 'personas'} (from {persona_source}); "
@@ -3738,6 +4374,12 @@ def main() -> None:
         agent.auto_bash = (ui.ask_bash_mode() if ui else ask_bash_mode_plain())
     agent.context_source = window_source
     agent.model_source = model_source
+    if trace:
+        trace.write({"t": 0.0, "event": "session", "version": __version__, "model": _trace_value(agent.model),
+                     "effort": _trace_value(agent.effort), "subagent_model": _trace_value(sub_model),
+                     "stream": agent.stream, "max_steps": agent.max_steps, "context_window": window,
+                     "compact_at": agent.compaction_trigger(), "sandbox": probe_sandbox()[0],
+                     "auto_bash": agent.auto_bash, "eval": eval_mode, "resumed": bool(resume_path)})
     resume_note = None
     if resume_path:
         try:

@@ -1,0 +1,5 @@
+{
+  "prompt": "Run `python3 run_checks.py` and fix whatever makes it fail. Fix the code it checks, not run_checks.py.",
+  "summary": "a failure in the middle of ~40k characters of output, past the 20k cut",
+  "timeout": 600
+}

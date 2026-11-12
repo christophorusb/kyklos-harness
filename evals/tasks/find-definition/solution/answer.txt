@@ -1,0 +1,1 @@
+It is `to_seconds` in chrono/convert.py, starting on line 21.

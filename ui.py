@@ -31,7 +31,7 @@ from kyklos import (BASH_MODE_CAVEAT, BASH_MODE_EXPLANATION, BROAD_WARNING, EXIT
                     __version__, apply_permission_answer, denial_note, ensure_private_dir,
                     error_detail, has_danger, has_opaque, permission_options, run_command, sandbox_warning,
                     short_tokens)
-from tools import ToolError, _match_edit, sanitize_terminal_text
+from tools import ToolError, _match_edit, apply_edits, edit_list, sanitize_terminal_text
 
 BASH_FULL_OUTPUT_LINES = 8  # bash output up to this many lines is shown in full; longer shows the last 3
 
@@ -675,9 +675,11 @@ class AeroUI:
         self._subs.append({"description": description, "mode": mode, "model": model, "effort": effort,
                            "start": time.monotonic(), "steps": deque(maxlen=3), "count": 0})
 
-    def _on_subagent_end(self, depth, steps=0, model=None, effort=None, **_):
+    def _on_subagent_end(self, depth, steps=0, model=None, effort=None, secs=None, **_):
         sub = self._subs.pop() if self._subs else {"start": time.monotonic()}
-        self._last_sub = {"steps": steps, "secs": time.monotonic() - sub["start"],
+        # The event's own duration when it has one: a subagent that ran beside others is drawn
+        # after the fact, and the time since its block appeared would say it took no time at all.
+        self._last_sub = {"steps": steps, "secs": time.monotonic() - sub["start"] if secs is None else secs,
                           "model": model or sub.get("model"), "effort": effort or sub.get("effort")}
 
     def _on_compact(self, depth, stage="", before=0, after=0, pruned=0, **_):
@@ -707,6 +709,13 @@ class AeroUI:
             current = ""
         if name == "write_file":
             return {"old": current, "new": str(args.get("content", "")), "first": 1, "trim": True}
+        if "edits" in args or args.get("replace_all"):
+            # Several changes, or one made everywhere: there is no single before-and-after pair, so
+            # the panel shows the file as it is against the file as it would be, trimmed to what moved.
+            try:
+                return {"old": current, "new": apply_edits(current, edit_list(args))[0], "first": 1, "trim": True}
+            except (ToolError, KeyError, TypeError):
+                return {"old": "", "new": "", "first": 1, "trim": False}
         old, new = str(args.get("old_string", "")), str(args.get("new_string", ""))
         if current and old:
             try:
@@ -779,8 +788,12 @@ class AeroUI:
             rows.append(self._view_row(f"  {label.lower()}", f"{'~' + f'{n:,}':>9}   {share:>3.0%}"))
         rows.append(self._view_row("  subtotal", f"{'~' + f'{subtotal:,}':>9}"))
         spend = f"{data['session_tokens']:,} tokens" if data["session_tokens"] else "not reported here"
+        seen = data.get("cache_seen", 0)
+        cache = (f"{data.get('cache_read', 0) / seen:.0%} of {seen:,} prompt tokens read from cache"
+                 if seen else "not reported here")
         rows += [Text(""),
                  self._view_row("session billed", spend, style="mint"),
+                 self._view_row("prompt cache", cache),
                  self._view_row("compacts at", f"{data['compact_at']:,}"
                                 + (f"  {self.g['dot']} COMPACT_ABOVE, not the window"
                                    if data.get("compact_capped") else ""))]

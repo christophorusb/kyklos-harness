@@ -30,8 +30,11 @@ MAX_READ_WHOLE_BYTES = 10_000_000
 # A model asked for an hour once, and a day is a valid integer. Ten minutes is longer than any
 # test or build Kyklos should wait on in the foreground; Ctrl+C still ends one sooner.
 MAX_BASH_TIMEOUT = 600
+MAX_EDITS = 20  # in one edit_file call; more than this is a rewrite, and write_file says so honestly
+MAX_GREP_CONTEXT = 10
 EDIT_CONTEXT_LINES = 2  # unchanged lines shown either side of an edit, in its result
-EDIT_SHOWN_LINES = 30   # past this, the middle of the edited region is elided
+EDIT_SHOWN_LINES = 30   # past this, the middle of an edited region is elided
+EDIT_SHOWN_REGIONS = 6  # and past this many separate regions, the rest are counted
 # Output past MAX_OUTPUT_CHARS is cut in the middle for the model, and the whole of it is kept in
 # the scratch directory so the cut part can be searched instead of produced again.
 SPILL_DIR = ".kyklos/scratch/output"
@@ -450,9 +453,133 @@ def _not_found_note(file_lines: list[str], old_lines: list[str]) -> str:
     return note + "\nCopy the file's text exactly (without the line-number prefixes)."
 
 
+def edit_list(args: dict) -> list[dict]:
+    """The edits an edit_file call asks for, whichever of its two shapes it used."""
+    edits = args.get("edits")
+    single = "old_string" in args or "new_string" in args
+    if edits is not None and single:
+        raise ToolError("give either old_string and new_string, or edits, not both")
+    if edits is None:
+        if "old_string" not in args or "new_string" not in args:
+            raise ToolError("edit_file needs old_string and new_string, or a list of edits")
+        edits = [{"old_string": args["old_string"], "new_string": args["new_string"],
+                  "replace_all": args.get("replace_all", False)}]
+    elif "replace_all" in args:
+        raise ToolError("with edits, put replace_all inside the edit it applies to")
+    if not isinstance(edits, list) or not edits:
+        raise ToolError("edits must be a non-empty list of {old_string, new_string}")
+    if len(edits) > MAX_EDITS:
+        raise ToolError(f"at most {MAX_EDITS} edits per call, not {len(edits)}: split them, or use write_file "
+                        "if the file is being rewritten")
+    out = []
+    for i, edit in enumerate(edits, 1):
+        if (not isinstance(edit, dict) or not isinstance(edit.get("old_string"), str)
+                or not isinstance(edit.get("new_string"), str)
+                or set(edit) - {"old_string", "new_string", "replace_all"}):
+            raise ToolError(f"edit {i} must be {{old_string, new_string}} with string values "
+                            "(and optionally replace_all)")
+        out.append({"old_string": edit["old_string"], "new_string": edit["new_string"],
+                    "replace_all": edit.get("replace_all") is True})
+    return out
+
+
+def apply_edits(text: str, edits: list[dict]) -> tuple[str, dict]:
+    """`text` with every edit applied in order, or a ToolError and nothing applied.
+
+    Each edit sees the text the ones before it left, which is what lets the second of two edits
+    build on the first. The dict says how the matching went: `tolerant` and `reindented` for a
+    match that needed the fallbacks, and `replaced` for how many places replace_all changed.
+    """
+    info = {"tolerant": False, "reindented": False, "replaced": 0}
+    for i, edit in enumerate(edits, 1):
+        old, new = edit["old_string"], edit["new_string"]
+        try:
+            if edit["replace_all"]:
+                if not old:
+                    raise ToolError("old_string must not be empty. Use write_file to create or overwrite a file.")
+                if "\r\n" not in text:
+                    old, new = old.replace("\r\n", "\n"), new.replace("\r\n", "\n")
+                count = text.count(old)
+                if not count:
+                    raise ToolError(_not_found_note(text.splitlines(keepends=True), old.splitlines()))
+                text = text.replace(old, new)
+                info["replaced"] += count
+            else:
+                matched, adjusted = _match_edit(text, old, new)
+                info["tolerant"] |= matched not in (old, old.replace("\r\n", "\n"))
+                info["reindented"] |= adjusted not in (new, new.replace("\r\n", "\n"))
+                text = text.replace(matched, adjusted, 1)
+        except ToolError as e:
+            if len(edits) == 1:
+                raise
+            earlier = " Line numbers are as the file would read after the edits before this one." if i > 1 else ""
+            raise ToolError(f"edit {i} of {len(edits)}: {e}{earlier} No edit was applied: the file is unchanged.")
+    return text, info
+
+
+def changed_regions(before: str, after: str) -> list[list[tuple]]:
+    """The parts of `after` that differ from `before`, each a list of (line number, text) with a
+    little unchanged text around it. Only the stretch between the first and last difference is
+    diffed, so a small edit to a large file costs what the edit is worth, not what the file is."""
+    a, b = before.splitlines(), after.splitlines()
+    head = 0
+    while head < min(len(a), len(b)) and a[head] == b[head]:
+        head += 1
+    tail = 0
+    while tail < min(len(a), len(b)) - head and a[-1 - tail] == b[-1 - tail]:
+        tail += 1
+    head, tail = max(head - EDIT_CONTEXT_LINES, 0), max(tail - EDIT_CONTEXT_LINES, 0)
+    mid_a, mid_b = a[head:len(a) - tail], b[head:len(b) - tail]
+    if len(mid_a) * len(mid_b) > 4_000_000:  # too far apart to be worth diffing line by line
+        return [[(head + k + 1, line) for k, line in enumerate(mid_b)]] if mid_b else []
+    regions = []
+    matcher = difflib.SequenceMatcher(None, mid_a, mid_b, autojunk=False)
+    for group in matcher.get_grouped_opcodes(EDIT_CONTEXT_LINES):
+        lo, hi = group[0][3], group[-1][4]
+        if hi > lo:
+            regions.append([(head + k + 1, mid_b[k]) for k in range(lo, hi)])
+    return regions
+
+
+def _region_text(rows: list[tuple]) -> str:
+    if len(rows) > EDIT_SHOWN_LINES:  # a long replacement: its edges are what the next edit needs
+        head, tail = EDIT_SHOWN_LINES * 2 // 3, EDIT_SHOWN_LINES // 3
+        rows = rows[:head] + [(None, f"... ({len(rows) - head - tail} lines not shown)")] + rows[-tail:]
+    return "\n".join(line if n is None else f"{n:>6}\t{line}" for n, line in rows)
+
+
 # After a write, the cheapest check there is: does the file still parse? Done in-process and only
 # for formats Python can read itself, so nothing the model wrote is ever executed to find out.
 JSONC_NAMES = ("tsconfig", "jsconfig", ".eslintrc", "devcontainer", ".babelrc", "settings", "launch", "tasks")
+
+
+_PROJECT_PYTHON: dict[str, tuple[int, int] | None] = {}
+
+
+def project_python() -> tuple[int, int] | None:
+    """(major, minor) of the python3 that bash would run, asked once per interpreter path; None
+    if there is none or it can't be asked safely.
+
+    Asked inside the sandbox, with -I, and never when it sits in a workspace-relative PATH entry:
+    Kyklos runs this itself, and a repository's own `python3` is not something to start unasked.
+    """
+    exe = shutil.which("python3")
+    if not exe or not os.path.isabs(exe):
+        return None
+    if exe not in _PROJECT_PYTHON:
+        version = None
+        if probe_sandbox()[0] in ("seatbelt", "bwrap"):
+            import tempfile
+            argv = sandbox_argv([exe, "-I", "-c", "import sys; print(*sys.version_info[:2])"],
+                                Path(tempfile.gettempdir()))
+            try:
+                out = subprocess.run(argv, capture_output=True, text=True, timeout=10,
+                                     env=child_env(), stdin=subprocess.DEVNULL).stdout.split()
+                version = (int(out[0]), int(out[1])) if len(out) == 2 else None
+            except (OSError, ValueError, subprocess.SubprocessError):
+                version = None
+        _PROJECT_PYTHON[exe] = version
+    return _PROJECT_PYTHON[exe]
 
 
 def syntax_problem(path: Path, text: str) -> str:
@@ -460,6 +587,12 @@ def syntax_problem(path: Path, text: str) -> str:
     suffix = path.suffix.lower()
     try:
         if suffix == ".py":
+            # Parsed by the Python Kyklos runs on. When the project's is newer, an error may only
+            # be syntax this one predates (t-strings, say), and "fix it" would have the model
+            # rewrite correct code, so the check stays quiet rather than guess.
+            newer = project_python()
+            if newer and newer > sys.version_info[:2]:
+                return ""
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")  # an invalid escape is a warning, not a broken file
                 ast.parse(text, filename=path.name)
@@ -570,14 +703,30 @@ def scratch_dir(workspace: Path) -> Path:
     return workspace.resolve() / ".kyklos" / "scratch"
 
 
+NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
 def ensure_scratch(workspace: Path) -> Path:
     """Create the scratch directory, ignoring itself rather than editing the project's .gitignore:
-    `.kyklos/.gitignore` holding `*` keeps the whole thing out of git and touches nothing of yours."""
+    `.kyklos/.gitignore` holding `*` keeps the whole thing out of git and touches nothing of yours.
+
+    Kyklos itself does this, outside the sandbox, so it refuses to go through a symlink: a
+    repository can ship `.kyklos` as a link to anywhere, and mkdir and the marker would follow it.
+    """
     directory = scratch_dir(workspace)
-    directory.mkdir(parents=True, exist_ok=True)
+    for part in (directory.parent, directory):
+        if part.is_symlink():
+            raise OSError(f"{part} is a symlink, so Kyklos won't write through it")
+        part.mkdir(exist_ok=True)
     marker = directory.parent / ".gitignore"
-    if not marker.exists():
-        marker.write_text("*\n", encoding="utf-8")
+    if not os.path.lexists(marker):
+        try:
+            fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW, 0o644)
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("*\n")
     return directory
 
 
@@ -1205,10 +1354,16 @@ class Tools:
         loop's own scrubbing only sees what comes back through a tool result.
         """
         try:
-            ensure_scratch(self.workspace)
-            directory = self.workspace / SPILL_DIR
-            directory.mkdir(parents=True, exist_ok=True)
-            old = sorted(directory.glob("bash-*.log"), key=lambda f: f.stat().st_mtime)
+            # Kyklos writes and prunes here itself, unsandboxed, so the folder must really be the
+            # one inside this workspace: ensure_scratch refuses a symlinked .kyklos or scratch, and
+            # the output folder is held to the same.
+            directory = ensure_scratch(self.workspace) / Path(SPILL_DIR).name
+            if directory.is_symlink():
+                return ""
+            directory.mkdir(exist_ok=True)
+            if Path(os.path.realpath(directory)) != directory:
+                return ""
+            old = sorted(directory.glob("bash-*.log"), key=lambda f: f.lstat().st_mtime)
             for stale in old[:max(len(old) - SPILL_KEEP + 1, 0)]:
                 stale.unlink(missing_ok=True)
             body = scrub_secrets(text, workspace=self.workspace)[0].encode("utf-8", errors="replace")
@@ -1216,7 +1371,7 @@ class Tools:
                 body = body[:SPILL_MAX_BYTES] + f"\n... [stopped at {SPILL_MAX_BYTES:,} bytes]\n".encode()
             # Nanoseconds, not a counter: a subagent has its own Tools and would count from one again.
             target = directory / f"bash-{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 1_000_000_000:09d}.log"
-            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW, 0o600)
             with os.fdopen(fd, "wb") as f:
                 f.write(body)
             return self._rel(target)
@@ -1281,40 +1436,51 @@ class Tools:
         p.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} chars to {path}" + _syntax_note(p, path, content)
 
-    def _prepare_edit(self, path: str, old_string: str, new_string: str) -> tuple[Path, str, str, str]:
-        p = self._resolve_writable(path, "edit")
+    def _prepare_edits(self, args: dict) -> tuple[Path, str, str, dict]:
+        """(file, its text, the text with every edit applied, how the matching went). Raises a
+        ToolError, with nothing written, if any edit can't be applied."""
+        p = self._resolve_writable(args["path"], "edit")
         if not p.is_file():
-            raise ToolError(f"File not found: {path}")
+            raise ToolError(f"File not found: {args['path']}")
         if is_secret_file(p):  # edit errors echo nothing, but keep secrets files hands-off entirely
-            raise ToolError(f"Refusing to edit {path}: it likely contains secrets. Ask the user to change it.")
+            raise ToolError(f"Refusing to edit {args['path']}: it likely contains secrets. Ask the user to change it.")
         text = p.read_text(encoding="utf-8")
-        matched_old, adjusted_new = _match_edit(text, old_string, new_string)
-        return p, text, matched_old, adjusted_new
+        updated, info = apply_edits(text, edit_list(args))
+        return p, text, updated, info
 
-    def edit_file(self, path: str, old_string: str, new_string: str) -> str:
-        p, text, matched_old, adjusted_new = self._prepare_edit(path, old_string, new_string)
+    def edit_file(self, path: str, old_string: str = None, new_string: str = None,
+                  replace_all: bool = None, edits: list = None) -> str:
+        args = {k: v for k, v in (("path", path), ("old_string", old_string), ("new_string", new_string),
+                                  ("replace_all", replace_all), ("edits", edits)) if v is not None}
+        p, text, updated, info = self._prepare_edits(args)
         if self.before_write:
             self.before_write(p)
-        updated = text.replace(matched_old, adjusted_new, 1)
         p.write_text(updated, encoding="utf-8")
         # "Edited path" left the model working from its own picture of the file, which is wrong
         # whenever the match was a tolerant one: the text on disk then differs from both strings it
-        # sent. The region as it now stands goes back instead, numbered like read_file's output.
-        how = ""
-        if matched_old != old_string.replace("\r\n", "\n") and matched_old != old_string:
-            how = (" (old_string matched after ignoring whitespace differences"
-                   + (", and new_string was re-indented to fit"
-                      if adjusted_new not in (new_string, new_string.replace("\r\n", "\n")) else "") + ")")
-        first = text.count("\n", 0, text.index(matched_old)) + 1
-        last = first + adjusted_new.count("\n") - (1 if adjusted_new.endswith("\n") else 0)
-        lines = updated.splitlines()
-        lo, hi = max(first - EDIT_CONTEXT_LINES, 1), min(last + EDIT_CONTEXT_LINES, len(lines))
-        shown = [(n, lines[n - 1]) for n in range(lo, hi + 1)]
-        if len(shown) > EDIT_SHOWN_LINES:  # a long replacement: its edges are what the next edit needs
-            head, tail = EDIT_SHOWN_LINES * 2 // 3, EDIT_SHOWN_LINES // 3
-            shown = shown[:head] + [(None, f"... ({len(shown) - head - tail} lines not shown)")] + shown[-tail:]
-        region = "\n".join(line if n is None else f"{n:>6}\t{line}" for n, line in shown)
-        result = f"Edited {path}{how}. Lines {lo}-{hi} now read:\n{region}" if shown else f"Edited {path}{how}."
+        # sent. The regions as they now stand go back instead, numbered like read_file's output.
+        notes = []
+        count = len(edits) if edits else 1
+        if count > 1:
+            notes.append(f"{count} edits applied")
+        if info["replaced"]:
+            notes.append(f"replace_all changed {info['replaced']} place{'' if info['replaced'] == 1 else 's'}")
+        if info["tolerant"]:
+            notes.append("old_string matched after ignoring whitespace differences"
+                         + (", and new_string was re-indented to fit" if info["reindented"] else ""))
+        how = f" ({'; '.join(notes)})" if notes else ""
+        regions = changed_regions(text, updated)
+        if not regions:
+            result = f"Edited {path}{how}."
+        elif len(regions) == 1:
+            rows = regions[0]
+            result = f"Edited {path}{how}. Lines {rows[0][0]}-{rows[-1][0]} now read:\n{_region_text(rows)}"
+        else:
+            shown = regions[:EDIT_SHOWN_REGIONS]
+            result = (f"Edited {path}{how}. The changed regions now read:\n"
+                      + "\n   ...\n".join(map(_region_text, shown)))
+            if len(regions) > len(shown):
+                result += f"\n... ({len(regions) - len(shown)} more changed regions not shown)"
         return self._truncate(result) + _syntax_note(p, path, updated)
 
     def check(self, name: str, args: dict) -> None:
@@ -1326,7 +1492,10 @@ class Tools:
             if is_secret_file(p):
                 raise ToolError(f"Refusing to write {args['path']}: it likely contains secrets. Ask the user to change it.")
         elif name == "edit_file":
-            self._prepare_edit(args["path"], args["old_string"], args["new_string"])
+            unknown = sorted(set(args) - {"path", "old_string", "new_string", "replace_all", "edits"})
+            if unknown:
+                raise TypeError(f"edit_file() got an unexpected keyword argument {unknown[0]!r}")
+            self._prepare_edits(args)
         elif name == "bash":
             unknown = sorted(set(args) - {"command", "timeout"})
             if unknown:
@@ -1363,15 +1532,20 @@ class Tools:
             for name in sorted(filenames):
                 yield Path(dirpath) / name
 
-    def grep(self, pattern: str, path: str = ".", glob: str = None, ignore_case: bool = False) -> str:
+    def grep(self, pattern: str, path: str = ".", glob: str = None, ignore_case: bool = False,
+             context: int = 0, output: str = "lines") -> str:
         try:
             regex = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
         except re.error as e:
             raise ToolError(f"Invalid regex: {e}")
+        if output not in ("lines", "files", "count"):
+            raise ToolError(f"output must be 'lines', 'files' or 'count', not {output!r}")
+        if isinstance(context, bool) or not isinstance(context, int) or not 0 <= context <= MAX_GREP_CONTEXT:
+            raise ToolError(f"context is a number of lines from 0 to {MAX_GREP_CONTEXT}, not {context!r}")
         root = self._resolve(path)
         if not root.exists():
             raise ToolError(f"Path not found: {path}")
-        hits = []
+        hits, matched, files = [], 0, 0
         globs = expand_braces(glob) if glob else []
         for f in self._walk_files(root):
             if (globs and not any(f.match(g) for g in globs)) or is_secret_file(f):
@@ -1384,12 +1558,43 @@ class Tools:
                 continue
             if b"\0" in data[:8192]:  # binary file
                 continue
-            for n, line in enumerate(data.decode("utf-8", errors="replace").splitlines(), 1):
-                if regex.search(line):
-                    hits.append(f"{self._rel(f)}:{n}: {line.strip()[:300]}")
-                    if len(hits) >= MAX_SEARCH_RESULTS:
-                        hits.append(f"... (stopped at {MAX_SEARCH_RESULTS} matches; narrow the pattern or path)")
-                        return self._truncate("\n".join(hits))
+            lines = data.decode("utf-8", errors="replace").splitlines()
+            found = [i for i, line in enumerate(lines) if regex.search(line)]
+            if not found:
+                continue
+            rel = self._rel(f)
+            if output != "lines":
+                # Which files, or how many times: the answer to "where is this used" without paying
+                # for every matching line of it.
+                hits.append(rel if output == "files" else f"{rel}: {len(found)}")
+                files += 1
+                if files >= MAX_SEARCH_RESULTS:
+                    hits.append(f"... (stopped at {MAX_SEARCH_RESULTS} files; narrow the pattern or path)")
+                    break
+                continue
+            room = MAX_SEARCH_RESULTS - matched
+            stopped = len(found) > room
+            found = found[:room]
+            matched += len(found)
+            if not context:
+                hits += [f"{rel}:{i + 1}: {lines[i].strip()[:300]}" for i in found]
+            else:
+                # As `grep -n -C` writes it: `:` marks a matching line and `-` one shown for context,
+                # with `--` between stretches that don't touch. Indentation is kept here, because
+                # the point of context is to read the code around the match.
+                hit, last = set(found), None
+                for i in found:
+                    for k in range(max(i - context, 0), min(i + context, len(lines) - 1) + 1):
+                        if last is not None and k <= last:
+                            continue
+                        if (last is not None and k > last + 1) or (last is None and hits):
+                            hits.append("--")
+                        mark = ":" if k in hit else "-"
+                        hits.append(f"{rel}{mark}{k + 1}{mark} {lines[k].rstrip()[:300]}")
+                        last = k
+            if stopped or matched >= MAX_SEARCH_RESULTS:
+                hits.append(f"... (stopped at {MAX_SEARCH_RESULTS} matches; narrow the pattern or path)")
+                break
         return self._truncate("\n".join(hits) or "No matches.")
 
     def glob(self, pattern: str) -> str:
@@ -1686,6 +1891,11 @@ SCHEMAS = [
                     "path": {"type": "string", "description": "File or folder to search, default the workspace"},
                     "glob": {"type": "string", "description": "Only search files matching this, e.g. *.py"},
                     "ignore_case": {"type": "boolean"},
+                    "context": {"type": "integer", "description": f"Lines to show before and after each match, "
+                                f"0 to {MAX_GREP_CONTEXT} (default 0). Use it instead of a read_file after the search."},
+                    "output": {"type": "string", "enum": ["lines", "files", "count"],
+                               "description": "lines (default): the matching lines. files: only the paths "
+                                              "that match. count: each path with its number of matches."},
                 },
                 "required": ["pattern"],
             },
@@ -1724,7 +1934,10 @@ SCHEMAS = [
             "name": "edit_file",
             "description": (
                 "Replace one exact occurrence of old_string with new_string. "
-                "old_string must match the file exactly (without line-number prefixes) and be unique."
+                "old_string must match the file exactly (without line-number prefixes) and be unique. "
+                "For several changes to one file, pass edits instead of old_string and new_string: "
+                "they are applied in order, and if any one fails none is applied. "
+                "The result shows the changed lines as they now read."
             ),
             "parameters": {
                 "type": "object",
@@ -1732,8 +1945,20 @@ SCHEMAS = [
                     "path": {"type": "string"},
                     "old_string": {"type": "string"},
                     "new_string": {"type": "string"},
+                    "replace_all": {"type": "boolean", "description": "Replace every occurrence of old_string "
+                                    "instead of requiring it to be unique, e.g. to rename a variable"},
+                    "edits": {
+                        "type": "array",
+                        "description": f"Up to {MAX_EDITS} edits to this file, instead of old_string and new_string",
+                        "items": {
+                            "type": "object",
+                            "properties": {"old_string": {"type": "string"}, "new_string": {"type": "string"},
+                                           "replace_all": {"type": "boolean"}},
+                            "required": ["old_string", "new_string"],
+                        },
+                    },
                 },
-                "required": ["path", "old_string", "new_string"],
+                "required": ["path"],
             },
         },
     },
@@ -1768,7 +1993,9 @@ SCHEMAS = [
         "type": "function",
         "function": {
             "name": "bash",
-            "description": f"Run a {SHELL_NAME} command in the workspace directory. Returns exit code and output.",
+            "description": (f"Run a {SHELL_NAME} command in the workspace directory. Returns exit code and output. "
+                            "Every call starts fresh in the workspace root: a cd or an exported variable does "
+                            "not carry over to the next call, so chain the commands in one call when it matters."),
             "parameters": {
                 "type": "object",
                 "properties": {

@@ -1,0 +1,5 @@
+{
+  "prompt": "Rename the function get_usr to get_user everywhere in this project: its definition, every caller, the tests and the README. Only that function: get_usr_email keeps its name. Make sure the tests still pass.",
+  "summary": "a rename across five files, with a near-miss name to leave alone",
+  "timeout": 600
+}

@@ -1,0 +1,5 @@
+{
+  "prompt": "Which file defines the function that converts ISO 8601 duration strings such as PT1H30M into a number of seconds, and on which line does its def statement start? Answer with the file path and the line number. Don't change any files.",
+  "summary": "a read-only question, with a stale doc and look-alike names as decoys",
+  "timeout": 600
+}

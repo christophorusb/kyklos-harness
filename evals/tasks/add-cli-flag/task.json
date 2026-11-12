@@ -1,0 +1,5 @@
+{
+  "prompt": "Add a --json option to wordcount.py: with it, print the three counts as one JSON object with the keys lines, words and chars, as numbers. Without it, the output must stay exactly as it is now. The option may come before or after the file name.",
+  "summary": "a small feature with a compatibility constraint",
+  "timeout": 600
+}

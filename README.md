@@ -80,6 +80,7 @@ Kyklos works in the folder you launch it from. Set `WORKSPACE` in `.env` to pin 
 | `CONTEXT_WINDOW` | Override the detected window. Lower is faster and cheaper |
 | `COMPACT_ABOVE` | Compact once the conversation passes this many tokens (default 100000) |
 | `MAX_STEPS` | Model turns one request may take (default 50) |
+| `KYKLOS_TRACE` | `0` turns off the session trace; a path writes it there instead (see [Evals](#evals)) |
 | `STREAM` | Stream the API call (default on). Transport only — nothing on screen changes. `0` to disable |
 | `SUBAGENT_MODEL`, `SUBAGENT_EFFORT` | Route subagents to a faster or cheaper model |
 | `KYKLOS_PERSONA` | A persona to start in, from `~/.kyklos/personas/<name>.md` |
@@ -136,7 +137,7 @@ Type `/help` for the commands; Tab completes them.
 | `/submodel [name\|same]` | Pick a separate model and effort for subagents |
 | `/persona [name\|off]` | Adopt a persona prompt layer from `~/.kyklos/personas`, or switch it off |
 | `/compact` | Shrink the conversation now |
-| `/tokens` | What fills the context window, the session's billed tokens, when compaction hits |
+| `/tokens` | What fills the context window, the session's billed tokens, the prompt-cache hit rate, when compaction hits |
 | `/tools` | The tools the model can call now, and the rules that auto-approve them |
 | `/diff` | What Kyklos has changed in the workspace this session |
 | `/map` | The workspace sketch the model starts each turn with |
@@ -152,7 +153,7 @@ Type `/help` for the commands; Tab completes them.
 - `a` — **ask every time.** The default, and what happens with no keyboard.
 - `u` — **run unflagged commands unprompted**, stopping for the rest.
 
-In `u` mode a command still asks if it carries a red finding, names a secret file, runs a program Kyklos has no rules for, or runs a script whose contents it can't see — "Kyklos can't tell what this does" must never come to mean "go ahead". The line is **red = changes something outside the conversation** (deleting, overwriting, escalating, installing, reaching the network) **or reads data that must not leave the machine** (credentials, and your own documents — `~/Documents`, `~/Desktop`, `~/Downloads`, `~/Pictures`, `~/Movies`, `~/Videos`, `~/Music`); **warning = reads somewhere you might not expect** but a project legitimately reaches, like `/tmp` or `/srv`. Warnings don't stop a command in `u` mode; red findings always do. A read is red here because the output goes to the model and then to whichever provider you're pointed at, so the read *is* the data leaving — there's no later step to catch it at. A workspace that lives inside one of those folders (a repo under `~/Desktop` is the ordinary case) still reads its own files freely; the gate is on leaving the workspace, not on the folder's name. `write_file` and `edit_file` always ask.
+In `u` mode a command still asks if it carries a red finding, names a secret file, runs a program Kyklos has no rules for, or runs a script whose contents it can't see — "Kyklos can't tell what this does" must never come to mean "go ahead". The line is **red = changes something outside the conversation** (deleting, overwriting, escalating, installing, reaching the network) **or reads data that must not leave the machine** (credentials, and your own documents — `~/Documents`, `~/Desktop`, `~/Downloads`, `~/Pictures`, `~/Movies`, `~/Videos`, `~/Music`); **warning = reads somewhere you might not expect** but a project legitimately reaches, like `/tmp` or `/srv`. Warnings don't stop a command in `u` mode; red findings always do. Three things that look like that line and aren't stay out of red: a redirect that creates a file which doesn't exist yet (plain path, inside the workspace, not a hook, CI or instruction file), deleting files inside `.kyklos/scratch/`, and piping into an interpreter that is given its program with `-c`, `-m` or a script file, so the pipe is only its input. All three go back to red in a command that changes directory, since the explainer doesn't follow `cd` and would be judging the wrong path. A read is red here because the output goes to the model and then to whichever provider you're pointed at, so the read *is* the data leaving — there's no later step to catch it at. A workspace that lives inside one of those folders (a repo under `~/Desktop` is the ordinary case) still reads its own files freely; the gate is on leaving the workspace, not on the folder's name. `write_file` and `edit_file` always ask.
 
 The choice is never remembered, and the status bar carries `bash: unflagged runs` while it's on.
 
@@ -187,21 +188,26 @@ Piped or scripted runs use the plain REPL automatically.
 | `ui.py` | Kyklos Aero: renders the Agent's events, the permission panel, the prompt and status bar |
 | `kyklos`, `kyklos.cmd` | Launchers for macOS / Linux and Windows |
 | `test_kyklos.py`, `test_ui.py` | Offline tests: a scripted fake model drives the real loop and UI |
+| `eval.py`, `evals/`, `test_eval.py` | Fixture tasks run against a real model, and the offline tests that keep their checks honest |
 | `DESIGN.md`, `design/aero_preview.py` | The UI design system, and a dependency-free preview of it |
 
 The `Agent` never prints: it emits events (`model_start`, `tool_call`, `tool_result`, `subagent_start`, …) and a front end renders them. The plain REPL and Kyklos Aero share one set of permission rules and one command registry.
 
-`Agent.send` sends the conversation, runs the tool calls that come back, appends the results, and repeats — until the model answers without calling a tool, or `MAX_STEPS` (50) is reached. Hitting the cap isn't a failure: Kyklos reports what the turn managed and which files changed, and `continue` resumes from there.
+`Agent.send` sends the conversation, runs the tool calls that come back, appends the results, and repeats — until the model answers without calling a tool, or `MAX_STEPS` (50) is reached. A fifth of the budget from the end the model is told how many steps are left, so it can wrap up instead of walking into the limit. Hitting the cap isn't a failure: Kyklos reports what the turn managed and which files changed, and `continue` resumes from there.
 
 A reply without a tool call ends the turn, so three replies that aren't answers get one nudge (one per turn in total) instead: an empty reply, a tool call written out as text (which runs nothing), and an answer given while the plan still has steps never started. Each is told from the reply and Kyklos's own state, and each shows as a notice, so you see when it happened.
 
 **Tools.** `read_file` (with line numbers), `grep`, `glob`, `write_file`, `edit_file` (unique string replacement, tolerant of trailing whitespace and indentation shifts), `bash` (PowerShell on Windows). Search skips `.git`, `.venv`, `node_modules` and binary files.
 
+`grep` takes `context` (lines around each match, written as `grep -n -C` writes them) and `output` (`files` or `count` when the matching lines themselves aren't needed). `edit_file` takes `replace_all`, or a list of `edits` applied in order and all-or-nothing, shown as one diff to approve.
+
 An edit answers with the lines as they now read, and a miss with the closest text in the file and the first line where it differs, so neither costs a re-read. After a write, `.py`, `.json` and `.toml` files are parsed in-process and a file that no longer parses is flagged in the result; nothing is executed to find out. `bash` output past 20,000 characters is cut in the middle for the model and saved whole under `.kyklos/scratch/output/` (secrets scrubbed, newest 20 kept), where it can be searched by path instead of run again.
 
-**Subagents.** `task` hands a self-contained job to a fresh `Agent` with an empty context; only its answer comes back. `explore` mode is read-only and never asks permission; `general` can also edit and run commands. Subagents can't nest and run one at a time. One that is stopped — by the step cap, or for repeating itself — is asked for a report of what it found, so its work reaches the parent as a partial answer rather than being lost. Route them elsewhere with `/submodel`, `SUBAGENT_MODEL`, or `--submodel`; the `task` line names the model when it differs. In a live test a subagent took 12 steps and read five files while the main context stayed at 6%.
+**Subagents.** `task` hands a self-contained job to a fresh `Agent` with an empty context; only its answer comes back. `explore` mode is read-only and never asks permission; `general` can also edit and run commands. Subagents can't nest. Explore tasks sent in one message run at the same time, up to four at once, since they only read and never ask; anything else runs one at a time. The interface still draws one subagent after another: the others' steps are held back and replayed when their turn comes, each with its real duration. A subagent whose API call fails comes back as a failed tool call the parent can act on, rather than ending the turn. One that is stopped — by the step cap, or for repeating itself — is asked for a report of what it found, so its work reaches the parent as a partial answer rather than being lost. Route them elsewhere with `/submodel`, `SUBAGENT_MODEL`, or `--submodel`; the `task` line names the model when it differs. In a live test a subagent took 12 steps and read five files while the main context stayed at 6%.
 
-**Workspace sketch.** The system prompt carries a generated list of source files and what each defines — names only, no signatures or line numbers, since a regex reading code gets names right and parameter lists wrong. Python names come from the real `ast`. Capped per file and overall (~340 tokens here), regenerated after any turn that wrote files. `/map` shows it.
+**Workspace sketch.** The system prompt carries a generated list of source files and what each defines — names only, no signatures or line numbers, since a regex reading code gets names right and parameter lists wrong. Python names come from the real `ast`. Capped per file and overall (~340 tokens here). `/map` shows it.
+
+The sketch is scanned once per conversation and then left alone, because providers that cache prompts key the cache on the prefix: rewriting the system prompt after every turn that edited a file made each following request a cache miss from its first token. Files that change are named in a short note in front of your next message instead, and folded into the prompt when it is rewritten anyway (`/reset`, a resumed session, compaction). `/tokens` shows how much of the prompt the provider says it read from cache, when it says.
 
 **Scratch space.** `.kyklos/scratch/` is for throwaway scripts; it's inside the workspace so relative imports and dependencies resolve. Writing there needs no approval; *running* a script still asks. It keeps itself out of git without touching your `.gitignore`.
 
@@ -256,9 +262,31 @@ Claims to have run the tests, committed, pushed or installed are compared agains
 ## Tests
 
 ```bash
-./.venv/bin/python -m unittest test_kyklos test_ui
+./.venv/bin/python -m unittest test_kyklos test_ui test_audit test_eval
 ```
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui
+.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui test_audit test_eval
 ```
+
+## Evals
+
+The tests prove the loop does what it says; they can't say whether a change helps a real model. `eval.py` does that: it runs Kyklos on small fixture tasks against the provider in `.env` and reports what each run did and cost. **It spends real tokens.**
+
+```bash
+./.venv/bin/python eval.py --list                     # the tasks, one line each
+./.venv/bin/python eval.py                            # every task once, with your usual model
+./.venv/bin/python eval.py long-log --repeat 3 --model kimi-k3 --keep
+```
+
+```
+PASS  fix-off-by-one   steps  5  tools  5  tokens   18k  cache 74%      9s
+PASS  long-log         steps  8  tools  8  tokens   34k  cache 70%     19s
+PASS  parallel-lookup  steps  6  tools 11  tokens   28k  cache 59%     13s
+```
+
+Each task in `evals/tasks/` is a small repository, a prompt, a `check.py` that decides pass or fail, and a reference solution that `test_eval.py` holds the check to: every check must fail the untouched repository and pass the solution, or it measures nothing. The tasks are chosen to land on the harness's own mechanisms — a failure buried past the 20,000-character output cut, a version bump where a blind replace-all rewrites history, a rename with a near-miss name, a read-only question with a stale doc as a decoy, three independent lookups that could go to parallel subagents.
+
+Each run gets a fresh copy under the system temp folder and runs `kyklos.py --eval` there with nobody at the keyboard. `--eval` swaps the person for a fixed policy — approve edits and commands, including ones Kyklos can't read, but never a red finding or a secret — and Kyklos refuses it unless the folder is one `eval.py` made (inside the temp folder, with a marker file) and the OS sandbox is on. The check runs the model's code too, so it runs in the same sandbox. Your model picks and model catalog are copied in; nothing else from `~/.kyklos` is. A persona is off unless `--persona` names one. Results are appended to `evals/results/<time>.jsonl`, one row per run, which is kept out of git.
+
+**The trace.** Every session writes one, not only evals: a JSONL row per event to `~/.kyklos/projects/<folder>/traces/` (the newest 50 kept, owner-only permissions). It records numbers and fixed labels only — tokens and cache reads per API call, each tool call's outcome, size and duration, and each time the harness stepped in (a nudge, a budget warning, a repeat, a parallel batch) — and never a path, a command, a prompt or an answer, so it can be read or shared without exposing the work. `KYKLOS_TRACE=0` turns it off.
