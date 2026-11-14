@@ -2340,7 +2340,7 @@ class ObservabilityCommandTests(unittest.TestCase):
         from kyklos import run_command
         agent = self.edited_agent()
         drawn = []
-        ctx = self.ctx(agent, render=lambda view, data: drawn.append((view, data)))
+        ctx = self.ctx(agent, render=lambda view, data, fallback: drawn.append((view, data)))
         for name in ("/tokens", "/tools", "/diff"):
             run_command(ctx, name)
         self.assertEqual([view for view, _ in drawn], ["tokens", "tools", "diff"])

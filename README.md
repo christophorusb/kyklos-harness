@@ -123,7 +123,12 @@ kyklos --trust "..."                     # trust this folder for one run (for sc
 kyklos --model kimi-k3                   # another model for one run (not remembered)
 kyklos --submodel minimax-m3.1-flash     # another subagent model for one run (or 'same')
 kyklos --persona chief                   # adopt a persona prompt layer for one run (or 'off')
+kyklos --serve                           # no UI: JSON-RPC on stdin/stdout, for a desktop app or editor
 ```
+
+`--serve` is the front end other programs build on. It runs the same agent, under the same rules,
+and asks the same questions over a pipe instead of the keyboard. [PROTOCOL.md](PROTOCOL.md) is the
+spec.
 
 Type `/help` for the commands; Tab completes them.
 
@@ -262,11 +267,11 @@ Claims to have run the tests, committed, pushed or installed are compared agains
 ## Tests
 
 ```bash
-./.venv/bin/python -m unittest test_kyklos test_ui test_audit test_eval
+./.venv/bin/python -m unittest test_kyklos test_ui test_audit test_eval test_serve
 ```
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui test_audit test_eval
+.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui test_audit test_eval test_serve
 ```
 
 ## Evals

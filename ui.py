@@ -27,11 +27,11 @@ from rich.text import Text
 from rich.theme import Theme
 
 from kyklos import (BASH_MODE_CAVEAT, BASH_MODE_EXPLANATION, BROAD_WARNING, EXIT, NO_APPROVER_NOTE,
-                    COMMANDS, TRUST_EXPLANATION, CommandContext,
+                    COMMANDS, TRUST_EXPLANATION, CommandContext, edit_preview,
                     __version__, apply_permission_answer, denial_note, ensure_private_dir,
                     error_detail, has_danger, has_opaque, permission_options, run_command, sandbox_warning,
                     short_tokens)
-from tools import ToolError, _match_edit, apply_edits, edit_list, sanitize_terminal_text
+from tools import sanitize_terminal_text
 
 BASH_FULL_OUTPUT_LINES = 8  # bash output up to this many lines is shown in full; longer shows the last 3
 
@@ -702,28 +702,7 @@ class AeroUI:
 
     def _diff_source(self, name: str, args: dict) -> dict:
         """The before/after text and starting line for an edit or write, read before the tool runs."""
-        try:
-            path = (self.workspace / str(args.get("path", ""))).resolve()
-            current = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
-        except OSError:
-            current = ""
-        if name == "write_file":
-            return {"old": current, "new": str(args.get("content", "")), "first": 1, "trim": True}
-        if "edits" in args or args.get("replace_all"):
-            # Several changes, or one made everywhere: there is no single before-and-after pair, so
-            # the panel shows the file as it is against the file as it would be, trimmed to what moved.
-            try:
-                return {"old": current, "new": apply_edits(current, edit_list(args))[0], "first": 1, "trim": True}
-            except (ToolError, KeyError, TypeError):
-                return {"old": "", "new": "", "first": 1, "trim": False}
-        old, new = str(args.get("old_string", "")), str(args.get("new_string", ""))
-        if current and old:
-            try:
-                old, new = _match_edit(current, old, new)
-            except ToolError:
-                pass
-        at = current.find(old) if old else -1
-        return {"old": old, "new": new, "first": current.count("\n", 0, at) + 1 if at >= 0 else 1, "trim": False}
+        return edit_preview(self.workspace, name, args)
 
     def diff_rows(self, info: dict, width: int, max_rows: int = 40) -> list:
         ops = diff_ops(info["old"], info["new"], info.get("first", 1))
@@ -760,7 +739,7 @@ class AeroUI:
 
     # -- command views: /tokens, /tools, /diff --
 
-    def render_view(self, view: str, data) -> None:
+    def render_view(self, view: str, data, fallback: str = "") -> None:
         """Draw a command's output. Commands work out what to show; how it looks lives here."""
         {"tokens": self._view_tokens, "tools": self._view_tools, "diff": self._view_diff}[view](data)
 

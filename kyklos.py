@@ -23,7 +23,8 @@ from types import SimpleNamespace
 
 from openai import APIConnectionError, APITimeoutError, InternalServerError, OpenAI, RateLimitError
 
-from tools import (SAFE_TOOLS, SCHEMAS, SHELL_NAME, ToolError, Tools, command_touches_secret, edit_list,
+from tools import (SAFE_TOOLS, SCHEMAS, SHELL_NAME, ToolError, Tools, _match_edit, apply_edits, command_touches_secret,
+                   edit_list,
                    hide_env_names,
                    is_scratch_path, MISSING_TOOL_ADVICE, missing_unix_tools, plain_line, probe_commands,
                    probe_sandbox,
@@ -1569,6 +1570,37 @@ def permission_options(name: str, args: dict) -> tuple[bool, str, list]:
     return touches_secret, prefix, findings
 
 
+def edit_preview(workspace: Path, name: str, args: dict) -> dict:
+    """The before/after text and first line of an edit_file or write_file call, read before it runs.
+
+    Shared by every front end that shows a pending change, so the terminal's panel and a client's
+    permission request are built from the same text. `trim` says the pair is a whole file against
+    the whole file as it would be, and is worth cutting down to what moved.
+    """
+    try:
+        path = (workspace / str(args.get("path", ""))).resolve()
+        current = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+    except OSError:
+        current = ""
+    if name == "write_file":
+        return {"old": current, "new": str(args.get("content", "")), "first": 1, "trim": True}
+    if "edits" in args or args.get("replace_all"):
+        # Several changes, or one made everywhere: there is no single before-and-after pair, so
+        # show the file as it is against the file as it would be.
+        try:
+            return {"old": current, "new": apply_edits(current, edit_list(args))[0], "first": 1, "trim": True}
+        except (ToolError, KeyError, TypeError):
+            return {"old": "", "new": "", "first": 1, "trim": False}
+    old, new = str(args.get("old_string", "")), str(args.get("new_string", ""))
+    if current and old:
+        try:
+            old, new = _match_edit(current, old, new)
+        except ToolError:
+            pass
+    at = current.find(old) if old else -1
+    return {"old": old, "new": new, "first": current.count("\n", 0, at) + 1 if at >= 0 else 1, "trim": False}
+
+
 def has_danger(findings: list) -> bool:
     return any(level == "danger" for level, _ in findings)
 
@@ -2759,11 +2791,11 @@ class Agent:
                 with slots:
                     if cancel.is_set():
                         return
-                    emit("tool_call", depth=self.depth, name="task", arguments=tc.function.arguments)
+                    emit("tool_call", depth=self.depth, name="task", arguments=tc.function.arguments, call_id=tc.id)
                     started = time.monotonic()
                     subs[i], routed = self._spawn("explore", on_event=emit, cancel=cancel)
                     result = self._run_spawned(subs[i], routed, args["description"], args["prompt"], "explore")
-                    emit("tool_result", depth=self.depth, name="task",
+                    emit("tool_result", depth=self.depth, name="task", call_id=tc.id,
                          result=scrub_secrets(result, workspace=self.tools.workspace)[0],
                          secs=time.monotonic() - started)
                     results[i] = result
@@ -2916,7 +2948,7 @@ class Agent:
                     except (ValueError, AttributeError):
                         bash_command = ""
                 if not ran_already:
-                    self._emit("tool_call", name=tc.function.name, arguments=tc.function.arguments)
+                    self._emit("tool_call", name=tc.function.name, arguments=tc.function.arguments, call_id=tc.id)
                 started = time.monotonic()
                 if ran_already:
                     result = prefetched[n]
@@ -2962,7 +2994,7 @@ class Agent:
                                   "answer with what is done and what remains; the user can send "
                                   "\"continue\" for more.]"))
                 if not ran_already:
-                    self._emit("tool_result", name=tc.function.name, result=result,
+                    self._emit("tool_result", name=tc.function.name, result=result, call_id=tc.id,
                                secs=time.monotonic() - started)
                 self.messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
                 if repeats >= REPEAT_STOP:
@@ -3663,6 +3695,25 @@ def workspace_changes(agent: "Agent") -> list:
 COMMANDS: dict[str, tuple] = {}  # name -> (handler, usage, summary)
 
 
+def state_snapshot(agent: "Agent") -> dict:
+    """What a status line shows about a session, as plain data a front end can draw from."""
+    seen = getattr(agent, "cache_seen_tokens", 0)
+    return {
+        "model": agent.model,
+        "effort": agent.effort,
+        "submodel": agent.subagent_model,
+        "persona": agent.persona,
+        "plan_mode": agent.plan_mode,
+        "auto_bash": agent.auto_bash,
+        "context_tokens": agent.context_tokens(),
+        "context_window": agent.context_window,
+        "compact_at": agent.compaction_trigger(),
+        "session_tokens": agent.session_tokens,
+        "cache_read_ratio": round(agent.cache_read_tokens / seen, 3) if seen else None,
+        "can_undo": bool(agent.undo_stack),
+    }
+
+
 class CommandContext:
     def __init__(self, agent: "Agent", say, default_session: Path, pick=None, home: Path = None,
                  load_models=None, context_override: bool = False, render=None, profile: str | None = None):
@@ -3684,7 +3735,7 @@ class CommandContext:
         looks. The plain REPL has no renderer, so it prints `fallback`.
         """
         if self.render:
-            self.render(view, data)
+            self.render(view, data, fallback)
         else:
             self.say("info", fallback)
 
@@ -4259,6 +4310,15 @@ def main() -> None:
         if idx >= len(args):
             sys.exit("--profile needs a name, e.g. kyklos --profile local")
         profile_flag = args.pop(idx)
+    serve_io = None
+    if "--serve" in args:  # JSON-RPC on stdin/stdout for a desktop app or editor (PROTOCOL.md)
+        args.remove("--serve")
+        if "--eval" in args:
+            sys.exit("--serve and --eval can't be combined.")
+        # Claimed first, before anything can print: from here on stdout belongs to the protocol.
+        sys.modules.setdefault("kyklos", sys.modules[__name__])
+        from serve import claim_stdio
+        serve_io = claim_stdio()
     # Refused before anything else happens, network included: --eval is for eval.py, never by hand.
     eval_mode = "--eval" in args  # unattended approval; see eval_workspace_problem
     if eval_mode:
@@ -4333,7 +4393,19 @@ def main() -> None:
             resume_path = default_session
 
     ui = None
-    if not eval_mode and wants_aero_ui(sys.stdin.isatty(), sys.stdout.isatty(), os.environ):
+    if serve_io:
+        if args:
+            sys.exit(f"--serve takes requests over the protocol, not as arguments: {' '.join(args)}")
+        from serve import UNTRUSTED, ServeUI, server_info
+        ui = ServeUI(workspace, *serve_io)
+        start = ui.handshake(server_info(workspace, probe_sandbox(), known_profiles(os.environ), profile,
+                                         __version__))
+        if start is None:  # the client hung up before starting a session
+            sys.exit(0)
+        resume = start.get("resume")
+        resume_path = default_session if resume == "last" else (
+            Path(resume) if isinstance(resume, str) and resume else None)
+    elif not eval_mode and wants_aero_ui(sys.stdin.isatty(), sys.stdout.isatty(), os.environ):
         # ui.py imports `kyklos`; point that name at this running script instead of loading a second copy.
         sys.modules.setdefault("kyklos", sys.modules[__name__])
         try:
@@ -4342,8 +4414,10 @@ def main() -> None:
         except ImportError:  # rich / prompt_toolkit not installed: fall back to the plain REPL
             ui = None
     # Decide trust before the Agent exists: creating it reads this folder's AGENTS.md into the prompt.
-    if not resolve_trust(home, workspace, interactive=sys.stdin.isatty(), preapproved=preapproved,
+    if not resolve_trust(home, workspace, interactive=sys.stdin.isatty() or bool(serve_io), preapproved=preapproved,
                          ask=ui.ask_trust if ui else ask_trust_plain):
+        if serve_io:
+            ui.fail_start(UNTRUSTED, f"Kyklos isn't trusted to work in {workspace}.")
         sys.exit(f"Kyklos isn't trusted to work in {workspace}. Run kyklos there in a terminal to decide, "
                  "or pass --trust to allow it for one run.")
     # In --eval the trace is the record and stdout carries the answer alone, so nothing is drawn.
@@ -4370,7 +4444,7 @@ def main() -> None:
         agent.set_persona(None)
     # Asked after trust, and never remembered: unlike trusting a folder, this relaxes the rules that
     # protect every run, so it is agreed once per session or not at all.
-    if sys.stdin.isatty() and not preapproved:
+    if (sys.stdin.isatty() or serve_io) and not preapproved:
         agent.auto_bash = (ui.ask_bash_mode() if ui else ask_bash_mode_plain())
     agent.context_source = window_source
     agent.model_source = model_source
