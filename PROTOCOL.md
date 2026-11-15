@@ -253,6 +253,7 @@ keyword arguments, unchanged:
 | `compact` | `stage`, `before`, `after`, `pruned` | `stage` is `pruned` or `summarized` |
 | `retry` | `attempt`, `max_attempts`, `delay`, `error` | |
 | `notice` | `text` | A caveat meant for the person, said once per session |
+| `image` | `path`, `rel`, `mime`, `width`, `height`, `bytes` | `generate_image` saved an image: `path` is absolute, `rel` is workspace-relative. Sent before that call's `tool_result` |
 | `signal` | `kind`, plus `reason`, `left`, `repeats`, `size`, `report`, `count` | The harness stepping in: `nudge`, `budget_warning`, `repeat_warn`, `repeat_stop`, `redacted`, `parallel_batch`, `delegation_hint`, `truncated_call`, `map_note`, `images_sent`, `stopped_report` |
 
 **Nesting guarantee.** At each depth, a `tool_result` closes the most recent `tool_call` (and

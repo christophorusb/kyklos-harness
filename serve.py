@@ -406,13 +406,17 @@ class ServeUI:
                 if method == "shutdown":
                     self.respond(rid, None)
                     break
+                # Each handler clears `busy` itself, just before its reply (see _done). Clearing it
+                # again here, after the reply, could wipe the flag for a request the client sent
+                # in the meantime; it is cleared here only if a handler raised before replying.
                 try:
                     if method == "session/prompt":
                         self._prompt(rid, msg["params"], default_session)
                     elif self._command(rid, msg["params"]):
                         break
-                finally:
+                except BaseException:
                     self.busy = False
+                    raise
         finally:
             self.ready = False
             if previous is not None:
@@ -428,7 +432,7 @@ class ServeUI:
     def _prompt(self, rid, params: dict, default_session: Path) -> None:
         text = params.get("text")
         if not isinstance(text, str) or not text.strip():
-            self.fail(rid, INVALID_PARAMS, "text must be a non-empty string")
+            self._done(rid, error=(INVALID_PARAMS, "text must be a non-empty string"))
             return
         agent, started = self.ctx.agent, time.monotonic()
         answer = None
@@ -442,11 +446,11 @@ class ServeUI:
             agent.repair_after_interrupt()
         except Exception as e:  # API errors: bad key, rate limit, network...
             self._settle()
-            self.fail(rid, API_ERROR, f"API error: {error_detail(e)}", {"detail": error_detail(e)})
+            self._done(rid, error=(API_ERROR, f"API error: {error_detail(e)}", {"detail": error_detail(e)}))
             return
         agent.save_session(default_session)
         self._settle()
-        self.respond(rid, {
+        self._done(rid, {
             "answer": answer, "outcome": agent.last_outcome, "steps": agent.last_steps,
             "secs": round(time.monotonic() - started, 3),
             "claims": [{"label": label, "missing": missing} for label, missing in agent.last_claims]})
@@ -455,7 +459,7 @@ class ServeUI:
         """Run a slash command. Returns True if it was /exit."""
         text = params.get("text")
         if not isinstance(text, str) or not text.strip().startswith("/"):
-            self.fail(rid, INVALID_PARAMS, "text must be a slash command, such as /tokens")
+            self._done(rid, error=(INVALID_PARAMS, "text must be a slash command, such as /tokens"))
             return False
         result = None
         try:
@@ -468,11 +472,20 @@ class ServeUI:
             self.say("warn", "Interrupted.")
         except Exception as e:
             self._settle()
-            self.fail(rid, COMMAND_FAILED, str(e))
+            self._done(rid, error=(COMMAND_FAILED, str(e)))
             return False
         self._settle()
-        self.respond(rid, {"then_send": result if isinstance(result, str) else None, "exit": result is EXIT})
+        self._done(rid, {"then_send": result if isinstance(result, str) else None, "exit": result is EXIT})
         return result is EXIT
+
+    def _done(self, rid, result=None, error: tuple | None = None) -> None:
+        """Reply to a turn or command, marking the server idle first. In the other order, a client
+        that sends its next request the moment the reply arrives can be told it is busy."""
+        self.busy = False
+        if error:
+            self.fail(rid, *error)
+        else:
+            self.respond(rid, result)
 
     def _settle(self) -> None:
         """After a turn or command: nothing is in flight any more, and the client hears the new state."""

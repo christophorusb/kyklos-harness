@@ -13,6 +13,7 @@ A small coding-agent harness (~4,200 lines of Python, plus ~2,900 lines of tests
 - **Undo** (`/undo`) reverts a turn's conversation *and* its file edits.
 - Sessions save and resume per folder; `continue` picks up a turn that hit the step cap.
 - **Images** for models that take them: `read_file` shows the model a PNG, JPEG or WebP, and `@path/to/shot.png` in a message attaches one.
+- **Image generation** (`generate_image`) when an image provider is set up: the model writes a prompt, you approve it, and the image is saved in the workspace.
 
 **Keeping turns cheap**
 - **Context compaction** in two stages: clear old tool results, then summarise — triggered at 75% of the window *or* `COMPACT_ABOVE` tokens, whichever comes first.
@@ -86,6 +87,8 @@ Kyklos works in the folder you launch it from. Set `WORKSPACE` in `.env` to pin 
 | `SUBAGENT_MODEL`, `SUBAGENT_EFFORT` | Route subagents to a faster or cheaper model |
 | `KYKLOS_PERSONA` | A persona to start in, from `~/.kyklos/personas/<name>.md` |
 | `KYKLOS_PASS_ENV` | Secret-named variables to let through to commands anyway |
+| `IMAGE_BASE_URL`, `IMAGE_API_KEY`, `IMAGE_MODEL` | An image provider for `generate_image`, set up on its own (see below) |
+| `IMAGE_API`, `IMAGE_SIZE` | `images` (the OpenAI Images API, default) or `chat` (OpenRouter-style); a default size like `1024x1024` |
 
 ### Profiles
 
@@ -209,6 +212,8 @@ A reply without a tool call ends the turn, so three replies that aren't answers 
 
 **Images.** Ollama says which of its models take images (the `vision` capability in `/api/show`, marked `images` in the `/model` picker), and for those `read_file` on a PNG, JPEG or WebP shows the model the picture: the tool result names the file, type, size and dimensions, and the image follows as one user message after the step's results, because the API takes only text in a tool result. You can attach one yourself with `@path` in a message: relative to the workspace, absolute, or `~/…`; quote a path with spaces, or drag the file into the terminal after the `@`. A model that isn't known to take images gets a clear refusal from `read_file` and the text of your message, with a notice saying what was left out. No other provider says which models take images, so for them set `VISION=1` in `.env` (or `VISION=0` to turn images off). Images are limited to 5 MB. An image counts as a fixed 1,500 tokens toward compaction, and compaction removes old images before anything else. If a provider refuses a request that carries an image, Kyklos takes every image out of the conversation, says so, and retries once with text only, so a bad guess can't wedge the session. Ollama doesn't refuse: it drops the image from a text-only model's request without saying so, and the model answers as though none was sent. So on Ollama, leave `VISION` unset and let the model's own capability list decide; if `VISION=1` contradicts that list, Kyklos says so the first time an image goes to that model. GIF is recognised but not sent, since Ollama refuses it outright ("invalid image input"); Kyklos says so and gives the command to convert it to PNG.
 
+**Generating images.** With an image provider set up in `.env` (`IMAGE_BASE_URL`, `IMAGE_API_KEY`, `IMAGE_MODEL`; all three or none), the model gets a `generate_image` tool: a prompt, a path in the workspace, and an optional size. The image provider is separate from the chat provider and never borrows its settings, so any chat model can ask for images and one provider's key can't reach the other's host. `IMAGE_API=images` speaks the OpenAI Images API (OpenAI, xAI, Together and others); `IMAGE_API=chat` asks a chat-served image model for an image reply, as OpenRouter serves Gemini's. Every call asks you first, showing the full prompt, where it is going and that image models usually bill per image; `a` allows it for the rest of the session. Before anything is sent, Kyklos checks the arguments (a `.png`, `.jpg` or `.webp` path inside the workspace, never `.git/` or a secret file) and takes known secret values out of the prompt. What comes back must really be a PNG, JPEG or WebP under 20 MB, and the file's extension is changed to match its content if the provider chose another format. The file is written like any other write, so `/undo` removes it. The tool isn't offered in plan mode, to subagents or in `--eval`, which runs unattended and shouldn't spend money.
+
 An edit answers with the lines as they now read, and a miss with the closest text in the file and the first line where it differs, so neither costs a re-read. After a write, `.py`, `.json` and `.toml` files are parsed in-process and a file that no longer parses is flagged in the result; nothing is executed to find out. `bash` output past 20,000 characters is cut in the middle for the model and saved whole under `.kyklos/scratch/output/` (secrets scrubbed, newest 20 kept), where it can be searched by path instead of run again.
 
 **Subagents.** `task` hands a self-contained job to a fresh `Agent` with an empty context; only its answer comes back. `explore` mode is read-only and never asks permission; `general` can also edit and run commands. Subagents can't nest. Explore tasks sent in one message run at the same time, up to four at once, since they only read and never ask; anything else runs one at a time. The interface still draws one subagent after another: the others' steps are held back and replayed when their turn comes, each with its real duration. A subagent whose API call fails comes back as a failed tool call the parent can act on, rather than ending the turn. One that is stopped — by the step cap, or for repeating itself — is asked for a report of what it found, so its work reaches the parent as a partial answer rather than being lost. Route them elsewhere with `/submodel`, `SUBAGENT_MODEL`, or `--submodel`; the `task` line names the model when it differs. In a live test a subagent took 12 steps and read five files while the main context stayed at 6%.
@@ -270,11 +275,11 @@ Claims to have run the tests, committed, pushed or installed are compared agains
 ## Tests
 
 ```bash
-./.venv/bin/python -m unittest test_kyklos test_ui test_audit test_eval test_serve
+./.venv/bin/python -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen
 ```
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui test_audit test_eval test_serve
+.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen
 ```
 
 ## Evals

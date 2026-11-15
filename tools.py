@@ -1311,6 +1311,11 @@ def sandbox_argv(inner_argv: list[str], workspace: Path, allow_network: bool = F
 
 
 IMAGE_LABELS = {"image/png": "PNG", "image/jpeg": "JPEG", "image/gif": "GIF", "image/webp": "WebP"}
+# What generate_image may save, by the type the bytes turn out to be: the file's extension is made
+# to match its content, so a JPEG never sits in a .png.
+GENERATED_IMAGE_SUFFIXES = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}
+GENERATED_IMAGE_PATH_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+MAX_IMAGE_PROMPT_CHARS = 4000
 # What is actually sent. GIF is recognised, so it can be named, but not sent: Ollama cloud answers
 # 400 "invalid image input" to GIF87a and GIF89a alike (checked on minimax-m3.1-flash and kimi-k3),
 # and a refused request costs every image in the conversation (see Agent._drop_images).
@@ -1544,6 +1549,20 @@ class Tools:
         p.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} chars to {path}" + _syntax_note(p, path, content)
 
+    def save_image(self, path: str, data: bytes) -> Path:
+        """Write a generated image. The same path rules as write_file, and the same snapshot, so
+        /undo removes it or puts back what it replaced."""
+        p = self._resolve_writable(path, "write")
+        if is_secret_file(p):
+            raise ToolError(f"Refusing to write {path}: it likely contains secrets.")
+        if self.before_write:
+            self.before_write(p)
+        if is_scratch_path(self.workspace, path):
+            ensure_scratch(self.workspace)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        return p
+
     def _prepare_edits(self, args: dict) -> tuple[Path, str, str, dict]:
         """(file, its text, the text with every edit applied, how the matching went). Raises a
         ToolError, with nothing written, if any edit can't be applied."""
@@ -1604,6 +1623,26 @@ class Tools:
             if unknown:
                 raise TypeError(f"edit_file() got an unexpected keyword argument {unknown[0]!r}")
             self._prepare_edits(args)
+        elif name == "generate_image":
+            unknown = sorted(set(args) - {"prompt", "path", "size"})
+            if unknown:
+                raise TypeError(f"generate_image() got an unexpected keyword argument {unknown[0]!r}")
+            prompt, path = args.get("prompt"), args.get("path")
+            if not isinstance(prompt, str) or not prompt.strip():
+                raise TypeError("generate_image() needs a non-empty string 'prompt'")
+            if len(prompt) > MAX_IMAGE_PROMPT_CHARS:
+                raise ToolError(f"The prompt is {len(prompt):,} characters; image models take up to "
+                                f"{MAX_IMAGE_PROMPT_CHARS:,}. Describe the image more briefly.")
+            if not isinstance(path, str) or not path.strip():
+                raise TypeError("generate_image() needs a string 'path' to save the image to, e.g. assets/hero.png")
+            if Path(path).suffix.lower() not in GENERATED_IMAGE_PATH_SUFFIXES:
+                raise ToolError(f"Save the image as .png, .jpg or .webp, not {path!r}.")
+            p = self._resolve_writable(path, "write")
+            if is_secret_file(p):
+                raise ToolError(f"Refusing to write {path}: it likely contains secrets.")
+            size = args.get("size")
+            if size is not None and not (isinstance(size, str) and re.match(r"^\d{2,4}x\d{2,4}$", size)):
+                raise ToolError(f"size must look like 1024x1024, not {size!r}.")
         elif name == "bash":
             unknown = sorted(set(args) - {"command", "timeout"})
             if unknown:

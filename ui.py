@@ -687,6 +687,12 @@ class AeroUI:
         self.print(Text(f"{self.g['compact']} context compacted: {what}, ~{before:,} {self.g['arrow']} ~{after:,} tokens",
                         style="frost"), indent=2 + 4 * depth)
 
+    def _on_image(self, depth, rel="", width=None, height=None, bytes=0, **_):
+        """A generated image, saved: where it went and how big, since a terminal can't show it."""
+        size = f"{width}{'x' if self.ascii else '×'}{height}, " if width and height else ""
+        self.print(Text(f"{self.g['done']} saved {sanitize_terminal_text(rel)} ({size}{bytes / 1e6:.1f} MB)",
+                        style="mint"), indent=4 + 4 * depth)
+
     def _on_notice(self, depth, text="", **_):
         """A standing caveat about this session rather than a step in it: printed once, where the
         agent raised it, because it changes how the numbers on screen should be read."""

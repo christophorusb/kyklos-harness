@@ -24,9 +24,10 @@ from types import SimpleNamespace
 
 from openai import APIConnectionError, APITimeoutError, InternalServerError, OpenAI, RateLimitError
 
+from imagegen import ImageError, ImageGenerator, image_config
 from tools import (SAFE_TOOLS, SCHEMAS, SHELL_NAME, ToolError, Tools, _match_edit, apply_edits, command_touches_secret,
                    edit_list,
-                   hide_env_names, image_info, load_image,
+                   GENERATED_IMAGE_SUFFIXES, describe_image, hide_env_names, image_info, load_image,
                    is_scratch_path, MISSING_TOOL_ADVICE, missing_unix_tools, plain_line, probe_commands,
                    probe_sandbox,
                    repository_map, sandbox_port_settings, sandbox_status, sanitize_terminal_text,
@@ -144,6 +145,32 @@ TASK_SCHEMA = {
                 "mode": {"type": "string", "enum": ["explore", "general"], "description": "Default explore"},
             },
             "required": ["description", "prompt"],
+        },
+    },
+}
+
+# Offered only when an image provider is configured (IMAGE_* in .env); never to subagents or in
+# plan mode. Each call sends a prompt to that provider and usually costs money, so it always asks.
+IMAGE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "generate_image",
+        "description": (
+            "Generate an image from a text prompt with the configured image model, and save it to path "
+            "in the workspace (.png, .jpg or .webp). The user approves every call: it sends the prompt to "
+            "the image provider and usually costs money. Write one complete, specific prompt (subject, "
+            "style, composition, colours, background, anything that must or must not appear) rather than "
+            "generating repeatedly to explore. Use it for assets the task needs, such as sprites, icons, "
+            "concept art or placeholders, not for diagrams that code can draw."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "The full description of the image"},
+                "path": {"type": "string", "description": "Where to save it, e.g. assets/sprites/hero.png"},
+                "size": {"type": "string", "description": "Optional, like 1024x1024; the provider's default if omitted"},
+            },
+            "required": ["prompt", "path"],
         },
     },
 }
@@ -906,6 +933,15 @@ def remote_provider_host(base_url: str | None) -> str:
     return host
 
 
+_IMAGE_PROVIDER: tuple[str, str] | None = None  # (host, model) of the image provider, when one is set up
+
+
+def set_image_provider(host: str | None, model: str | None) -> None:
+    """Record where generate_image sends prompts, so its permission prompt can say so."""
+    global _IMAGE_PROVIDER
+    _IMAGE_PROVIDER = (host, model) if host and model else None
+
+
 def set_explain_provider(base_url: str | None) -> None:
     """Record the active API endpoint so permission prompts can warn when host telemetry would leave
     the device."""
@@ -1665,6 +1701,17 @@ def permission_options(name: str, args: dict) -> tuple[bool, str, list]:
         if target:
             findings.append(("danger", f"modifies {target}, which controls persistent instructions or code "
                                        f"that runs automatically (hooks, editor tasks, CI)"))
+    elif name == "generate_image":
+        host, model = _IMAGE_PROVIDER or ("the image provider", "the image model")
+        findings.append(("warn", f"sends this prompt to {host} to make an image with {model}; image models "
+                                 f"usually bill per image"))
+        path = str(args.get("path", ""))
+        target = _protected_workspace_target(path)
+        if target:
+            findings.append(("danger", f"writes {target}, which controls persistent instructions or code "
+                                       f"that runs automatically"))
+        elif _EXPLAIN_WORKSPACE is not None and path and (_EXPLAIN_WORKSPACE / path).is_file():
+            findings.append(("warn", f"overwrites {path}"))
     touches_secret = name == "bash" and command_touches_secret(cmd)
     prefix = "" if (touches_secret or has_danger(findings)) else (suggest_prefix(cmd) if cmd else "")
     return touches_secret, prefix, findings
@@ -2066,6 +2113,9 @@ def console_observer(event: str, depth: int = 0, **data) -> None:
         detail = (f"cleared {data['pruned']} old tool results"
                   if data["stage"] == "pruned" else "summarized older turns")
         print(f"{indent}\033[2m(Context compacted: {detail}, ~{data['before']:,} -> ~{data['after']:,} tokens)\033[0m")
+    elif event == "image":
+        print(f"{indent}\033[36m▣ saved {sanitize_terminal_text(str(data['rel']))} "
+              f"({data['width']}×{data['height']}, {data['bytes']:,} bytes)\033[0m")
     elif event == "retry":
         print(f"{indent}\033[33m(API error: {sanitize_terminal_text(str(data['error']))}; retrying in {data['delay']:.0f}s "
               f"[{data['attempt']}/{data['max_attempts']}])\033[0m")
@@ -2270,7 +2320,7 @@ class Agent:
                  subagent_context_window: int | None = None, persona: str | None = None,
                  home: Path | None = None, stream: bool = True, notices_seen: set | None = None,
                  vision: bool | None = None, vision_override: bool | None = None,
-                 subagent_vision: bool | None = None):
+                 subagent_vision: bool | None = None, images: "ImageGenerator | None" = None):
         self.client = client
         self.model = model
         # Whether the model takes images: what the provider says (None: it didn't say), and the
@@ -2283,6 +2333,9 @@ class Agent:
         set_explain_workspace(self.tools.workspace)
         set_explain_provider(getattr(client, "base_url", None))
         self.permission = permission
+        self.images: ImageGenerator | None = images  # generate_image exists only when this is set
+        if images is not None:
+            set_image_provider(images.config.host, images.config.model)
         self.context_window = context_window
         self.depth = depth  # 0 for the main agent, 1 for a subagent
         self.indent = "    " * depth  # subagent output is indented under the task call
@@ -2304,7 +2357,7 @@ class Agent:
         # Chosen at startup, for this session only: a relaxation of the permission rules should
         # never outlive the run it was agreed for, the way folder trust deliberately does.
         self.auto_bash = False
-        all_schemas = SCHEMAS + [TASK_SCHEMA]
+        all_schemas = self._all_schemas()
         if tool_names is None:
             tool_names = {s["function"]["name"] for s in all_schemas}
         self.base_tool_names = set(tool_names)
@@ -2438,8 +2491,11 @@ class Agent:
         if self.active_snapshots is not None and p not in self.active_snapshots:
             self.active_snapshots[p] = p.read_bytes() if p.is_file() else None
 
+    def _all_schemas(self) -> list:
+        return SCHEMAS + [TASK_SCHEMA] + ([IMAGE_SCHEMA] if self.images is not None else [])
+
     def _update_mode(self) -> None:
-        all_schemas = SCHEMAS + [TASK_SCHEMA]
+        all_schemas = self._all_schemas()
         allowed = (self.base_tool_names & PLAN_TOOLS) if self.plan_mode else self.base_tool_names
         self.schemas = [s for s in all_schemas if s["function"]["name"] in allowed]
         self.tool_names = {s["function"]["name"] for s in self.schemas}
@@ -2454,6 +2510,10 @@ class Agent:
                        f"dependencies resolve, it is kept out of git, and writing there needs no "
                        f"approval. Don't write scratch files to /tmp: nothing there can import the "
                        f"project.")
+        if "generate_image" in self.tool_names:
+            prompt += (f"\n- generate_image makes images with {self.images.config.model} and saves them to the "
+                       f"workspace. Every call asks the user and usually costs money: one careful prompt "
+                       f"beats several tries. If you can see images, read_file the result to check it.")
         if "plan" in self.tool_names:
             # Without a nudge the model narrates its intent in prose, where it scrolls past between
             # tool calls. The plan tool puts the same thing somewhere the UI can keep it in view.
@@ -2805,7 +2865,7 @@ class Agent:
                 return self.run_subagent(**args)
             except TypeError as e:
                 return f"Error: bad arguments for task: {e}"
-        fn = getattr(self.tools, name)
+        fn = self.generate_image if name == "generate_image" else getattr(self.tools, name)
         try:
             self.tools.check(name, args)
         except ToolError as e:
@@ -2834,6 +2894,44 @@ class Agent:
             # copy of state that could disagree with this one.
             self._emit("plan", steps=list(self.tools.plan_steps), active=self.tools.plan_active)
         return result
+
+    def generate_image(self, prompt: str, path: str, size: str | None = None) -> str:
+        """Ask the image provider for one image and save it; runs only after the user approved the call.
+
+        Known secret values are taken out of the prompt first: the image provider is a second host,
+        and a prompt the model wrote after reading the workspace could carry one. The bytes must be a
+        PNG, JPEG or WebP image whatever the provider claims, and the file's extension is made to
+        match what they are.
+        """
+        if self.images is None:
+            raise ToolError("Image generation isn't set up: set IMAGE_BASE_URL, IMAGE_API_KEY and IMAGE_MODEL in .env.")
+        clean, redacted = scrub_secrets(prompt, workspace=self.tools.workspace)
+        try:
+            data = self.images.generate(clean, size)
+        except ImageError as e:
+            raise ToolError(str(e))
+        info = image_info(data[:64 * 1024])
+        if not info or info[0] not in GENERATED_IMAGE_SUFFIXES:
+            kind = info[0] if info else "not an image Kyklos recognises"
+            raise ToolError(f"The image provider sent {kind}, not a PNG, JPEG or WebP image; nothing was saved.")
+        mime, width, height = info
+        notes = []
+        wanted = GENERATED_IMAGE_SUFFIXES[mime]
+        if Path(path).suffix.lower() not in ({".jpg", ".jpeg"} if wanted == ".jpg" else {wanted}):
+            renamed = str(Path(path).with_suffix(wanted))
+            notes.append(f"The provider sent a {describe_image(mime, None, None, len(data)).split(',')[0]}, so it "
+                         f"was saved as {renamed} instead of {path}.")
+            self.tools.check("generate_image", {"prompt": prompt, "path": renamed})  # same rules for the new name
+            path = renamed
+        saved = self.tools.save_image(path, data)
+        rel = self.tools._rel(saved)
+        self._emit("image", path=str(saved), rel=rel, mime=mime, width=width, height=height, bytes=len(data))
+        if redacted:
+            notes.append(f"Kyklos removed {redacted} secret value{'s' if redacted > 1 else ''} from the prompt "
+                         f"before sending it.")
+        return (f"Generated {rel} ({describe_image(mime, width, height, len(data))}) with {self.images.config.model}."
+                + "".join(f" {n}" for n in notes)
+                + (" read_file it to check the result." if self.sees_images() else ""))
 
     def repair_after_interrupt(self) -> None:
         """After Ctrl+C, give any tool call that never got a result a placeholder one.
@@ -4609,6 +4707,13 @@ def main() -> None:
     # only: no other provider says, and None means no). VISION decides when set, but the provider's
     # answer is still looked up, so a VISION=1 that contradicts it can be pointed out.
     vision_override = choose_vision(env)
+    # The image provider is set up on its own (IMAGE_* in .env), never from the chat profile, and is
+    # off in --eval: an unattended run must not spend money on images.
+    try:
+        images_cfg = None if eval_mode else image_config(os.environ)
+    except ValueError as e:
+        sys.exit(str(e))
+    images = ImageGenerator(images_cfg) if images_cfg else None
 
     def vision_of(name: str | None) -> bool | None:
         if not name:
@@ -4685,7 +4790,7 @@ def main() -> None:
                   subagent_model=sub_model, subagent_effort=sub_effort, subagent_context_window=sub_window,
                   persona=persona, home=home, stream=choose_stream(os.environ),
                   permission=permission, on_event=observer, vision=vision_of(model),
-                  vision_override=vision_override, subagent_vision=vision_of(sub_model))
+                  vision_override=vision_override, subagent_vision=vision_of(sub_model), images=images)
     if persona and not persona_path(persona, home):
         # Named but not there: say so rather than starting a plain agent that looks like the persona.
         print(f"No persona named {persona} in {home / 'personas'} (from {persona_source}); "
