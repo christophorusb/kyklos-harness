@@ -2329,7 +2329,9 @@ class Agent:
         self.vision_override = vision_override
         self.active_snapshots: dict[Path, bytes | None] | None = None
         self._before_write = before_write or self._record_file_snapshot
-        self.tools = Tools(workspace, before_write=self._before_write, sees_images=self.sees_images)
+        self.tools = Tools(workspace, before_write=self._before_write, sees_images=self.sees_images,
+                           image_delegate=self.image_delegate)
+        self._attachment_note = ""  # set by _attachments for the turn it is building
         set_explain_workspace(self.tools.workspace)
         set_explain_provider(getattr(client, "base_url", None))
         self.permission = permission
@@ -2379,6 +2381,19 @@ class Agent:
         self.cache_seen_tokens = 0
         self.cache_read_tokens = 0
         self.reset()
+
+    def image_delegate(self) -> str | None:
+        """The model a text-only agent can hand images to: its subagents' model, when that one takes
+        images and this one doesn't. Only for an agent that can start subagents (the main one, with
+        the task tool on offer), and only when a separate submodel is set: otherwise a subagent is
+        the same model and can't see them either.
+        """
+        if self.depth > 0 or not self.subagent_model or "task" not in getattr(self, "tool_names", ()):
+            return None
+        if self.sees_images():
+            return None
+        sub_sees = self.vision_override if self.vision_override is not None else bool(self.subagent_vision)
+        return self.subagent_model if sub_sees else None
 
     def sees_images(self) -> bool:
         """Whether images go to this model: VISION if set, else what the provider said, else no."""
@@ -3099,8 +3114,10 @@ class Agent:
     def _send_turn(self, user_text: str, preface: str = "") -> str:
         # The preface is Kyklos's, not the user's: it rides in front, so the message still ends
         # with the request verbatim, which is what compaction and the turn log go by.
-        text = f"{preface}\n\n{user_text}" if preface else user_text
         images = self._attachments(user_text) if self.depth == 0 else []
+        front = "\n\n".join(part for part in (preface, self._attachment_note) if part)
+        self._attachment_note = ""
+        text = f"{front}\n\n{user_text}" if front else user_text
         self.messages.append({"role": "user", "content": [{"type": "text", "text": text}]
                               + [image_part(i) for i in images] if images else text})
         self.current_request = user_text
@@ -3286,6 +3303,18 @@ class Agent:
             self._emit("notice", text=problem)
         if images and not self.sees_images():
             names = ", ".join(i["path"] for i in images)
+            delegate = self.image_delegate()
+            if delegate:
+                # The model would otherwise see only "@shot.png" in the text, with no idea the image
+                # exists or that a subagent could look at it for it.
+                self._attachment_note = (
+                    f"[Kyklos: the user attached {names}, but you don't take images, so they weren't sent "
+                    f"to you. Your subagents run {delegate}, which does: to see them, delegate a task "
+                    f"(mode explore) that names each file and says exactly what to look for, and work from "
+                    f"its description.]")
+                self._emit("notice", text=f"Not attached for {self.model}, which isn't known to take images: "
+                                          f"{names}. It was told a subagent on {delegate} can look at them.")
+                return []
             self._emit("notice", text=f"Not attached: {names}. {self.model} isn't known to take images, so "
                                       f"only the text was sent. If it does, set VISION=1 in .env.")
             return []

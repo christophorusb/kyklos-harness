@@ -1407,13 +1407,16 @@ def load_image(p: Path, shown_as: str) -> dict:
 
 
 class Tools:
-    def __init__(self, workspace: Path, before_write=None, sees_images=None):
+    def __init__(self, workspace: Path, before_write=None, sees_images=None, image_delegate=None):
         self.workspace = workspace.resolve()
         self.before_write = before_write
         # Whether the model on the other end accepts images; asked at each read, because /model
         # can change the answer mid-session. read_file leaves the images it reads in
         # pending_images, and the agent loop sends them on after the call's text result.
         self.sees_images = sees_images or (lambda: False)
+        # The subagent model that can look at an image this model can't, or None; see
+        # Agent.image_delegate. Asked at each read, for the same reason as sees_images.
+        self.image_delegate = image_delegate or (lambda: None)
         self.pending_images: list[dict] = []
         # The plan the model is working through. Steps are linear, so one index is the whole
         # state: everything before `plan_active` is done, everything after is still to do.
@@ -1513,9 +1516,14 @@ class Tools:
         if image_info(head):
             if not self.sees_images():
                 info = image_info(head)
-                raise ToolError(f"{path} is an image ({describe_image(info[0], info[1], info[2], size)}), and the "
-                                "current model doesn't take images, so Kyklos can't show it to you. Say so if "
-                                "you need to see it; `file` with bash gives its type and size.")
+                what = f"{path} is an image ({describe_image(info[0], info[1], info[2], size)}), and the current model"
+                delegate = self.image_delegate()
+                if delegate:
+                    raise ToolError(f"{what} doesn't take images, so Kyklos can't show it to you. Your subagents run "
+                                    f"{delegate}, which does: to see it, delegate a task (mode explore) that names "
+                                    f"{path} and says exactly what to look for, and work from its description.")
+                raise ToolError(f"{what} doesn't take images, so Kyklos can't show it to you. Say so if you need to "
+                                "see it; `file` with bash gives its type and size.")
             image = load_image(p, path)
             self.pending_images.append(image)
             return f"{path}: {image['desc']}. The image follows, in the next message."

@@ -6275,5 +6275,90 @@ class ImageTests(unittest.TestCase):
         self.assertIsNone(choose_vision({}))
 
 
+class VisionDelegationTests(unittest.TestCase):
+    """A text-only model with a submodel that takes images is told it can hand images to a subagent."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name) / "ws"
+        self.ws.mkdir()
+        (self.ws / "shot.png").write_bytes(png_bytes(1280, 800))
+        self.events = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def agent(self, client, vision=False, subagent_model="vision-sub", subagent_vision=True, **kw):
+        return Agent(client, "text-main", self.ws, permission=allow_all, vision=vision,
+                     subagent_model=subagent_model, subagent_vision=subagent_vision,
+                     on_event=lambda event, depth=0, **data: self.events.append((event, data)), **kw)
+
+    def read_refusal(self, agent):
+        return agent.run_tool("read_file", '{"path": "shot.png"}')
+
+    def test_the_refusal_names_the_submodel_that_can_look(self):
+        result = self.read_refusal(self.agent(FakeClient([])))
+        self.assertIn("doesn't take images", result)
+        self.assertIn("vision-sub", result)
+        self.assertIn("mode explore", result)
+
+    def test_no_hint_without_a_submodel_that_takes_images(self):
+        for kw in ({"subagent_model": None}, {"subagent_vision": False}, {"subagent_vision": None}):
+            with self.subTest(**kw):
+                result = self.read_refusal(self.agent(FakeClient([]), **kw))
+                self.assertIn("doesn't take images", result)
+                self.assertNotIn("subagent", result)
+
+    def test_a_model_that_sees_images_needs_no_hint(self):
+        agent = self.agent(FakeClient([]), vision=True)
+        self.assertIsNone(agent.image_delegate())
+        self.assertIn("The image follows", self.read_refusal(agent))
+
+    def test_subagents_and_agents_without_task_are_never_pointed_elsewhere(self):
+        sub = self.agent(FakeClient([]), depth=1)
+        self.assertIsNone(sub.image_delegate(), "a subagent can't start subagents of its own")
+        no_task = self.agent(FakeClient([]), tool_names={"read_file", "grep", "glob"})
+        self.assertIsNone(no_task.image_delegate())
+
+    def test_vision_override_decides_for_both_models(self):
+        # VISION=0 keeps images out everywhere, so there is nobody to delegate to.
+        self.assertIsNone(self.agent(FakeClient([]), vision_override=False).image_delegate())
+
+    def test_an_attachment_tells_the_model_and_keeps_the_request_last(self):
+        client = FakeClient([reply("ok")])
+        self.agent(client).send("what is wrong in @shot.png")
+        sent = client.calls[0][-1]
+        self.assertIsInstance(sent["content"], str, "no image part goes to a model that can't take it")
+        self.assertTrue(sent["content"].startswith("[Kyklos: the user attached shot.png"))
+        self.assertIn("vision-sub", sent["content"])
+        self.assertTrue(sent["content"].endswith("what is wrong in @shot.png"), "the request stays last, verbatim")
+        notices = [d["text"] for e, d in self.events if e == "notice"]
+        self.assertTrue(any("It was told a subagent on vision-sub can look" in n for n in notices), notices)
+
+    def test_the_note_is_for_one_turn_only(self):
+        client = FakeClient([reply("ok"), reply("ok")])
+        agent = self.agent(client)
+        agent.send("look at @shot.png")
+        agent.send("thanks")
+        self.assertEqual(client.calls[1][-1]["content"], "thanks")
+
+    def test_delegating_gets_the_image_to_the_submodel(self):
+        client = FakeClient([
+            reply(tool_calls=[tool_call("t1", "task", description="look at the screenshot",
+                                        prompt="Read shot.png and describe the login form.", mode="explore")]),
+            reply(tool_calls=[tool_call("r1", "read_file", path="shot.png")]),  # the subagent
+            reply("A login form with an empty password field."),  # the subagent's answer
+            reply("The password field is empty."),  # the main agent's answer
+        ])
+        answer = self.agent(client).send("what is wrong in the screenshot shot.png?")
+        self.assertEqual(answer, "The password field is empty.")
+        models = [extra["model"] for extra in client.extra]
+        self.assertEqual(models, ["text-main", "vision-sub", "vision-sub", "text-main"])
+        self.assertTrue(image_urls(client.calls[2]), "the vision submodel was sent the image")
+        self.assertFalse(image_urls(client.calls[0]) or image_urls(client.calls[3]),
+                         "the text-only main model never was")
+        self.assertIn("A login form", [m for m in client.calls[3] if m["role"] == "tool"][-1]["content"])
+
+
 if __name__ == "__main__":
     unittest.main()
