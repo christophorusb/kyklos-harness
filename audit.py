@@ -202,6 +202,13 @@ def answer_corpus() -> list[Case]:
 # saved session is already the corpus: every finished turn can be handed back to the checker exactly
 # as the live loop handed it over. This is the half that needs no grammar and no guessing.
 
+def _is_image_result(content) -> bool:
+    """Whether a user-role message is Kyklos passing on what read_file read (see IMAGE_RESULT_NOTE)."""
+    if isinstance(content, list):
+        content = next((p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"), "")
+    return isinstance(content, str) and content.startswith("[Kyklos: the image")
+
+
 def replay_session(path: Path) -> list[tuple[str, list[tuple[str, str]]]]:
     """(final answer, commands run) for each finished turn in a saved session.
 
@@ -222,6 +229,8 @@ def replay_session(path: Path) -> list[tuple[str, list[tuple[str, str]]]]:
         if obj.get("_meta") == "state":
             continue
         role = obj.get("role")
+        if role == "user" and _is_image_result(obj.get("content")):
+            continue  # the images a read_file call read, sent on mid-turn: not the user speaking
         if role == "user":
             commands, pending = [], {}
         elif role == "assistant":

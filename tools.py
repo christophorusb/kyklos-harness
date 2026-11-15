@@ -27,6 +27,9 @@ MAX_SEARCH_FILE_BYTES = 2_000_000
 # Above this, read_file streams to the requested window instead of loading the file: a 1 GB dump
 # read whole would hold the harness's memory for a slice of 2000 lines.
 MAX_READ_WHOLE_BYTES = 10_000_000
+# An image is re-sent, base64-encoded (a third larger), on every step until compaction drops it,
+# so one big screenshot costs on every call that follows. 5 MB holds any ordinary screenshot.
+MAX_IMAGE_BYTES = 5_000_000
 # A model asked for an hour once, and a day is a valid integer. Ten minutes is longer than any
 # test or build Kyklos should wait on in the foreground; Ctrl+C still ends one sooner.
 MAX_BASH_TIMEOUT = 600
@@ -1307,10 +1310,106 @@ def sandbox_argv(inner_argv: list[str], workspace: Path, allow_network: bool = F
     return inner_argv
 
 
+IMAGE_LABELS = {"image/png": "PNG", "image/jpeg": "JPEG", "image/gif": "GIF", "image/webp": "WebP"}
+# What is actually sent. GIF is recognised, so it can be named, but not sent: Ollama cloud answers
+# 400 "invalid image input" to GIF87a and GIF89a alike (checked on minimax-m3.1-flash and kimi-k3),
+# and a refused request costs every image in the conversation (see Agent._drop_images).
+SENDABLE_IMAGES = {"image/png", "image/jpeg", "image/webp"}
+
+
+def _jpeg_size(data: bytes) -> tuple[int, int] | None:
+    i = 2
+    while i + 9 < len(data):
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        marker = data[i + 1]
+        if marker == 0xFF:  # fill byte
+            i += 1
+            continue
+        if marker in (0x01, 0xD8) or 0xD0 <= marker <= 0xD7:  # markers with no length
+            i += 2
+            continue
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):  # a start-of-frame
+            return int.from_bytes(data[i + 7:i + 9], "big"), int.from_bytes(data[i + 5:i + 7], "big")
+        i += 2 + int.from_bytes(data[i + 2:i + 4], "big")
+    return None
+
+
+def image_info(data: bytes) -> tuple[str, int | None, int | None] | None:
+    """(mime type, width, height) of a PNG, JPEG, GIF or WebP, from its bytes; None for anything else.
+
+    Read from the magic number rather than the extension, so a renamed file is still what it is.
+    The size is best effort (None where the header doesn't say) and is only ever shown, never relied on.
+    """
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", *((int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big"))
+                              if len(data) >= 24 else (None, None))
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", *(_jpeg_size(data) or (None, None))
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif", *((int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little"))
+                              if len(data) >= 10 else (None, None))
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        chunk, size = data[12:16], (None, None)
+        if chunk == b"VP8X" and len(data) >= 30:
+            size = 1 + int.from_bytes(data[24:27], "little"), 1 + int.from_bytes(data[27:30], "little")
+        elif chunk == b"VP8 " and len(data) >= 30:
+            size = int.from_bytes(data[26:28], "little") & 0x3FFF, int.from_bytes(data[28:30], "little") & 0x3FFF
+        elif chunk == b"VP8L" and len(data) >= 25:
+            bits = int.from_bytes(data[21:25], "little")
+            size = (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+        return "image/webp", *size
+    return None
+
+
+def describe_image(mime: str, width: int | None, height: int | None, nbytes: int) -> str:
+    """'PNG, 1280×800, 214 KB' -- what a person (or a model) needs to know about an image at a glance."""
+    size = f"{nbytes / 1_000_000:.1f} MB" if nbytes >= 1_000_000 else f"{max(1, round(nbytes / 1000))} KB"
+    dims = f", {width}×{height}" if width and height else ""
+    return f"{IMAGE_LABELS.get(mime, mime)}{dims}, {size}"
+
+
+def load_image(p: Path, shown_as: str) -> dict:
+    """An image file read for the model: {"path", "mime", "data" (base64), "desc"}.
+
+    Raises ToolError for anything that isn't a supported image or is over MAX_IMAGE_BYTES, with the
+    reason in words, so the caller can hand the message on unchanged.
+    """
+    import base64
+    try:
+        size = p.stat().st_size
+        if size > MAX_IMAGE_BYTES:
+            with p.open("rb") as f:
+                info = image_info(f.read(64 * 1024))
+            what = describe_image(info[0], info[1], info[2], size) if info else f"{size:,} bytes"
+            raise ToolError(f"{shown_as} is too large to send as an image ({what}; the limit is "
+                            f"{MAX_IMAGE_BYTES // 1_000_000} MB). Make a smaller copy first, e.g. "
+                            f"`sips -Z 1600 in.png --out {SCRATCH_DIR}/small.png` on macOS or "
+                            f"`magick in.png -resize 1600x1600 {SCRATCH_DIR}/small.png`.")
+        data = p.read_bytes()
+    except OSError as e:
+        raise ToolError(f"Couldn't read {shown_as}: {e}")
+    info = image_info(data)
+    if not info:
+        raise ToolError(f"{shown_as} isn't a PNG, JPEG or WebP image.")
+    if info[0] not in SENDABLE_IMAGES:
+        raise ToolError(f"{shown_as} is a {IMAGE_LABELS[info[0]]}, which Ollama refuses as image input, so Kyklos "
+                        f"doesn't send it. Convert it to PNG first, e.g. `sips -s format png in.gif --out "
+                        f"{SCRATCH_DIR}/in.png` on macOS or `ffmpeg -i in.gif -frames:v 1 {SCRATCH_DIR}/in.png`.")
+    return {"path": shown_as, "mime": info[0], "data": base64.b64encode(data).decode("ascii"),
+            "desc": describe_image(info[0], info[1], info[2], len(data))}
+
+
 class Tools:
-    def __init__(self, workspace: Path, before_write=None):
+    def __init__(self, workspace: Path, before_write=None, sees_images=None):
         self.workspace = workspace.resolve()
         self.before_write = before_write
+        # Whether the model on the other end accepts images; asked at each read, because /model
+        # can change the answer mid-session. read_file leaves the images it reads in
+        # pending_images, and the agent loop sends them on after the call's text result.
+        self.sees_images = sees_images or (lambda: False)
+        self.pending_images: list[dict] = []
         # The plan the model is working through. Steps are linear, so one index is the whole
         # state: everything before `plan_active` is done, everything after is still to do.
         self.plan_steps: list[str] = []
@@ -1406,6 +1505,15 @@ class Tools:
                 head = f.read(8192)
         except OSError as e:
             raise ToolError(f"Couldn't read {path}: {e}")
+        if image_info(head):
+            if not self.sees_images():
+                info = image_info(head)
+                raise ToolError(f"{path} is an image ({describe_image(info[0], info[1], info[2], size)}), and the "
+                                "current model doesn't take images, so Kyklos can't show it to you. Say so if "
+                                "you need to see it; `file` with bash gives its type and size.")
+            image = load_image(p, path)
+            self.pending_images.append(image)
+            return f"{path}: {image['desc']}. The image follows, in the next message."
         if b"\0" in head:  # the same test grep uses; UTF-16 text has NULs too, and is rare in a repo
             raise ToolError(f"{path} looks binary ({size:,} bytes): as text it would be replacement "
                             "characters. Inspect it with bash instead (`file`, `xxd | head`, `sqlite3`, `unzip -l`).")
@@ -1864,7 +1972,9 @@ SCHEMAS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a text file. Returns lines prefixed with line numbers.",
+            "description": ("Read a file. Text comes back as lines prefixed with line numbers. An image "
+                            "(PNG, JPEG, WebP) is shown to you when the model takes images; "
+                            "offset and limit don't apply to it."),
             "parameters": {
                 "type": "object",
                 "properties": {

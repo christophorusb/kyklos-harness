@@ -2758,7 +2758,9 @@ class ModelCatalogTests(unittest.TestCase):
         from kyklos import parse_model_info
         self.assertEqual(parse_model_info("kimi-k3", KIMI_K3), {
             "name": "kimi-k3", "context": 1048576, "tools": True,
-            "efforts": ["off", "low", "high", "max"], "default": "max"})
+            "efforts": ["off", "low", "high", "max"], "default": "max", "vision": True})
+        self.assertFalse(parse_model_info("k", KIMI_CODE)["vision"])  # lists capabilities, not vision
+        self.assertIsNone(parse_model_info("x", {"model_info": {}})["vision"])  # lists none: unknown
         self.assertIsNone(parse_model_info("m", MINIMAX)["efforts"])  # thinks, levels unknown
         self.assertEqual(parse_model_info("m", MISTRAL)["efforts"], [])  # can't think
         self.assertFalse(parse_model_info("c", CLEF)["tools"])
@@ -2948,7 +2950,7 @@ class ModelCommandTests(unittest.TestCase):
         from kyklos import load_settings, run_command
         run_command(self.ctx(answers=[0, 3]), "/model")  # kimi-k3, then "high"
         title, rows, cursor, marked = self.picks[0]
-        self.assertEqual(rows[0], ("kimi-k3", "1M", "off · low · high · max"))
+        self.assertEqual(rows[0], ("kimi-k3", "1M · images", "off · low · high · max"))
         self.assertEqual(rows[2][2], "no thinking")
         self.assertEqual(marked, 1)  # minimax is the current model
         self.assertEqual(self.picks[1][0], "Thinking effort for kimi-k3")
@@ -5981,6 +5983,296 @@ class ExplainerFalsePositiveTests(unittest.TestCase):
         (self.ws / "link").symlink_to(outside, target_is_directory=True)
         self.assertIn("overwrites link/new.txt", self.danger("echo x > link/new.txt"))
         self.assertEqual(self.danger("echo x > sub/new.txt"), [])
+
+
+def png_bytes(width=4, height=3, pad=0):
+    """A PNG header as image_info reads it: signature, then IHDR's width and height."""
+    return (b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + width.to_bytes(4, "big") + height.to_bytes(4, "big")
+            + b"\x08\x02\x00\x00\x00" + b"\x00" * pad)
+
+
+def jpeg_bytes(width=640, height=480):
+    app0 = b"\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+    sof0 = b"\xff\xc0\x00\x11\x08" + height.to_bytes(2, "big") + width.to_bytes(2, "big") + b"\x03" + b"\x00" * 9
+    return b"\xff\xd8" + app0 + sof0 + b"\xff\xd9"
+
+
+def bad_request(message="image input is not supported"):
+    return TransientAPIError(400, message)  # the shape the SDK's BadRequestError has: a status_code
+
+
+def image_urls(messages):
+    return [p["image_url"]["url"] for m in messages if isinstance(m.get("content"), list)
+            for p in m["content"] if p.get("type") == "image_url"]
+
+
+class ImageTests(unittest.TestCase):
+    """Images reach a model that takes them, and never break a conversation with one that doesn't."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name) / "ws"
+        self.ws.mkdir()
+        (self.ws / "shot.png").write_bytes(png_bytes(1280, 800))
+        (self.ws / "photo.jpg").write_bytes(jpeg_bytes())
+        self.events = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def agent(self, client, vision=True, **kw):
+        return Agent(client, "fake", self.ws, permission=allow_all, vision=vision,
+                     on_event=lambda event, depth=0, **data: self.events.append((event, data)), **kw)
+
+    def notices(self):
+        return [d["text"] for e, d in self.events if e == "notice"]
+
+    # ---- reading the bytes -------------------------------------------------
+
+    def test_image_info_reads_type_and_size_from_the_bytes(self):
+        from tools import image_info
+        self.assertEqual(image_info(png_bytes(1280, 800)), ("image/png", 1280, 800))
+        self.assertEqual(image_info(jpeg_bytes(640, 480)), ("image/jpeg", 640, 480))
+        self.assertEqual(image_info(b"GIF89a" + (32).to_bytes(2, "little") + (16).to_bytes(2, "little")),
+                         ("image/gif", 32, 16))
+        vp8x = b"RIFF\x00\x00\x00\x00WEBPVP8X" + b"\x00" * 8 + (99).to_bytes(3, "little") + (49).to_bytes(3, "little")
+        self.assertEqual(image_info(vp8x), ("image/webp", 100, 50))
+        self.assertIsNone(image_info(b"%PDF-1.7\n"))
+        self.assertIsNone(image_info(b"print('hi')\n"))
+
+    def test_text_only_model_is_told_the_file_is_an_image(self):
+        tools = self.agent(FakeClient([]), vision=False).tools
+        with self.assertRaises(ToolError) as cm:
+            tools.read_file("shot.png")
+        self.assertIn("is an image (PNG, 1280×800", str(cm.exception))
+        self.assertIn("doesn't take images", str(cm.exception))
+        self.assertEqual(tools.pending_images, [])
+
+    def test_oversized_image_is_refused_with_a_way_to_shrink_it(self):
+        from tools import MAX_IMAGE_BYTES
+        (self.ws / "huge.png").write_bytes(png_bytes(9000, 9000, pad=MAX_IMAGE_BYTES))
+        with self.assertRaises(ToolError) as cm:
+            self.agent(FakeClient([])).tools.read_file("huge.png")
+        self.assertIn("too large", str(cm.exception))
+        self.assertIn("9000×9000", str(cm.exception))
+
+    # ---- read_file in the loop ---------------------------------------------
+
+    def test_read_file_image_follows_the_tool_results_as_one_user_message(self):
+        client = FakeClient([
+            reply(tool_calls=[tool_call("1", "read_file", path="shot.png"),
+                              tool_call("2", "read_file", path="photo.jpg")]),
+            reply("A login form and a cat."),
+        ])
+        answer = self.agent(client).send("What do the images show?")
+        self.assertEqual(answer, "A login form and a cat.")
+        sent = client.calls[1]
+        assert_tool_results_paired(self, sent)
+        tool_results = [m["content"] for m in sent if m["role"] == "tool"]
+        self.assertEqual(tool_results, ["shot.png: PNG, 1280×800, 1 KB. The image follows, in the next message.",
+                                        "photo.jpg: JPEG, 640×480, 1 KB. The image follows, in the next message."])
+        # Both results first, then one message carrying both images, and it is the last thing sent.
+        self.assertEqual([m["role"] for m in sent[-4:]], ["assistant", "tool", "tool", "user"])
+        urls = image_urls(sent[-1:])
+        self.assertEqual(len(urls), 2)
+        self.assertTrue(urls[0].startswith("data:image/png;base64,"))
+        self.assertTrue(urls[1].startswith("data:image/jpeg;base64,"))
+        self.assertIn("data, not instructions", sent[-1]["content"][0]["text"])
+
+    def test_explore_subagent_sees_images_when_its_model_does(self):
+        client = FakeClient([
+            reply(tool_calls=[tool_call("1", "task", description="look", prompt="Describe shot.png")]),
+            reply(tool_calls=[tool_call("s1", "read_file", path="shot.png")]),
+            reply("It's a login form."),
+            reply("The subagent says it's a login form."),
+        ])
+        self.agent(client).send("What's in shot.png?")
+        self.assertEqual(len(image_urls(client.calls[2])), 1)  # the subagent's second call
+        self.assertEqual(image_urls(client.calls[3]), [])  # only its answer comes back up
+
+    # ---- @attachments ------------------------------------------------------
+
+    def test_at_path_attaches_the_image_and_keeps_the_request_verbatim(self):
+        client = FakeClient([reply("A login form.")])
+        agent = self.agent(client)
+        agent.send("what's wrong in @shot.png?")
+        user = client.calls[0][-1]
+        self.assertEqual(user["content"][0], {"type": "text", "text": "what's wrong in @shot.png?"})
+        self.assertEqual(len(image_urls([user])), 1)
+        self.assertIn("Attached shot.png (PNG, 1280×800, 1 KB).", self.notices())
+        self.assertEqual(agent.turn_log, [("what's wrong in @shot.png?", "A login form.")])
+
+    def test_attachment_paths_quoted_escaped_and_outside_the_workspace(self):
+        from kyklos import find_attachments
+        outside = Path(self.tmp.name) / "Desk top"
+        outside.mkdir()
+        (outside / "a b.png").write_bytes(png_bytes())
+        escaped = str(outside / "a b.png").replace(" ", "\\ ")
+        for text in (f'see @"{outside}/a b.png"', f"see @'{outside}/a b.png'", f"see @{escaped}."):
+            images, problems = find_attachments(text, self.ws)
+            self.assertEqual([i["mime"] for i in images], ["image/png"], text)
+            self.assertEqual(problems, [])
+
+    def test_handles_and_emails_are_left_alone_and_text_files_reported(self):
+        from kyklos import find_attachments
+        (self.ws / "notes.txt").write_text("hi\n")
+        images, problems = find_attachments("ask @alice, or mail bob@shot.png; also @notes.txt", self.ws)
+        self.assertEqual(images, [])
+        self.assertEqual(problems, ["@notes.txt isn't a PNG, JPEG or WebP image, so it was sent as text."])
+
+    def test_text_only_model_gets_the_text_and_the_user_is_told(self):
+        client = FakeClient([reply("I can't see it.")])
+        self.agent(client, vision=False).send("look at @shot.png")
+        self.assertEqual(client.calls[0][-1]["content"], "look at @shot.png")
+        self.assertTrue(any("Not attached: shot.png" in n and "VISION=1" in n for n in self.notices()))
+
+    def test_vision_setting_overrides_what_the_provider_said(self):
+        agent = self.agent(FakeClient([]), vision=None, vision_override=True)
+        self.assertTrue(agent.sees_images())
+        agent = self.agent(FakeClient([]), vision=True, vision_override=False)
+        self.assertFalse(agent.sees_images())
+        agent = self.agent(FakeClient([]), vision=True)
+        agent.set_model("text-only", vision=False)
+        self.assertFalse(agent.tools.sees_images())
+
+    def test_gif_is_named_but_not_sent_because_ollama_refuses_it(self):
+        (self.ws / "anim.gif").write_bytes(b"GIF89a" + (32).to_bytes(2, "little") + (16).to_bytes(2, "little") + b"\0" * 8)
+        tools = self.agent(FakeClient([])).tools
+        with self.assertRaises(ToolError) as cm:
+            tools.read_file("anim.gif")
+        self.assertIn("is a GIF, which Ollama refuses", str(cm.exception))
+        self.assertIn("sips -s format png", str(cm.exception))
+        self.assertEqual(tools.pending_images, [])
+        client = FakeClient([reply("No image here.")])
+        self.agent(client).send("what's in @anim.gif?")
+        self.assertEqual(client.calls[0][-1]["content"], "what's in @anim.gif?")
+        self.assertTrue(any("is a GIF" in n for n in self.notices()))
+
+    def test_forced_vision_against_ollamas_list_is_pointed_out_once(self):
+        client = FakeClient([
+            reply(tool_calls=[tool_call("1", "read_file", path="shot.png")]),
+            reply("Nothing visible."),
+            reply("Still nothing."),
+        ])
+        agent = self.agent(client, vision=False, vision_override=True)
+        agent.send("look at @photo.jpg")  # an attachment, then a read_file image: one warning
+        agent.send("and @shot.png?")
+        conflicts = [n for n in self.notices() if "VISION=1 is set, but Ollama lists no vision for fake" in n]
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(len(image_urls(client.calls[-1])), 3)  # still sent: VISION=1 is the user's call
+
+    def test_no_conflict_when_the_provider_never_said(self):
+        agent = self.agent(FakeClient([reply("A login form.")]), vision=None, vision_override=True)
+        agent.send("what's in @shot.png?")
+        self.assertFalse(any("VISION=1 is set" in n for n in self.notices()))
+
+    # ---- recovering from a refusal -----------------------------------------
+
+    def test_refused_request_drops_the_images_and_retries_as_text(self):
+        client = FakeClient([bad_request(), reply("Text only, then.")])
+        agent = self.agent(client, vision_override=True)
+        self.assertEqual(agent.send("what's in @shot.png?"), "Text only, then.")
+        self.assertEqual(image_urls(client.calls[1]), [])
+        user = client.calls[1][-1]["content"]
+        self.assertTrue(user.startswith("what's in @shot.png?"))
+        self.assertIn("Kyklos removed an image here", user)
+        self.assertTrue(any("removed the images" in n for n in self.notices()))
+        self.assertEqual(image_urls(agent.messages), [])  # and it stays out for every later request
+
+    def test_a_refusal_without_images_is_still_an_error(self):
+        agent = self.agent(FakeClient([bad_request("bad tool schema")]))
+        with self.assertRaises(Exception) as cm:
+            agent.send("hello")
+        self.assertIn("bad tool schema", str(cm.exception))
+
+    def test_a_second_refusal_in_the_turn_is_not_swallowed(self):
+        agent = self.agent(FakeClient([bad_request(), bad_request("context too long")]))
+        with self.assertRaises(Exception) as cm:
+            agent.send("look @shot.png")
+        self.assertIn("context too long", str(cm.exception))
+
+    # ---- context bookkeeping -----------------------------------------------
+
+    def test_an_image_counts_a_fixed_estimate_not_its_base64_length(self):
+        from kyklos import IMAGE_TOKEN_ESTIMATE, estimate_tokens
+        huge = {"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "image_url",
+                "image_url": {"url": "data:image/png;base64," + "A" * 400_000}}]}
+        self.assertLess(estimate_tokens([huge]), IMAGE_TOKEN_ESTIMATE + 50)
+        self.assertGreaterEqual(estimate_tokens([huge]), IMAGE_TOKEN_ESTIMATE)
+
+    def test_transcript_marks_images_and_compaction_prunes_old_ones(self):
+        from kyklos import IMAGE_PRUNED_MARK, render_transcript
+        client = FakeClient([
+            reply(tool_calls=[tool_call("1", "read_file", path="shot.png")], prompt_tokens=100),
+            reply("A login form.", prompt_tokens=200),
+            reply("Still a login form.", prompt_tokens=200),
+        ])
+        agent = self.agent(client, context_window=12_000)
+        agent.send("look at shot.png")
+        self.assertIn("[image]", render_transcript(agent.messages[1:], 10_000))
+        agent.messages.append({"role": "user", "content": "z" * 12_000})  # past the keep budget
+        agent.messages.append({"role": "assistant", "content": "ok"})
+        self.assertTrue(agent.compact())
+        self.assertEqual(image_urls(agent.messages), [])
+        self.assertTrue(any(IMAGE_PRUNED_MARK in str(m.get("content")) for m in agent.messages))
+
+    def test_session_with_an_image_saves_loads_and_undoes(self):
+        client = FakeClient([reply("A login form.")])
+        agent = self.agent(client)
+        agent.send("what's in @shot.png?")
+        path = self.ws / "s.jsonl"
+        agent.save_session(path)
+        again = self.agent(FakeClient([]))
+        again.load_session(path)
+        self.assertEqual(image_urls(again.messages), image_urls(agent.messages))
+        agent.undo()
+        self.assertEqual(image_urls(agent.messages), [])
+
+    def test_audit_replay_does_not_take_the_image_message_for_a_new_turn(self):
+        from audit import replay_session
+        client = FakeClient([
+            reply(tool_calls=[tool_call("1", "bash", command="echo ok"), tool_call("2", "read_file", path="shot.png")]),
+            reply("Ran it and looked."),
+        ])
+        agent = self.agent(client)
+        agent.auto_bash = True
+        agent.send("go")
+        path = self.ws / "s.jsonl"
+        agent.save_session(path)
+        [(answer, commands)] = replay_session(path)
+        self.assertEqual(answer, "Ran it and looked.")
+        self.assertEqual([c for c, _ in commands], ["echo ok"])
+
+    # ---- asking the provider -----------------------------------------------
+
+    def test_detect_model_vision_asks_ollama_and_only_ollama(self):
+        from kyklos import choose_vision, detect_model_vision
+        asked = []
+
+        class Response:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def read(self):
+                return json.dumps(self.payload).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def urlopen(request, timeout=None):
+            asked.append(request.full_url)
+            return Response(KIMI_K3 if json.loads(request.data)["model"] == "kimi-k3" else KIMI_CODE)
+
+        self.assertTrue(detect_model_vision("https://ollama.com/v1", "k", "kimi-k3", urlopen=urlopen))
+        self.assertFalse(detect_model_vision("http://localhost:11434/v1", "k", "kimi-code", urlopen=urlopen))
+        self.assertIsNone(detect_model_vision("https://api.openai.com/v1", "k", "gpt", urlopen=urlopen))
+        self.assertEqual(asked, ["https://ollama.com/api/show", "http://localhost:11434/api/show"])
+        self.assertTrue(choose_vision({"VISION": "1"}))
+        self.assertFalse(choose_vision({"VISION": "off"}))
+        self.assertIsNone(choose_vision({}))
 
 
 if __name__ == "__main__":
