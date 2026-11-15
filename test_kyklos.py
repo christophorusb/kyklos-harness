@@ -6360,5 +6360,65 @@ class VisionDelegationTests(unittest.TestCase):
         self.assertIn("A login form", [m for m in client.calls[3] if m["role"] == "tool"][-1]["content"])
 
 
+class UnavailableToolTests(unittest.TestCase):
+    """A tool the agent doesn't have is refused with advice for the role it is in, not a dead end."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_as(self, name, args, **kw):
+        agent = Agent(FakeClient([]), "fake", self.ws, permission=allow_all, **kw)
+        return agent.run_tool(name, json.dumps(args))
+
+    def test_a_read_only_subagent_is_told_to_put_the_command_in_its_report(self):
+        result = self.run_as("bash", {"command": "python3 measure.py"}, depth=1, tool_names=SUBAGENT_TOOLS["explore"])
+        self.assertIn("isn't available here. Available tools: glob, grep, read_file.", result)
+        self.assertIn("read-only subagent", result)
+        self.assertIn("put the exact command or change in it", result)
+        self.assertFalse((self.ws / "measure.py").exists())
+
+    def test_the_same_for_a_write(self):
+        result = self.run_as("write_file", {"path": "x.txt", "content": "x"}, depth=1,
+                             tool_names=SUBAGENT_TOOLS["explore"])
+        self.assertIn("read-only subagent", result)
+        self.assertFalse((self.ws / "x.txt").exists())
+
+    def test_a_general_subagent_can_not_delegate_further(self):
+        result = self.run_as("task", {"description": "d", "prompt": "p"}, depth=1, tool_names=SUBAGENT_TOOLS["general"])
+        self.assertIn("Subagents can't start subagents of their own", result)
+
+    def test_a_general_subagent_without_a_tool_says_so_in_its_report(self):
+        result = self.run_as("generate_image", {"prompt": "p", "path": "a.png"}, depth=1,
+                             tool_names=SUBAGENT_TOOLS["general"])
+        self.assertIn("wasn't given generate_image", result)
+
+    def test_plan_mode_points_at_the_plan(self):
+        result = self.run_as("write_file", {"path": "x.txt", "content": "x"}, plan_mode=True)
+        self.assertIn("Plan mode is read-only", result)
+        self.assertFalse((self.ws / "x.txt").exists())
+
+    def test_an_invented_tool_gets_the_plain_refusal(self):
+        result = self.run_as("browser", {"url": "https://example.com"}, depth=1, tool_names=SUBAGENT_TOOLS["explore"])
+        self.assertTrue(result.endswith("Available tools: glob, grep, read_file."), result)
+
+    def test_an_explore_subagent_that_hits_it_still_reports_back(self):
+        client = FakeClient([
+            reply(tool_calls=[tool_call("t1", "task", description="audit frames", prompt="Measure the walk cels.")]),
+            reply(tool_calls=[tool_call("b1", "bash", command="python3 measure.py")]),  # the explore subagent
+            reply("Can't run it here. To measure, run: python3 measure.py"),  # its report
+            reply("I'll run the measurement."),
+        ])
+        agent = Agent(client, "fake", self.ws, permission=allow_all)
+        self.assertEqual(agent.send("audit the walk cycle"), "I'll run the measurement.")
+        refusal = [m for m in client.calls[2] if m["role"] == "tool"][-1]["content"]
+        self.assertIn("read-only subagent", refusal)
+        report = [m for m in client.calls[3] if m["role"] == "tool"][-1]["content"]
+        self.assertIn("python3 measure.py", report)
+
+
 if __name__ == "__main__":
     unittest.main()

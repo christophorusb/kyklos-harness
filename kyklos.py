@@ -2874,7 +2874,8 @@ class Agent:
         except json.JSONDecodeError as e:
             return f"Error: arguments were not valid JSON ({e}). Send valid JSON."
         if name not in self.tool_names:
-            return f"Error: tool {name!r} isn't available here. Available tools: {', '.join(sorted(self.tool_names))}"
+            return (f"Error: tool {name!r} isn't available here. Available tools: {', '.join(sorted(self.tool_names))}."
+                    + self._unavailable_tool_advice(name))
         if name == "task":
             try:
                 return self.run_subagent(**args)
@@ -2909,6 +2910,33 @@ class Agent:
             # copy of state that could disagree with this one.
             self._emit("plan", steps=list(self.tools.plan_steps), active=self.tools.plan_active)
         return result
+
+    def _unavailable_tool_advice(self, name: str) -> str:
+        """What to do instead of a tool this agent doesn't have, said for the role it is in.
+
+        A bare "not available" is a dead end: a read-only subagent that wanted to run a measurement
+        tends to try again, or stall. Told what it is and what its report can carry, it finishes
+        with something the agent that delegated it can act on.
+        """
+        known = {s["function"]["name"] for s in SCHEMAS + [TASK_SCHEMA, IMAGE_SCHEMA]}
+        if name not in known:
+            return ""
+        acting = {"bash", "write_file", "edit_file", "generate_image"}
+        if self.depth > 0 and not (self.base_tool_names & acting):
+            return (" You are a read-only subagent: you can read and search, but not run commands or change "
+                    "files, and asking again won't change that. Do what you can with the tools above. If the "
+                    "task needs a command run or a file changed, finish with your report and put the exact "
+                    "command or change in it, so the agent that delegated this can run it or hand it to a "
+                    "subagent that can.")
+        if self.depth > 0 and name == "task":
+            return " Subagents can't start subagents of their own: do this part yourself."
+        if self.depth > 0:
+            return (f" This subagent wasn't given {name}. If the task needs it, say so in your report, with "
+                    "exactly what should be done.")
+        if self.plan_mode:
+            return (f" Plan mode is read-only, so {name} is off until the user leaves it. Put this step in "
+                    "your plan instead.")
+        return ""
 
     def generate_image(self, prompt: str, path: str, size: str | None = None) -> str:
         """Ask the image provider for one image and save it; runs only after the user approved the call.
