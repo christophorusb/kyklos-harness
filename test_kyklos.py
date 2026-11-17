@@ -3286,6 +3286,41 @@ class NoKeyboardTests(unittest.TestCase):
         with mock.patch.object(tools_mod, "probe_sandbox", return_value=("off", "off")):
             self.assertEqual("", self.tools._sandbox_note("Operation not permitted"))
 
+    def test_a_denied_read_of_a_sibling_project_is_not_blamed_on_macos(self):
+        """A session was refused a sibling project under ~/Desktop and ~/.kyklos, read a note that
+        only spoke of writes, and told the user it was macOS privacy protection (TCC), offering Full
+        Disk Access. The note now covers reads, rules TCC out by name, and says whose move it is."""
+        from pathlib import Path
+        from unittest import mock
+        import tools as tools_mod
+        home = Path.home()
+        with mock.patch.object(tools_mod, "probe_sandbox", return_value=("seatbelt", "macOS seatbelt")):
+            sibling = self.tools._sandbox_note(
+                f"ls: {home}/Desktop/projects/other/aseprite-mcp: Operation not permitted")
+            self.assertIn("read of the user's personal folders", sibling)
+            self.assertIn("not macOS privacy protection (TCC)", sibling)
+            self.assertIn("Full Disk Access", sibling)
+            self.assertIn("copy it into the workspace", sibling)
+            self.assertNotIn("~/.kyklos is Kyklos's own configuration", sibling)
+            config = self.tools._sandbox_note(f"ls: {home}/.kyklos: Operation not permitted")
+            self.assertIn("~/.kyklos/mcp.json", config)
+            self.assertNotIn("copy it into the workspace", config)
+            # Node's bare error code is a denial too.
+            self.assertIn("[harness]", self.tools._sandbox_note("ERR EPERM"))
+
+    def test_a_denial_inside_a_command_that_exited_0_still_gets_the_note(self):
+        """`ls X 2>&1; echo done` exits 0. Every denial in that session came back that way, so the
+        note, gated on a failing exit code, never appeared. A success counts the kernel's own wording
+        only: ordinary output that mentions "permission denied" is not dressed up as a denial."""
+        from unittest import mock
+        import tools as tools_mod
+        with mock.patch.object(tools_mod, "probe_sandbox", return_value=("seatbelt", "macOS seatbelt")):
+            self.assertIn("[harness]", self.tools._sandbox_note(
+                "ls: /x: Operation not permitted\ndone", succeeded=True))
+            self.assertEqual("", self.tools._sandbox_note(
+                "README.md: handle 'permission denied' errors", succeeded=True))
+            self.assertIn("[harness]", self.tools._sandbox_note("cat: x: Permission denied"))
+
     def test_the_sandbox_hint_names_the_way_through_for_git_init_and_for_ports(self):
         """The generic line cost a model a turn each time it hit one of these two ordinary walls:
         `git init` copying sample hooks into the read-only .git/hooks, and a dev server unable to

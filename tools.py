@@ -892,7 +892,14 @@ SANDBOX_SCRATCH_ROOTS = (
 # up blaming macOS, asking for sudo, or asking the user to loosen something (SEC-12).
 SANDBOX_DENIAL_SIGNATURES = ("operation not permitted", "permission denied", "not permitted",
                              "read-only file system",  # how a bubblewrap read-only bind refuses
+                             "eperm",  # Node's code, which a script may print on its own ("ERR EPERM")
                              "err_access_denied")  # Chrome's name for the same refusal on a connect
+# The subset that is the kernel's own wording, unlikely in ordinary output. A command that ends in
+# `echo`, `|| true` or a script that catches the error exits 0 with the denial in its output -- a
+# session probed a sibling folder a dozen times that way and never saw the note -- so these are
+# checked even when the command succeeded. "permission denied" is left out: tools print it
+# routinely about files they skipped.
+SANDBOX_STRONG_DENIAL_SIGNATURES = ("operation not permitted", "eperm", "read-only file system")
 # Words that say a denial was about a port rather than a file, so the hint can name the right wall.
 SANDBOX_NETWORK_SIGNATURES = ("listen", "bind", "connect", "socket", "err_access_denied")
 
@@ -1774,7 +1781,7 @@ class Tools:
                          f"{'it' if hidden == 1 else 'they'} likely hold{'s' if hidden == 1 else ''} secrets)")
         return "\n".join(files) or "No files matched."
 
-    def _sandbox_note(self, out: str) -> str:
+    def _sandbox_note(self, out: str, succeeded: bool = False) -> str:
         """Name the sandbox when it is the likely author of a failure.
 
         A seatbelt denial surfaces as `Operation not permitted` and nothing else -- the same text a
@@ -1791,22 +1798,44 @@ class Tools:
         A third needs no denial at all to show up: a tool that goes looking for the Keychain fails
         with its own wording ("the specified keychain could not be found"), so on macOS any output
         that mentions it gets the explanation, and the warning about the dialog's wrong button.
+
+        Reads are named as well as writes. A model denied a sibling project under ~/Desktop read the
+        old write-only wording, decided the note did not apply, and blamed macOS privacy protection
+        (TCC) -- then offered the user Full Disk Access, which would not have helped. So the note
+        rules TCC out by name, and says plainly when the denied path is a personal folder or
+        Kyklos's own configuration, both of which are the user's to act on.
+
+        `succeeded` is a command that exited 0. Only the kernel's own wording counts then, because
+        output that merely talks about permissions is common in a successful run.
         """
         kind, label = probe_sandbox()
         if kind not in {"seatbelt", "bwrap"} or not out:
             return ""
         low = out.lower()
-        denied = any(sig in low for sig in SANDBOX_DENIAL_SIGNATURES)
+        denied = any(sig in low for sig in (SANDBOX_STRONG_DENIAL_SIGNATURES if succeeded
+                                            else SANDBOX_DENIAL_SIGNATURES))
         keychain = kind == "seatbelt" and "keychain" in low
         if not denied and not keychain:
             return ""
         note = f"\n\n[harness] bash runs under {label}."
         if denied:
-            note += (" If that was a write outside the workspace "
-                     "or a scratch dir, a change to a path the sandbox keeps read-only (.git/hooks, "
-                     ".git/config, .husky, .vscode, AGENTS.md), or running a file from "
-                     f"{SANDBOX_SCRATCH_ROOTS[0]} and friends, this sandbox refused it -- not the host OS, "
-                     "and not a missing privilege.")
+            note += (" If that was a read of the user's personal folders (~/Desktop, ~/Documents, ~/Downloads "
+                     "and the like) outside the workspace, of a credential store or ~/.kyklos, a write "
+                     "outside the workspace or a scratch dir, a change to a path the sandbox keeps "
+                     "read-only (.git/hooks, .git/config, .husky, .vscode, AGENTS.md), or running a file "
+                     f"from {SANDBOX_SCRATCH_ROOTS[0]} and friends, this sandbox refused it -- not the host "
+                     "OS. It is not macOS privacy protection (TCC), file permissions or a missing privilege, "
+                     "so Full Disk Access, chmod and sudo will not change it; don't suggest them.")
+            home = str(Path.home()).lower()
+            if any(f"{home}/{name.lower()}" in low or f"~/{name.lower()}" in low
+                   for name in SANDBOX_PROTECTED_PERSONAL_DIRS):
+                note += (" The user's personal folders are unreadable here on purpose, apart from the "
+                         "workspace itself, and that includes other projects beside it. If you need "
+                         "something from one, ask the user to copy it into the workspace or paste it.")
+            if f"{home}/.kyklos" in low or "~/.kyklos" in low:
+                note += (" ~/.kyklos is Kyklos's own configuration (MCP servers in ~/.kyklos/mcp.json, "
+                         "settings, models) and is hidden from bash on purpose: the user edits it and "
+                         "restarts Kyklos.")
             if ".git/config" in low or "could not write config file" in low:
                 # Settings are what make git run programs (core.fsmonitor, core.hooksPath, aliases),
                 # so they are the user's to change. Commits, branches, merges and tags still work.
@@ -1906,8 +1935,7 @@ class Tools:
             self._quarantine(watch)
             raise
         out = (stdout or "") + (stderr or "")
-        if process.returncode != 0:
-            out += self._sandbox_note(out)
+        out += self._sandbox_note(out, succeeded=process.returncode == 0)
         out += self._quarantine(watch)
         return self._truncate_spilling(f"exit code {process.returncode}\n{out}".rstrip())
 
