@@ -176,6 +176,25 @@ refused, so the same request goes out again under a new id, with `rejected: {ans
 added. A confused client gets asked again rather than turning into an accidental yes. An error
 response, or no answer before the client hangs up, is a denial with `NO_APPROVER_NOTE`.
 
+### `question/request`
+
+Sent when the model calls `ask_user`, wherever the terminal would show its Question panel:
+`{depth, call_id, question, options: [string], multiple: bool}`. `options` may be empty, for an
+open question.
+
+Result, one of:
+- `{"selected": [int, …]}`: 0-based indexes into `options`; exactly one unless `multiple`.
+- `{"text": string}`: the user's own words. It is read as the terminal reads a typed line, so
+  `"2"` picks option 2, and an empty string skips.
+- `{"skipped": true}`.
+
+Any other shape is asked again with `rejected: {answer, reason}`, as for `permission/request`.
+An error response, or no answer before the client hangs up, tells the model nobody is available
+to answer (`NO_ANSWER_NOTE`). A cancel withdraws it like any other request (§6).
+
+The client must let the user type an answer of their own and skip, not only pick, and must not
+pre-select an option: the first option is the model's suggestion, not a default.
+
 ### `trust/request`
 
 `{folder, broad, explanation: TRUST_EXPLANATION, warning: BROAD_WARNING | null, choices}`. When
@@ -210,7 +229,7 @@ way to stop.
   which sets Python's flag but leaves the main thread asleep in `communicate()` until its timeout.
   Delivered to the main thread, the signal breaks the blocked call, and Python raises
   `KeyboardInterrupt` there exactly as a keypress would.
-- An outstanding `permission/request` is withdrawn with a `request/withdrawn {id}` notification,
+- An outstanding `permission/request` or `question/request` is withdrawn with a `request/withdrawn {id}` notification,
   and its late answer is ignored.
 - `session/prompt` then returns normally with `outcome: "interrupted"`, after
   `repair_after_interrupt` and a save, which is what `AeroUI.turn` does.

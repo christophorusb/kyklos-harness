@@ -23,8 +23,8 @@ from pathlib import Path
 
 from kyklos import (BASH_MODE_CAVEAT, BASH_MODE_EXPLANATION, BROAD_WARNING, COMMANDS, EXIT, NO_APPROVER_NOTE,
                     TRUST_EXPLANATION, CommandContext, apply_permission_answer, denial_note, edit_preview,
-                    error_detail, has_danger, has_opaque, permission_options, run_command, sandbox_warning,
-                    state_snapshot)
+                    error_detail, has_danger, has_opaque, parse_question_answer, permission_options,
+                    run_command, sandbox_warning, state_snapshot)
 
 PROTOCOL_VERSION = 0
 
@@ -340,6 +340,32 @@ class ServeUI:
         if apply_permission_answer(name, answer, always_allowed, touches_secret, prefix, danger, opaque):
             return True, ""
         return False, denial_note(name, str(reply.get("reason") or "").strip())
+
+    def ask_user(self, question: str, options: list, multiple: bool):
+        """The model's question to the client. Returns (picks, text), or None when nobody answers."""
+        depth = self._running[-1] if self._running else 0
+        params = {"depth": depth, "call_id": self._open_calls.get(depth), "question": question,
+                  "options": options, "multiple": multiple}
+        while True:
+            reply = self.request("question/request", params)
+            if reply is None:
+                return None
+            if reply.get("skipped") is True:
+                return [], ""
+            picks, text = reply.get("selected"), reply.get("text")
+            if picks is None and isinstance(text, str):
+                # Free text goes through the same reading as the terminal's, so "2" picks option 2.
+                return parse_question_answer(text, options, multiple)
+            if (isinstance(picks, list) and picks and text is None
+                    and all(isinstance(i, int) and not isinstance(i, bool) and 0 <= i < len(options)
+                            for i in picks)
+                    and len(set(picks)) == len(picks) and (multiple or len(picks) == 1)):
+                return picks, ""
+            # An answer that isn't one of the shapes offered is never guessed at: the question goes
+            # out again, saying why the last answer wasn't taken (as permission/request does).
+            params = {**params, "rejected": {"answer": reply, "reason": (
+                "reply with selected (0-based option indexes"
+                + (", several allowed" if multiple else ", exactly one") + "), text, or skipped: true")}}
 
     def _display(self, name: str, args: dict) -> dict:
         if name in ("edit_file", "write_file"):

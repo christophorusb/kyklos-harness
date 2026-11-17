@@ -8,6 +8,7 @@ A small coding-agent harness (~4,200 lines of Python, plus ~2,900 lines of tests
 
 **The loop**
 - Six tools: `read_file`, `grep`, `glob`, `write_file`, `edit_file`, `bash` — plus `task` for subagents.
+- **Questions mid-turn** (`ask_user`): when the model is blocked on a decision that's yours, it asks and carries on with the answer, instead of guessing or ending the turn.
 - **Subagents** with their own empty context, so a long search costs the main conversation one result instead of every file read. Routable to a cheaper model with `/submodel`.
 - **Plan mode** (`/plan`) — read-only, for working out an approach before touching anything.
 - **Undo** (`/undo`) reverts a turn's conversation *and* its file changes — including the ones its commands made, from a snapshot of the workspace.
@@ -220,6 +221,8 @@ An edit answers with the lines as they now read, and a miss with the closest tex
 
 **Undo.** Each turn snapshots the workspace when it starts and when it ends, as git trees in a private store of Kyklos's own: a fresh temporary folder, removed when Kyklos exits. The workspace's own `.git` is never read or written, and none of your git setup applies (no hooks, filters, or line-ending conversion), so files come back byte for byte with their permissions and symlinks. `/undo` puts back every path that changed between the two — by `write_file` and `edit_file`, by a `sed -i`, an `rm`, a generator or a subagent alike — except a file that changed again after the turn ended: that change was yours, so it is left alone and named. Snapshots skip what Kyklos skips everywhere (`.venv`, `node_modules`, …), what the workspace's `.gitignore` ignores, `.kyklos/`, and secret files, whose contents are never copied; the file tools' own record still covers their writes to anything snapshots can't see. Files outside the workspace aren't covered. Without git, in your home folder or a drive root, or with `KYKLOS_SNAPSHOTS=0`, `/undo` reverts only the file tools' edits and says so. A snapshot costs two quick git calls per turn: git rehashes only the files whose size or modification time changed.
 
+**Questions.** `ask_user` puts one question to you without ending the turn: a panel with the question and up to six numbered options, answered on one line. A number picks an option (several, comma-separated, when the model allows more than one), anything else is your own answer, and Enter alone skips; the answer goes back to the model as the tool result. Asking needs no approval, since answering is already your call. The model is told to ask only about decisions that are yours to make — not for permission, not to confirm a plan it can carry out, not for anything its tools can find out — and a turn may ask at most three. It's offered in plan mode, where ambiguities get settled, and never to subagents, which answer to another agent: one that tries is told to make the most reasonable assumption and name it in its report. With nobody to answer (a piped run, `--eval`), the model is told so and to go on and state what it assumed.
+
 **Subagents.** `task` hands a self-contained job to a fresh `Agent` with an empty context; only its answer comes back. `explore` mode is read-only and never asks permission; `general` can also edit and run commands. Subagents can't nest. Explore tasks sent in one message run at the same time, up to four at once, since they only read and never ask; anything else runs one at a time. The interface still draws one subagent after another: the others' steps are held back and replayed when their turn comes, each with its real duration. A subagent whose API call fails comes back as a failed tool call the parent can act on, rather than ending the turn. One that is stopped — by the step cap, or for repeating itself — is asked for a report of what it found, so its work reaches the parent as a partial answer rather than being lost. Route them elsewhere with `/submodel`, `SUBAGENT_MODEL`, or `--submodel`; the `task` line names the model when it differs. In a live test a subagent took 12 steps and read five files while the main context stayed at 6%.
 
 **Workspace sketch.** The system prompt carries a generated list of source files and what each defines — names only, no signatures or line numbers, since a regex reading code gets names right and parameter lists wrong. Python names come from the real `ast`. Capped per file and overall (~340 tokens here). `/map` shows it.
@@ -279,11 +282,11 @@ Claims to have run the tests, committed, pushed or installed are compared agains
 ## Tests
 
 ```bash
-./.venv/bin/python -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots
+./.venv/bin/python -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question
 ```
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots
+.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question
 ```
 
 ## Evals

@@ -125,7 +125,8 @@ class ServeTestCase(unittest.TestCase):
                                    "sandbox": {"kind": "test", "label": "", "warning": None},
                                    "commands": [], "profiles": [], "profile": None})
         self.assertIsNotNone(start)
-        agent = Agent(fake, "fake", self.ws, permission=self.ui.permission, on_event=self.ui.observer)
+        agent = Agent(fake, "fake", self.ws, permission=self.ui.permission, ask=self.ui.ask_user,
+                      on_event=self.ui.observer)
         self.ui.run(agent, self.session)
         thread.join(WAIT)
         if failures:

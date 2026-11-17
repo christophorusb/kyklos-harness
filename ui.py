@@ -29,8 +29,8 @@ from rich.theme import Theme
 from kyklos import (BASH_MODE_CAVEAT, BASH_MODE_EXPLANATION, BROAD_WARNING, EXIT, NO_APPROVER_NOTE,
                     COMMANDS, TRUST_EXPLANATION, CommandContext, edit_preview,
                     __version__, apply_permission_answer, denial_note, ensure_private_dir,
-                    error_detail, has_danger, has_opaque, permission_options, run_command, sandbox_warning,
-                    short_tokens)
+                    error_detail, has_danger, has_opaque, parse_question_answer, permission_options,
+                    run_command, sandbox_warning, short_tokens)
 from tools import sanitize_terminal_text
 
 BASH_FULL_OUTPUT_LINES = 8  # bash output up to this many lines is shown in full; longer shows the last 3
@@ -224,6 +224,9 @@ def describe_call(name: str, args: dict) -> str:
         return sanitize_terminal_text(f"{args.get('mode') or 'explore'} · {args.get('description', '')}")
     if name == "plan":
         return _plural(len(args["steps"]), "step") if args.get("steps") else f"step {args.get('active', 0)}"
+    if name == "ask_user":
+        question = sanitize_terminal_text(str(args.get("question", ""))).strip()
+        return (question.splitlines() or [""])[0][:120]
     return sanitize_terminal_text(json.dumps(args, ensure_ascii=False))[:120]
 
 
@@ -261,6 +264,10 @@ def summarize_result(name: str, args: dict, result: str) -> tuple:
         if result.startswith("No files"):
             return status, "no files", [], ""
         return status, _plural(len([l for l in result.splitlines() if l and not l.startswith("...")]), "file"), [], ""
+    if name == "ask_user":
+        if result.startswith("The user chose") or result.startswith("The user answered"):
+            return status, "answered", [], ""
+        return status, "skipped" if result.startswith("The user skipped") else "no one to answer", [], ""
     if name == "write_file":
         return status, "✓ written", [], ""
     if name == "edit_file":
@@ -891,6 +898,35 @@ class AeroUI:
         self.print(Text(f"{self.g['denied']} denied" + (f": {reason}" if reason else ""), style="coral"),
                    indent=indent + 2)
         return False, denial_note(name, reason)
+
+    # -- questions from the model (ask_user) --
+
+    def ask_user(self, question: str, options: list, multiple: bool):
+        """The model's question in a panel, answered on one line: a number (or several, when multiple)
+        picks an option, anything else is your own answer, Enter alone skips. Returns (picks, text)."""
+        self._pause_live()
+        indent = 2
+        width = self.width - indent
+        body = [Text(sanitize_terminal_text(question), style="bold")]
+        if options:
+            body.append(Text(""))
+            for i, option in enumerate(options, 1):
+                body.append(Text(f"{i}  ", style="bold sun") + Text(sanitize_terminal_text(option)))
+        hint = ("numbers, comma-separated, or your own words" if multiple
+                else "a number or your own words" if options else "your own words")
+        body += [Text(""), Text(f"{hint}  {self.g['dot']}  enter alone skips", style="frost")]
+        panel = Panel(Group(*body), title=Text("Question", style="bold"), title_align="left",
+                      box=box.ASCII if self.ascii else box.ROUNDED, border_style="aqua",
+                      width=width, padding=(0, 1))
+        self.print(panel, indent=indent)
+        picks, text = parse_question_answer(self.edit_line("  answer: "), options, multiple)
+        if picks:
+            record = "chose " + ", ".join(sanitize_terminal_text(options[i]) for i in picks)
+        else:
+            record = f"answered: {sanitize_terminal_text(text)}" if text else "skipped"
+        self.print(Text(f"{self.g['arrow']} {record}", style="frost"), indent=indent + 2)
+        self._refresh()
+        return picks, text
 
     # -- picker (DESIGN.md §4, Picker): /model and /effort --
 

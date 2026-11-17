@@ -176,13 +176,43 @@ IMAGE_SCHEMA = {
     },
 }
 
+# Questions to the user mid-turn. Never offered to subagents, which answer to another agent and
+# can't reach the user; offered in plan mode, which is where ambiguities get settled.
+MAX_QUESTIONS_PER_TURN = 3  # past this, the model is interviewing rather than working
+MAX_QUESTION_CHARS, MAX_OPTION_CHARS, MAX_OPTIONS = 1000, 200, 6
+ASK_USER_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "ask_user",
+        "description": (
+            "Ask the user one question and wait for the answer, without ending your turn. Use it only "
+            "when you are blocked on a decision that is the user's to make (a choice between real "
+            "alternatives, a requirement the request leaves out) and a wrong guess would waste the "
+            "work. Don't use it to ask permission (risky tools already ask), to confirm a plan you "
+            "can just carry out, or for anything you can find out with your tools. Give 2-6 short "
+            "options when the answer is a choice, best first; the user can always answer in their "
+            "own words or skip. At most " + str(MAX_QUESTIONS_PER_TURN) + " questions per turn."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "One question, complete on its own"},
+                "options": {"type": "array", "items": {"type": "string"},
+                            "description": "Optional: 2-6 short answers to choose from, best first"},
+                "multiple": {"type": "boolean", "description": "Optional: allow choosing several options"},
+            },
+            "required": ["question"],
+        },
+    },
+}
+
 SUBAGENT_PROMPT = """
 
 You are a subagent. Another agent delegated this task to you; your final answer goes back to it, not to the user.
 You can't see that agent's conversation, only the task below. Work on your own, without asking questions.
 Make your final answer self-contained: specific findings, exact file paths and line numbers, and anything you could not determine."""
 
-PLAN_TOOLS = SAFE_TOOLS | {"task"}
+PLAN_TOOLS = SAFE_TOOLS | {"task", "ask_user"}
 PLAN_PROMPT = """
 
 You are in PLAN MODE (read-only). You may explore the codebase with read_file, grep, glob, and explore subagents, but you cannot create, edit, or run anything.
@@ -1799,6 +1829,76 @@ NO_APPROVER_NOTE = ("The {name} call was denied: nobody is available to approve 
                     "Use read-only tools instead.")
 
 
+NO_ANSWER_NOTE = ("Nobody is available to answer questions in this session. Don't ask again: go on "
+                  "with the most reasonable choice, and say in your answer what you assumed.")
+SKIPPED_NOTE = ("The user skipped this question. Go on with the most reasonable choice, and say in "
+                "your answer what you assumed.")
+
+
+def question_problem(question, options, multiple) -> str:
+    """Why these ask_user arguments can't be asked, or "" if they can."""
+    if not isinstance(question, str) or not question.strip():
+        return "question must be a non-empty string"
+    if len(question) > MAX_QUESTION_CHARS:
+        return f"question is {len(question)} characters; keep it under {MAX_QUESTION_CHARS}"
+    if options is not None:
+        if not isinstance(options, list) or not all(isinstance(o, str) and o.strip() for o in options):
+            return "options must be a list of non-empty strings"
+        if not 2 <= len(options) <= MAX_OPTIONS:
+            return f"give 2-{MAX_OPTIONS} options, or none for an open question"
+        if any(len(o) > MAX_OPTION_CHARS for o in options):
+            return f"keep each option under {MAX_OPTION_CHARS} characters"
+        if len({o.strip().lower() for o in options}) != len(options):
+            return "options must differ from each other"
+    if multiple is not None and not isinstance(multiple, bool):
+        return "multiple must be true or false"
+    if multiple and not options:
+        return "multiple needs options to choose from"
+    return ""
+
+
+def parse_question_answer(raw: str, options: list, multiple: bool) -> tuple[list[int], str]:
+    """What a typed answer picks: (0-based option indexes, free text). Numbers that name options
+    pick them (several, comma- or space-separated, only when multiple); anything else is the
+    user's own words. Both empty means the question was skipped."""
+    raw = (raw or "").strip()
+    if options and re.fullmatch(r"\d+(?:\s*[, ]\s*\d+)*", raw):
+        picks = list(dict.fromkeys(int(n) - 1 for n in re.split(r"[\s,]+", raw)))
+        if all(0 <= i < len(options) for i in picks) and (multiple or len(picks) == 1):
+            return picks, ""
+    return [], raw
+
+
+def question_result(options: list, picks: list[int], text: str) -> str:
+    """The tool result for an answer: the user's own words, so they carry the user's authority."""
+    if picks:
+        chosen = ", ".join(json.dumps(options[i], ensure_ascii=False) for i in picks)
+        return f"The user chose: {chosen}."
+    if text:
+        return f"The user answered in their own words: {text}"
+    return SKIPPED_NOTE
+
+
+def ask_user_plain(question: str, options: list, multiple: bool) -> tuple[list[int], str] | None:
+    """Plain terminal question. Returns (picks, text), or None when nobody can answer."""
+    print(f"\n\033[36m? {sanitize_terminal_text(question)}\033[0m")
+    for i, option in enumerate(options, 1):
+        print(f"  {i}. {sanitize_terminal_text(option)}")
+    hint = ("numbers, comma-separated, or your own answer" if multiple
+            else "a number or your own answer" if options else "your answer")
+    try:
+        raw = input(f"  Answer ({hint}; Enter to skip): ")
+    except EOFError:  # no keyboard, e.g. piped or scripted run
+        print("  (no input available: not answered)")
+        return None
+    return parse_question_answer(raw, options, multiple)
+
+
+def no_one_to_ask(question: str, options: list, multiple: bool) -> None:
+    """The answerer for unattended runs (--eval): nobody is there."""
+    return None
+
+
 def ask_permission(name: str, args: dict, always_allowed: set) -> tuple[bool, str]:
     """Plain terminal prompt before a risky tool runs. Returns (allowed, note_for_model)."""
     print(f"\n\033[33m? {name}\033[0m")
@@ -2312,7 +2412,7 @@ def eval_permission(name: str, args: dict, always_allowed: set) -> tuple[bool, s
 
 
 class Agent:
-    def __init__(self, client, model: str, workspace: Path, permission=ask_permission,
+    def __init__(self, client, model: str, workspace: Path, permission=ask_permission, ask=ask_user_plain,
                  context_window: int = DEFAULT_CONTEXT_WINDOW, tool_names: set = None,
                  depth: int = 0, always_allowed: set = None, plan_mode: bool = False,
                  before_write=None, on_event=console_observer, sleep=time.sleep, effort: str = "default",
@@ -2344,6 +2444,8 @@ class Agent:
         set_explain_workspace(self.tools.workspace)
         set_explain_provider(getattr(client, "base_url", None))
         self.permission = permission
+        self.ask = ask  # ask(question, options, multiple) -> (picks, text), or None: nobody to answer
+        self.questions_asked = 0  # this turn; see MAX_QUESTIONS_PER_TURN
         self.images: ImageGenerator | None = images  # generate_image exists only when this is set
         if images is not None:
             set_image_provider(images.config.host, images.config.model)
@@ -2516,7 +2618,7 @@ class Agent:
             self.active_snapshots[p] = p.read_bytes() if p.is_file() else None
 
     def _all_schemas(self) -> list:
-        return SCHEMAS + [TASK_SCHEMA] + ([IMAGE_SCHEMA] if self.images is not None else [])
+        return SCHEMAS + [TASK_SCHEMA, ASK_USER_SCHEMA] + ([IMAGE_SCHEMA] if self.images is not None else [])
 
     def _update_mode(self) -> None:
         all_schemas = self._all_schemas()
@@ -2554,6 +2656,10 @@ class Agent:
                        "tool (mode 'explore'): only its answer comes back, not every file it read. "
                        "Independent questions can go out as several task calls in one message; "
                        "explore subagents then run at the same time.")
+        if "ask_user" in self.tool_names:
+            prompt += ("\n- When you are blocked on a decision that is the user's to make, ask with "
+                       "ask_user and carry on with the answer, rather than guessing or ending your turn "
+                       "on a question. When a sensible default exists, take it and say so instead.")
         if self.plan_mode:
             prompt += PLAN_PROMPT
         if self.depth > 0:
@@ -2939,6 +3045,8 @@ class Agent:
                 return self.run_subagent(**args)
             except TypeError as e:
                 return f"Error: bad arguments for task: {e}"
+        if name == "ask_user":
+            return self.ask_user(args)
         fn = self.generate_image if name == "generate_image" else getattr(self.tools, name)
         try:
             self.tools.check(name, args)
@@ -2969,6 +3077,28 @@ class Agent:
             self._emit("plan", steps=list(self.tools.plan_steps), active=self.tools.plan_active)
         return result
 
+    def ask_user(self, args: dict) -> str:
+        """Put the model's question to the user. Asking is the user's to answer, not to approve, so it
+        skips the permission prompt; the answer goes back as the tool result."""
+        unknown = set(args) - {"question", "options", "multiple"}
+        if unknown:
+            return f"Error: bad arguments for ask_user: unexpected {', '.join(sorted(unknown))}"
+        question, options, multiple = args.get("question"), args.get("options"), args.get("multiple")
+        problem = question_problem(question, options, multiple)
+        if problem:
+            return f"Error: {problem}."
+        if self.questions_asked >= MAX_QUESTIONS_PER_TURN:
+            return (f"Error: you have asked {MAX_QUESTIONS_PER_TURN} questions this turn, the most one turn "
+                    "may ask. Go on with the most reasonable choices, and list your assumptions and any "
+                    "open questions in your answer.")
+        self.questions_asked += 1
+        options, multiple = [o.strip() for o in options or []], bool(multiple)
+        answer = self.ask(question.strip(), options, multiple)
+        if answer is None:
+            return NO_ANSWER_NOTE
+        picks, text = answer
+        return question_result(options, picks, text)
+
     def _unavailable_tool_advice(self, name: str) -> str:
         """What to do instead of a tool this agent doesn't have, said for the role it is in.
 
@@ -2976,9 +3106,13 @@ class Agent:
         tends to try again, or stall. Told what it is and what its report can carry, it finishes
         with something the agent that delegated it can act on.
         """
-        known = {s["function"]["name"] for s in SCHEMAS + [TASK_SCHEMA, IMAGE_SCHEMA]}
+        known = {s["function"]["name"] for s in SCHEMAS + [TASK_SCHEMA, IMAGE_SCHEMA, ASK_USER_SCHEMA]}
         if name not in known:
             return ""
+        if self.depth > 0 and name == "ask_user":
+            return (" Subagents can't reach the user: you answer to the agent that delegated this. Go on "
+                    "with the most reasonable assumption, and name it and the open question in your report, "
+                    "so that agent can ask.")
         acting = {"bash", "write_file", "edit_file", "generate_image"}
         if self.depth > 0 and not (self.base_tool_names & acting):
             return (" You are a read-only subagent: you can read and search, but not run commands or change "
@@ -3184,6 +3318,7 @@ class Agent:
             ))
             self.active_snapshots = snapshots
             self.turn_trees.append([self._workspace_tree(), None])
+            self.questions_asked = 0
         answer, self.last_outcome = None, "error"
         try:
             answer = self._send_turn(user_text, preface)
@@ -4124,7 +4259,7 @@ def tool_overview(agent: "Agent") -> dict:
              for r in sorted(agent.always_allowed)]
     return {
         "tools": sorted(agent.tool_names),
-        "safe": sorted(agent.tool_names & SAFE_TOOLS),
+        "safe": sorted(agent.tool_names & (SAFE_TOOLS | {"ask_user"})),
         "plan_mode": agent.plan_mode,
         "rules": rules,
         "workspace": str(agent.tools.workspace),
@@ -4924,11 +5059,12 @@ def main() -> None:
         except OSError as e:
             print(f"! No trace this session: {e}", file=sys.stderr)
     permission = eval_permission if eval_mode else (ui.permission if ui else ask_permission)
+    ask = no_one_to_ask if eval_mode else (ui.ask_user if ui else ask_user_plain)
     agent = Agent(client, model, workspace, context_window=window, plan_mode=plan_mode, effort=effort,
                   max_steps=choose_max_steps(os.environ), compact_above=choose_compact_above(os.environ),
                   subagent_model=sub_model, subagent_effort=sub_effort, subagent_context_window=sub_window,
                   persona=persona, home=home, stream=choose_stream(os.environ),
-                  permission=permission, on_event=observer, vision=vision_of(model),
+                  permission=permission, ask=ask, on_event=observer, vision=vision_of(model),
                   vision_override=vision_override, subagent_vision=vision_of(sub_model), images=images)
     if persona and not persona_path(persona, home):
         # Named but not there: say so rather than starting a plain agent that looks like the persona.
