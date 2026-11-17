@@ -285,6 +285,33 @@ class MCPTests(unittest.TestCase):
         self.assertIn("initialize timed out", report)
         self.assertIn("good [running]", report)
 
+    def test_servers_start_side_by_side_each_within_its_own_startup_timeout(self):
+        write_config(self.home, {
+            "slow-a": server_entry(self.log, "--startup", "slow", startupTimeout=1),
+            "slow-b": server_entry(self.log, "--startup", "slow", startupTimeout=1),
+            "slow-c": server_entry(self.log, "--startup", "slow", startupTimeout=1),
+            "good": server_entry(self.log),
+        })
+        started = time.monotonic()
+        agent = self.agent()
+        took = time.monotonic() - started
+        self.assertLess(took, 2.5, "three 1s timeouts one after another would take 3s or more")
+        self.assertIn("mcp__good__echo", agent.tool_names)
+        notices = [data["text"] for event, data in self.events if event == "notice"]
+        failed = [text for text in notices if "failed to start" in text]
+        self.assertEqual([text.split()[2] for text in failed], ["slow-a", "slow-b", "slow-c"],
+                         "notices come in server order, whichever thread finished first")
+        self.assertEqual(threading.current_thread(), threading.main_thread())
+
+    def test_startup_timeout_defaults_and_must_be_a_positive_number(self):
+        from mcp_client import STARTUP_TIMEOUT, MCPError, _server_config
+        config, _ = _server_config({"command": "x"}, {})
+        self.assertEqual(config.startup_timeout, STARTUP_TIMEOUT)
+        self.assertEqual(_server_config({"command": "x", "startupTimeout": 90}, {})[0].startup_timeout, 90)
+        for bad in (0, -1, "30", True, float("inf")):
+            with self.assertRaisesRegex(MCPError, "startupTimeout must be a positive number"):
+                _server_config({"command": "x", "startupTimeout": bad}, {})
+
     def test_secrets_are_redacted_in_schemas_results_stderr_and_spilled_output(self):
         public_name_value = "ordinary-value-forwarded-as-secret"
         never_passed = "secret-that-stays-with-kyklos"

@@ -301,7 +301,14 @@ and Kyklos redacts the value from its output and diagnostics.
 ```
 
 MCP servers run **unsandboxed** with your account's filesystem and network access. Kyklos starts
-them from the user configuration directory and stops them when it exits. Each call needs
+them when it starts, all at once, and stops them when it exits. Each has `startupTimeout` seconds
+(default 30) to finish its handshake; the first run of an `npx -y` or `uvx` server downloads its
+package, so raise it for a large one. A server that misses it is reported and the session goes on
+without it; `/mcp restart <server>` tries again.
+
+Servers run with the configuration directory (`~/.kyklos`) as their working directory, never the
+project, so a repository can't decide where they run. A server that acts on "the current folder"
+by default, such as a git or filesystem server, needs the project's absolute path in its `args`. Each call needs
 approval unless you add its original tool name to the server's `autoApprove` list or choose
 `a` for that tool in the current session. The server's `readOnly` list controls which tools
 appear in plan mode. Both lists come from your configuration. `timeout` is in seconds and defaults

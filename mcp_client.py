@@ -22,7 +22,10 @@ from tools import (IS_WINDOWS, MAX_IMAGE_BYTES, SENDABLE_IMAGES, child_env, desc
 
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 MCP_PREFIX = "mcp__"
-STARTUP_TIMEOUT = 10
+# Seconds a server has to finish the handshake and list its tools. Generous by default because an
+# `npx -y` or `uvx` server's first start downloads its package; servers start side by side, so
+# the wait is the slowest server's, not the sum. `startupTimeout` in mcp.json sets it per server.
+STARTUP_TIMEOUT = 30
 CALL_TIMEOUT = 120
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 MAX_CONFIG_BYTES = 256 * 1024
@@ -63,6 +66,7 @@ class ServerConfig:
     auto_approve: frozenset[str]
     read_only: frozenset[str]
     timeout: float
+    startup_timeout: float
 
 
 def _server_config(data, environ) -> tuple[ServerConfig, set[str]]:
@@ -73,13 +77,8 @@ def _server_config(data, environ) -> tuple[ServerConfig, set[str]]:
         values = data.get(key, [])
         if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
             raise MCPError(f"{key} must be an array of strings.")
-    timeout = data.get("timeout", CALL_TIMEOUT)
-    try:
-        seconds = float(timeout) if type(timeout) in (int, float) else 0
-    except OverflowError:
-        seconds = 0
-    if not 0 < seconds < math.inf:
-        raise MCPError("timeout must be a positive number of seconds.")
+    seconds = _seconds(data, "timeout", CALL_TIMEOUT)
+    startup_seconds = _seconds(data, "startupTimeout", STARTUP_TIMEOUT)
     entries = data.get("env", {})
     if not isinstance(entries, dict) or not all(isinstance(value, str) for value in entries.values()):
         raise MCPError("env must be an object with string values.")
@@ -101,7 +100,18 @@ def _server_config(data, environ) -> tuple[ServerConfig, set[str]]:
         env[name] = value
     return (ServerConfig(data["command"], tuple(data.get("args", [])), env,
                          frozenset(data.get("autoApprove", [])), frozenset(data.get("readOnly", [])),
-                         seconds), secrets)
+                         seconds, startup_seconds), secrets)
+
+
+def _seconds(data: dict, key: str, default: float) -> float:
+    value = data.get(key, default)
+    try:
+        seconds = float(value) if type(value) in (int, float) else 0
+    except OverflowError:
+        seconds = 0
+    if not 0 < seconds < math.inf:
+        raise MCPError(f"{key} must be a positive number of seconds.")
+    return seconds
 
 
 def _launch(config: ServerConfig, home: Path, workspace: Path) -> subprocess.Popen:
@@ -350,17 +360,44 @@ class MCP:
         self.tools: dict[str, MCPTool] = {}
         self.forwarded: set[str] = set()
         self.config_error: str | None = None
+        self._closing = False
+        self._held: dict[int, list[str]] = {}  # startup thread -> its notices, said in server order
         if home is None:
             return
         try:
             self._configure()
-            for name, server in self.servers.items():
-                if server.config:
-                    self._start(name, server)
+            self._start_all()
             self._catalog()
         except BaseException:
             self.close()
             raise
+
+    def _start_all(self):
+        """Start every configured server at once, so startup waits for the slowest, not the sum.
+
+        Each thread holds its notices until all are done; they are then said from this thread, in
+        server order, so the front end only ever hears from the thread that owns it."""
+        pending = [(name, server) for name, server in self.servers.items() if server.config]
+        if not pending:
+            return
+        held = {name: [] for name, _ in pending}
+
+        def start(name, server):
+            self._held[threading.get_ident()] = held[name]
+            try:
+                self._start(name, server)
+            finally:
+                self._held.pop(threading.get_ident(), None)
+
+        threads = [threading.Thread(target=start, args=entry, daemon=True, name=f"kyklos-mcp-start-{i}")
+                   for i, entry in enumerate(pending)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()  # each start is bounded by its server's own startupTimeout
+        for name, _ in pending:
+            for text in held[name]:
+                self.notice(text)
 
     def clean(self, text: str) -> str:
         return _clean_text(text, self._secrets())
@@ -370,7 +407,11 @@ class MCP:
         return sorted(values, key=lambda value: (-len(value), value))
 
     def _say(self, text: str):
-        self.notice(self.clean(text))
+        held = self._held.get(threading.get_ident())
+        if held is not None:
+            held.append(self.clean(text))
+        else:
+            self.notice(self.clean(text))
 
     def _configure(self):
         try:
@@ -415,10 +456,13 @@ class MCP:
                 self._say(f"MCP server {plain_line(name)}: {server.error}")
 
     def _start(self, name: str, server: Server):
-        deadline = time.monotonic() + STARTUP_TIMEOUT
+        deadline = time.monotonic() + server.config.startup_timeout
         server.version, server.error, server.stderr, server.generation = None, None, "", 0
         try:
             server.wire = Stdio(server.config, self.home, self.workspace)
+            if self._closing:  # close() ran while this was launching: don't leave it behind
+                self._stop(server)
+                return
             reply = server.wire.request("initialize", {"protocolVersion": PROTOCOL_VERSIONS[0],
                                         "capabilities": {},
                                         "clientInfo": {"name": "kyklos", "version": self.version}}, deadline)
@@ -515,7 +559,8 @@ class MCP:
             wire = server.wire
             if wire and wire.generation != server.generation and not wire.status_error():
                 try:
-                    definitions, generation = self._list(name, server, time.monotonic() + STARTUP_TIMEOUT)
+                    definitions, generation = self._list(name, server,
+                                                         time.monotonic() + server.config.startup_timeout)
                     updates.append((name, server, definitions, generation))
                 except MCPError as error:
                     server.error = str(error)
@@ -549,6 +594,7 @@ class MCP:
             server.wire = None
 
     def close(self):
+        self._closing = True
         for server in self.servers.values():
             self._stop(server)
 
