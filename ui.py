@@ -27,7 +27,7 @@ from rich.text import Text
 from rich.theme import Theme
 
 from kyklos import (BASH_MODE_CAVEAT, BASH_MODE_EXPLANATION, BROAD_WARNING, EXIT, NO_APPROVER_NOTE,
-                    COMMANDS, TRUST_EXPLANATION, CommandContext, edit_preview,
+                    TRUST_EXPLANATION, CommandContext, command_list, edit_preview,
                     __version__, apply_permission_answer, denial_note, ensure_private_dir,
                     error_detail, has_danger, has_opaque, parse_question_answer, permission_options,
                     run_command, sandbox_warning, short_tokens)
@@ -1284,14 +1284,18 @@ class AeroUI:
         from prompt_toolkit.key_binding import KeyBindings
         from prompt_toolkit.styles import Style
 
+        commands = command_list(self.agent)
+
         class SlashCompleter(Completer):
             def get_completions(self, document, complete_event):
                 text = document.text_before_cursor
                 if not text.startswith("/") or " " in text:
                     return
-                for name, (_, usage, summary) in COMMANDS.items():
+                for entry in commands:
+                    name = entry["name"]
                     if name.startswith(text[1:].lower()):
-                        yield Completion(f"/{name}", start_position=-len(text), display=usage, display_meta=summary)
+                        yield Completion(f"/{name}", start_position=-len(text),
+                                         display=entry["usage"], display_meta=entry["summary"])
 
         bindings = KeyBindings()
 

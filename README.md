@@ -13,6 +13,7 @@ A small coding-agent harness (~4,200 lines of Python, plus ~2,900 lines of tests
 - **Plan mode** (`/plan`) — read-only, for working out an approach before touching anything.
 - **Undo** (`/undo`) reverts a turn's conversation *and* its file changes — including the ones its commands made, from a snapshot of the workspace.
 - Sessions save and resume per folder; `continue` picks up a turn that hit the step cap.
+- **Custom slash commands** turn reusable Markdown prompts into commands you can run from the prompt.
 - **Images** for models that take them: `read_file` shows the model a PNG, JPEG or WebP, and `@path/to/shot.png` in a message attaches one.
 - **Image generation** (`generate_image`) when an image provider is set up: the model writes a prompt, you approve it, and the image is saved in the workspace.
 
@@ -140,6 +141,7 @@ Type `/help` for the commands; Tab completes them.
 
 | Command | What it does |
 |---|---|
+| `/help` | List built-in and custom commands |
 | `/plan [task]` | Toggle read-only plan mode, or plan one task in it |
 | `/undo` | Revert the last turn's conversation and the files it changed, by tools or commands |
 | `/save [file]`, `/resume [file]` | Save or load a JSONL session |
@@ -154,6 +156,7 @@ Type `/help` for the commands; Tab completes them.
 | `/map` | The workspace sketch the model starts each turn with |
 | `/reset` | Clear the conversation |
 | `/exit` | Quit (or Ctrl+C twice at an empty prompt) |
+| `/<name> [args]` | Run a custom Markdown prompt from your user or project commands folder |
 
 ## The first run in a folder
 
@@ -233,6 +236,28 @@ The sketch is scanned once per conversation and then left alone, because provide
 
 **Project instructions.** An `AGENTS.md` in the workspace is added to the system prompt, like CLAUDE.md or GEMINI.md elsewhere.
 
+**Custom slash commands.** Save a prompt as `~/.kyklos/commands/<name>.md` (under `KYKLOS_HOME`
+if set), or share it in `.agents/commands/<name>.md` in a trusted project. Use up to 40 lowercase
+letters, digits and hyphens, starting with a letter or digit. An optional header between `---`
+lines accepts `description: ...` for help and Tab completion, and `argument-hint: ...` for usage.
+A file at `.agents/commands/review.md` can use this format.
+
+```markdown
+---
+description: Review a file
+argument-hint: <file>
+---
+Review $ARGUMENTS for correctness and report any problems with line references.
+```
+
+Type `/review src/app.py` to send the expanded prompt as your message. Each `$ARGUMENTS` gets
+the text after the command name, or an empty string when omitted. Attachment syntax such as
+`@path` stays literal in expanded prompts. Kyklos shows the source file before sending the
+prompt. Built-ins take precedence, followed by user commands, then project commands. The command
+list is loaded at startup, and skipped files are reported there. Restart Kyklos after changing a
+command. Prompts are capped at 20,000 characters, and modifying project command files through
+Kyklos requires approval each time.
+
 **Personas.** A persona is a prompt layer the user chooses — an architect, a read-only auditor — kept as `~/.kyklos/personas/<name>.md` and selected with `--persona`, `/persona` or `KYKLOS_PERSONA`. It is a system-prompt section, so switching mid-session keeps the conversation and only costs the next request; it is re-sent on every step, so the picker shows each one's token size. Read from `~/.kyklos` only, never from the workspace: a persona defines who the agent is, so a checked-out repository must not be able to name one. It goes into the prompt before the guardrails and `AGENTS.md`, which keeps the harness's own rules the last word, and a subagent doesn't inherit it — it gets a charter instead.
 
 **Models and thinking effort.** `/model` opens an arrow-key picker — ↑/↓, type to filter, Enter, Esc — then a second picker offers *that model's own* effort levels:
@@ -282,11 +307,11 @@ Claims to have run the tests, committed, pushed or installed are compared agains
 ## Tests
 
 ```bash
-./.venv/bin/python -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question
+./.venv/bin/python -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_commands
 ```
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question
+.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_commands
 ```
 
 ## Evals

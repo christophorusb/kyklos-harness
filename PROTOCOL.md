@@ -63,14 +63,14 @@ app adds no configuration of its own.
 ```
 client                                   kyklos --serve
   │ initialize ─────────────────────────────▶│
-  │◀──────────────── result: versions, sandbox, commands
+  │◀──────────────── result: versions, sandbox, built-in commands
   │ session/start {resume} ─────────────────▶│
   │                                          │ folder not yet trusted?
   │◀────────────────────── trust/request ────│   (before the Agent exists:
   │ {choice: "once"} ───────────────────────▶│    it reads AGENTS.md)
   │◀────────────────── session/bash_mode ────│
   │ {mode: "ask"} ──────────────────────────▶│
-  │◀──────── result: state, resume note ─────│
+  │◀──────── result: state, resume note, commands
   │                                          │
   │ session/prompt {text} ──────────────────▶│
   │◀─────── session/update (turn_start) ─────│
@@ -103,7 +103,7 @@ before the handshake.
 | Method | Params | Result |
 |---|---|---|
 | `initialize` | `protocol_version`, `client: {name, version}` | `protocol_version`, `kyklos_version`, `workspace`, `sandbox: {kind, label, warning}`, `commands: [{name, usage, summary}]`, `profiles`, `profile` |
-| `session/start` | `resume: null \| "last" \| path` | `state` (§7.3), `note: {kind, text} \| null` |
+| `session/start` | `resume: null \| "last" \| path` | `state` (§7.3), `note: {kind, text} \| null`, `commands: [{name, usage, summary, source?}]` |
 | `session/prompt` | `text` | `answer`, `outcome`, `steps`, `secs`, `claims: [{label, missing}]` |
 | `session/cancel` | *(notification)* | none: the in-flight `session/prompt` returns with `outcome: "interrupted"` |
 | `command/run` | `text` (the whole line, `/model gpt-5`) | `then_send: string \| null`, `exit: bool` |
@@ -115,10 +115,13 @@ before the handshake.
   `last_claims`: answer claims the turn didn't back up, which the terminal prints as `! this answer
   says it …`. The client shows them, and no client may hide them. The session is saved before the
   result is sent, exactly as `AeroUI.turn` does.
-- **`command/run`** goes through `run_command` and the shared `COMMANDS` registry, so every slash
-  command, including ones added later, works in every client with no client change. A handler that
-  returns text to send (`/plan <request>`) comes back as `then_send`, and the client then sends it
-  with `session/prompt` itself. There is one way to start a turn.
+- **`commands`** from `initialize` lists built-ins. Use the list from `session/start` when it is
+  present. It includes custom commands loaded after folder trust, each with a `source` of `user`
+  or `project`. The startup list stays fixed until the process restarts.
+- **`command/run`** handles both built-in and custom slash commands. A handler that returns text
+  to send (such as `/plan <request>` or a custom prompt) comes back as `then_send`, which the
+  client passes unchanged to `session/prompt`. For a custom command, the server first sends a
+  `say` notification with the source file. Show it before submitting the expanded prompt.
 - **Busy:** while a turn runs, only `session/cancel`, `session/state` and `shutdown` are accepted.
   Anything else gets error `-32001 busy`. The terminal can't run `/model` mid-turn either.
 - **Errors:** `-32001 busy` (above). `-32002 api_error` is an API failure that ends a turn, with
@@ -271,7 +274,7 @@ keyword arguments, unchanged:
 | `plan` | `steps`, `active` | The resolved plan, never the call's arguments |
 | `compact` | `stage`, `before`, `after`, `pruned` | `stage` is `pruned` or `summarized` |
 | `retry` | `attempt`, `max_attempts`, `delay`, `error` | |
-| `notice` | `text` | A caveat meant for the person, said once per session |
+| `notice` | `text` | A caveat meant for the person, said once per session. Skipped command files can be reported before the `session/start` result |
 | `image` | `path`, `rel`, `mime`, `width`, `height`, `bytes` | `generate_image` saved an image: `path` is absolute, `rel` is workspace-relative. Sent before that call's `tool_result` |
 | `signal` | `kind`, plus `reason`, `left`, `repeats`, `size`, `report`, `count` | The harness stepping in: `nudge`, `budget_warning`, `repeat_warn`, `repeat_stop`, `redacted`, `parallel_batch`, `delegation_hint`, `truncated_call`, `map_note`, `images_sent`, `stopped_report` |
 

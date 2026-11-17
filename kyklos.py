@@ -19,6 +19,7 @@ import tempfile
 import textwrap
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -48,6 +49,9 @@ REPEAT_WARN, REPEAT_STOP = 3, 5
 # finish_reason values that mean the reply was cut off by the output-token limit, not finished.
 TRUNCATED_FINISH_REASONS = {"length", "max_tokens"}
 MAX_INSTRUCTIONS_CHARS = 20_000
+MAX_FRONTMATTER_CHARS = 4_000
+CUSTOM_COMMAND_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
+PROJECT_COMMANDS_DIR = ".agents/commands"
 MAX_API_RETRIES = 3
 RETRY_BASE_DELAY = 1.0
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -1079,7 +1083,7 @@ CI_CONFIG_FILES = {".gitlab-ci.yml", ".travis.yml", "jenkinsfile", "azure-pipeli
 GITHUB_EXEC_DIRS = {"workflows", "actions"}
 
 
-def _protected_workspace_target(path: str) -> str:
+def _protected_workspace_target(path: str, workspace: Path | None = None) -> str:
     """Non-empty label if `path` names a repository file that controls git hooks, persistent agent
     instructions (AGENTS.md), automatic editor execution (.vscode/tasks.json), CI (.github/workflows)
     or the user's shell on entering the folder (.envrc)."""
@@ -1090,6 +1094,16 @@ def _protected_workspace_target(path: str) -> str:
     if not parts:
         return ""
     low_parts = [p.lower() for p in parts]
+    command_parts = PROJECT_COMMANDS_DIR.split("/")
+    if any(low_parts[i:i + 2] == command_parts for i in range(len(low_parts) - 1)):
+        return f"{PROJECT_COMMANDS_DIR}/"
+    if workspace is not None:
+        try:
+            resolved = (workspace / path.strip("\"'")).resolve().relative_to(workspace)
+            if [p.lower() for p in resolved.parts[:2]] == command_parts:
+                return f"{PROJECT_COMMANDS_DIR}/"
+        except (OSError, RuntimeError, ValueError):
+            pass
     if ".git" in low_parts:
         return ".git/"
     if ".husky" in low_parts:
@@ -1169,7 +1183,7 @@ def _new_workspace_file(target: str) -> bool:
     something run later (hooks, CI, AGENTS.md and the rest), which stay red however they're written."""
     if _EXPLAIN_WORKSPACE is None or not PLAIN_PATH_RE.match(target) or target.startswith("/"):
         return False
-    if ".." in Path(target).parts or _protected_workspace_target(target):
+    if ".." in Path(target).parts or _protected_workspace_target(target, _EXPLAIN_WORKSPACE):
         return False
     try:
         base = _EXPLAIN_WORKSPACE.resolve()
@@ -1288,6 +1302,10 @@ def explain_command(command: str, depth: int = 0) -> list[tuple[str, str]]:
         target = _bare(target)
         if target.lower() in NULL_SINKS:
             continue  # discarding output, not writing a file
+        protected = _protected_workspace_target(target, _EXPLAIN_WORKSPACE)
+        if protected == f"{PROJECT_COMMANDS_DIR}/":
+            findings.append(("danger", f"writes to protected repository path {target}"))
+            continue
         if steady and _inside_scratch(target):
             # The scratch directory exists to be written over. Once this matched any target that
             # merely contained the name, so `.kyklos/scratch/../../src/app.py` was never mentioned.
@@ -1461,7 +1479,7 @@ def _command_findings(tokens: list[str]) -> list[tuple[str, str]]:
         elif flags & {"-r", "--recursive"}:
             findings.append(("danger", "changes permissions recursively"))
         for target in operands:
-            if _protected_workspace_target(target):
+            if _protected_workspace_target(target, _EXPLAIN_WORKSPACE):
                 findings.append(("danger", f"modifies protected repository path {target}"))
     if stem == "chown" and flags & {"-r", "--recursive"}:
         findings.append(("danger", "changes ownership recursively"))
@@ -1470,11 +1488,11 @@ def _command_findings(tokens: list[str]) -> list[tuple[str, str]]:
     if stem == "ln":
         if flags & {"-f", "--force"}:
             findings.append(("danger", f"replaces {operands[-1] if operands else 'the link it creates'}"))
-        if operands and _protected_workspace_target(operands[-1]):
+        if operands and _protected_workspace_target(operands[-1], _EXPLAIN_WORKSPACE):
             findings.append(("danger", f"links into protected repository path {operands[-1]}"))
     if stem in {"touch", "mkdir"}:
         for target in operands:
-            if _protected_workspace_target(target):
+            if _protected_workspace_target(target, _EXPLAIN_WORKSPACE):
                 findings.append(("danger", f"modifies protected repository path {target}"))
     if stem in {"cp", "mv"} and len(operands) >= 2:
         verb = "moves" if stem == "mv" else "copies"
@@ -1482,10 +1500,16 @@ def _command_findings(tokens: list[str]) -> list[tuple[str, str]]:
             findings.append(("danger", f"empties {operands[-1]}"))
         elif _outside_workspace(operands[-1]):
             findings.append(("danger", f"{verb} {operands[0]} out to {operands[-1]}"))
-        elif _protected_workspace_target(operands[-1]):
+        elif _protected_workspace_target(operands[-1], _EXPLAIN_WORKSPACE):
             findings.append(("danger", f"{verb} {operands[0]} into protected repository path {operands[-1]}"))
         elif stem == "mv":
             findings.append(("note", f"moves {operands[0]} to {operands[-1]}"))
+    if stem in {"mv", "rmdir"}:
+        sources = operands[:-1] if stem == "mv" else operands
+        for target in sources:
+            if (_protected_workspace_target(target, _EXPLAIN_WORKSPACE) == f"{PROJECT_COMMANDS_DIR}/"
+                    or target.rstrip("/\\").replace("\\", "/").rsplit("/", 1)[-1].lower() == ".agents"):
+                findings.append(("danger", f"moves or removes protected repository path {target}"))
     if stem == "git" and raw:
         # Every rule here reads the subcommand's own arguments, never git's options in front of it.
         # Local names, so `git -C /tmp …` still reaches the outside-the-workspace check below.
@@ -1680,10 +1704,10 @@ def is_auto_allowed(name: str, args: dict, always_allowed: set[str], auto_bash: 
         return True
     if name in ("write_file", "edit_file"):
         path = str(args.get("path", ""))
+        if _protected_workspace_target(path, workspace):
+            return False
         if workspace is not None and is_scratch_path(workspace, path):
             return True
-        if _protected_workspace_target(path):
-            return False
         return name in always_allowed
     if name == "bash":
         cmd = str(args.get("command", ""))
@@ -1728,7 +1752,7 @@ def permission_options(name: str, args: dict) -> tuple[bool, str, list]:
                                           for _, text in findings):
             findings.append(("warn", f"output from this command will be sent to remote provider {_EXPLAIN_PROVIDER_HOST}"))
     elif name in ("write_file", "edit_file"):
-        target = _protected_workspace_target(str(args.get("path", "")))
+        target = _protected_workspace_target(str(args.get("path", "")), _EXPLAIN_WORKSPACE)
         if target:
             findings.append(("danger", f"modifies {target}, which controls persistent instructions or code "
                                        f"that runs automatically (hooks, editor tasks, CI)"))
@@ -2492,6 +2516,7 @@ class Agent:
         self.cache_seen_tokens = 0
         self.cache_read_tokens = 0
         self.reset()
+        self.custom_commands = load_custom_commands(self, home) if depth == 0 else {}
 
     def image_delegate(self) -> str | None:
         """The model a text-only agent can hand images to: its subagents' model, when that one takes
@@ -4294,6 +4319,119 @@ def workspace_changes(agent: "Agent") -> list:
 
 
 COMMANDS: dict[str, tuple] = {}  # name -> (handler, usage, summary)
+COMMAND_ALIASES = {"quit": "exit"}
+
+
+@dataclass(frozen=True)
+class CustomCommand:
+    path: Path
+    source: str
+    usage: str
+    summary: str
+    body: str
+
+
+def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
+    """Read a bounded header of simple key/value pairs from the start of a Markdown file."""
+    opening, _, rest = text.partition("\n")
+    if opening.strip() != "---":
+        return {}, text
+    fields, offset = {}, 0
+    for raw in rest.splitlines(keepends=True):
+        offset += len(raw)
+        if offset > MAX_FRONTMATTER_CHARS:
+            raise ValueError(f"frontmatter exceeds {MAX_FRONTMATTER_CHARS} characters")
+        line = raw.strip()
+        if line == "---":
+            return fields, rest[offset:]
+        if not line:
+            continue
+        key, sep, value = line.partition(":")
+        key, value = key.strip(), value.strip()
+        if not sep or not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_-]*", key) or key in fields:
+            raise ValueError("frontmatter needs unique key: value pairs")
+        if value[:1] in {"'", '"'}:
+            if len(value) < 2 or value[-1] != value[0]:
+                raise ValueError("frontmatter has an unclosed quoted value")
+            value = value[1:-1]
+        fields[key] = value
+    raise ValueError("frontmatter is missing its closing ---")
+
+
+def load_custom_commands(agent: Agent, home: Path | None) -> dict[str, CustomCommand]:
+    """Load one catalog after folder trust, keeping built-ins and user commands ahead of project files."""
+    commands = {}
+    workspace = agent.tools.workspace
+
+    def clean(text):
+        return scrub_secrets(text, workspace=workspace)[0]
+
+    def skip(path, reason):
+        agent._emit("notice", text=clean(f"Skipped custom command file {plain_line(str(path))}: {reason}."))
+
+    roots = [("project", workspace, PROJECT_COMMANDS_DIR)]
+    if home is not None:
+        roots.insert(0, ("user", home, "commands"))
+    for source, base, relative in roots:
+        folder = base / relative
+        try:
+            folder = base.resolve() / relative
+            if folder.resolve() != folder:
+                skip(folder, "command directories cannot be symlinked")
+                continue
+            paths = sorted(folder.iterdir())
+        except FileNotFoundError:
+            continue
+        except (OSError, RuntimeError):
+            skip(folder, "could not list the directory")
+            continue
+        for path in paths:
+            name = path.stem
+            try:
+                if path.is_symlink():
+                    skip(path, "command files cannot be symlinked")
+                    continue
+                if path.is_dir():
+                    continue
+                if path.suffix != ".md" or not CUSTOM_COMMAND_NAME.fullmatch(name):
+                    skip(path, "expected a .md file with a lowercase command name of at most 40 characters")
+                    continue
+                if name in COMMANDS or name in COMMAND_ALIASES:
+                    skip(path, f"built-in /{name} takes precedence")
+                    continue
+                if name in commands:
+                    skip(path, f"user command /{name} takes precedence")
+                    continue
+                if not path.is_file():
+                    skip(path, "expected a regular file")
+                    continue
+                with path.open(encoding="utf-8", errors="replace") as file:
+                    fields, body = parse_frontmatter(file.read(MAX_FRONTMATTER_CHARS + MAX_INSTRUCTIONS_CHARS + 5))
+                body = clean(body.lstrip("\n"))[:MAX_INSTRUCTIONS_CHARS].rstrip()
+                if not body.strip():
+                    skip(path, "the prompt is empty")
+                    continue
+            except OSError:
+                skip(path, "could not read the file")
+                continue
+            except ValueError as e:
+                skip(path, str(e))
+                continue
+            hint = clean(plain_line(fields.get("argument-hint", "")))
+            summary = clean(plain_line(fields.get("description", ""))) or "Custom command"
+            usage = f"/{name} {hint}" if hint else f"/{name}"
+            commands[name] = CustomCommand(path, source, usage, summary, body)
+    return commands
+
+
+def command_list(agent: Agent | None = None) -> list[dict[str, str]]:
+    """Display metadata shared by /help, Aero completion and the serve handshake."""
+    entries = [{"name": name, "usage": usage, "summary": summary}
+               for name, (_, usage, summary) in COMMANDS.items()]
+    if agent is not None:
+        entries.extend({"name": name, "usage": cmd.usage, "summary": cmd.summary, "source": cmd.source}
+                       for name, cmd in sorted(agent.custom_commands.items()))
+    return entries
 
 
 def state_snapshot(agent: "Agent") -> dict:
@@ -4350,8 +4488,13 @@ def command(name: str, usage: str, summary: str):
 
 @command("help", "/help", "Show these commands")
 def _cmd_help(ctx, arg):
-    width = max(len(usage) for _, usage, _ in COMMANDS.values()) + 2
-    ctx.say("info", "\n".join(f"{usage:<{width}}{summary}" for _, usage, summary in COMMANDS.values()))
+    entries = command_list(ctx.agent)
+    width = max(len(entry["usage"]) for entry in entries) + 2
+    lines = []
+    for entry in entries:
+        source = f" [{entry['source']}]" if "source" in entry else ""
+        lines.append(f"{entry['usage']:<{width}}{entry['summary']}{source}")
+    ctx.say("info", "\n".join(lines))
 
 
 @command("plan", "/plan [request]", "Toggle read-only plan mode, or run one request in it")
@@ -4812,11 +4955,23 @@ def _cmd_exit(ctx, arg):
 def run_command(ctx: CommandContext, text: str):
     """Run a /command line. Returns None, EXIT, or text to send to the agent."""
     name, _, arg = text[1:].partition(" ")
-    entry = COMMANDS.get(name.lower()) or (COMMANDS["exit"] if name.lower() == "quit" else None)
-    if entry is None:
-        ctx.say("error", f"Unknown command /{name}. Type /help for the list.")
+    key = name.lower()
+    entry = COMMANDS.get(COMMAND_ALIASES.get(key, key))
+    if entry is not None:
+        return entry[0](ctx, arg.strip())
+    custom = ctx.agent.custom_commands.get(key)
+    if custom is None:
+        ctx.say("error", f"Unknown command /{plain_line(name)}. Type /help for the list.")
         return None
-    return entry[0](ctx, arg.strip())
+    prompt = custom.body.replace("$ARGUMENTS", arg.strip())
+    if not prompt.strip():
+        ctx.say("error", f"/{name} expanded to an empty prompt. Usage: {custom.usage}")
+        return None
+    path = scrub_secrets(plain_line(str(custom.path)), workspace=ctx.agent.tools.workspace)[0]
+    ctx.say("info", f"Using {custom.source} command /{key} from {path}.")
+    # An @path in a template isn't the user's consent to open a local file. Escape attachment
+    # syntax in the returned text so it stays literal even when a serve client resubmits it.
+    return ATTACH_RE.sub(lambda match: "\\" + match[0], prompt)
 
 
 def wants_aero_ui(stdin_tty: bool, stdout_tty: bool, env: dict) -> bool:

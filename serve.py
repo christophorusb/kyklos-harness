@@ -21,9 +21,9 @@ import time
 from difflib import SequenceMatcher
 from pathlib import Path
 
-from kyklos import (BASH_MODE_CAVEAT, BASH_MODE_EXPLANATION, BROAD_WARNING, COMMANDS, EXIT, NO_APPROVER_NOTE,
+from kyklos import (BASH_MODE_CAVEAT, BASH_MODE_EXPLANATION, BROAD_WARNING, EXIT, NO_APPROVER_NOTE,
                     TRUST_EXPLANATION, CommandContext, apply_permission_answer, denial_note, edit_preview,
-                    error_detail, has_danger, has_opaque, parse_question_answer, permission_options,
+                    command_list, error_detail, has_danger, has_opaque, parse_question_answer, permission_options,
                     run_command, sandbox_warning, state_snapshot)
 
 PROTOCOL_VERSION = 0
@@ -61,8 +61,7 @@ def server_info(workspace: Path, sandbox: tuple, profiles: list, profile: str | 
         "kyklos_version": version,
         "workspace": str(workspace),
         "sandbox": {"kind": kind, "label": label, "warning": sandbox_warning() or None},
-        "commands": [{"name": name, "usage": usage, "summary": summary}
-                     for name, (_, usage, summary) in COMMANDS.items()],
+        "commands": command_list(),
         "profiles": profiles,
         "profile": profile,
     }
@@ -420,10 +419,11 @@ class ServeUI:
             previous = None
         try:
             self.state = self.snapshot()
+            self.ready = True
             if self.start_request:
                 self.respond(self.start_request[0], {
-                    "state": self.state, "note": {"kind": notice[0], "text": notice[1]} if notice else None})
-            self.ready = True
+                    "state": self.state, "note": {"kind": notice[0], "text": notice[1]} if notice else None,
+                    "commands": command_list(agent)})
             while True:
                 msg = self._next_work()
                 if msg is None:
