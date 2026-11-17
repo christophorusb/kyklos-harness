@@ -251,8 +251,9 @@ Review $ARGUMENTS for correctness and report any problems with line references.
 ```
 
 Type `/review src/app.py` to send the expanded prompt as your message. Each `$ARGUMENTS` gets
-the text after the command name, or an empty string when omitted. Attachment syntax such as
-`@path` stays literal in expanded prompts. Kyklos shows the source file before sending the
+the text after the command name, or an empty string when omitted. Without a placeholder, any
+arguments go on a new line after the prompt. An `@path` in the template stays literal, and an
+`@path` typed as an argument can attach an image. Kyklos shows the source file before sending the
 prompt. Built-ins take precedence, followed by user commands, then project commands. The command
 list is loaded at startup, and skipped files are reported there. Restart Kyklos after changing a
 command. Prompts are capped at 20,000 characters, and modifying project command files through

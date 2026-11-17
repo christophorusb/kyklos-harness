@@ -70,6 +70,13 @@ class CommandTests(unittest.TestCase):
         run_command(ctx, "/help")
         self.assertRegex(self.said[-1][1], r"/check-2 +Custom command \[user\]")
 
+    def test_arguments_are_appended_without_a_placeholder(self):
+        put_command(self.project, "fix.md", "Fix the failing test.\n")
+        _, ctx, _ = self.agent()
+        self.assertEqual(run_command(ctx, "/fix"), "Fix the failing test.")
+        self.assertEqual(run_command(ctx, "/fix only the parser test"),
+                         "Fix the failing test.\nonly the parser test")
+
     def test_malformed_headers_and_bad_names_are_reported(self):
         for name, body in {
             "broken.md": "---\ndescription missing colon\n---\nText",
@@ -130,15 +137,18 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(set(agent.custom_commands), {"review"})
         self.assertTrue(any("link.md" in t and "symlinked" in t for t in self.notices))
 
-    def test_expanded_templates_cannot_attach_files(self):
-        put_command(self.project, "check.md", "Check @screenshot.png and $ARGUMENTS.")
+    def test_only_arguments_can_attach_files(self):
+        put_command(self.project, "check.md", "Check @template.png and $ARGUMENTS.")
+        (self.ws / "template.png").write_bytes(png_bytes())
+        (self.ws / "shot.png").write_bytes(png_bytes())
         agent, ctx, client = self.agent([reply("Done.")], vision=True)
-        with mock.patch("kyklos.load_image") as load:
-            (self.ws / "screenshot.png").write_bytes(png_bytes())
-            prompt = run_command(ctx, "/check @screenshot.png")
-            agent.send(prompt)
-            load.assert_not_called()
-        self.assertEqual(client.calls[0][-1]["content"], r"Check \@screenshot.png and \@screenshot.png.")
+        prompt = run_command(ctx, "/check @shot.png")
+        self.assertEqual(prompt, r"Check \@template.png and @shot.png.")
+        agent.send(prompt)
+        parts = client.calls[0][-1]["content"]
+        self.assertEqual([part["type"] for part in parts], ["text", "image_url"])
+        self.assertIn("Attached shot.png", "\n".join(self.notices))
+        self.assertNotIn("Attached template.png", "\n".join(self.notices))
 
     def test_project_commands_require_per_call_approval_for_writes(self):
         path = put_command(self.project, "review.md", "Original prompt")

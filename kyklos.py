@@ -4963,15 +4963,19 @@ def run_command(ctx: CommandContext, text: str):
     if custom is None:
         ctx.say("error", f"Unknown command /{plain_line(name)}. Type /help for the list.")
         return None
-    prompt = custom.body.replace("$ARGUMENTS", arg.strip())
+    # Only paths typed by the user can authorize an attachment.
+    prompt = ATTACH_RE.sub(lambda match: "\\" + match[0], custom.body)
+    arg = arg.strip()
+    if "$ARGUMENTS" in prompt:
+        prompt = prompt.replace("$ARGUMENTS", arg)
+    elif arg:
+        prompt += f"\n{arg}"
     if not prompt.strip():
         ctx.say("error", f"/{name} expanded to an empty prompt. Usage: {custom.usage}")
         return None
     path = scrub_secrets(plain_line(str(custom.path)), workspace=ctx.agent.tools.workspace)[0]
     ctx.say("info", f"Using {custom.source} command /{key} from {path}.")
-    # An @path in a template isn't the user's consent to open a local file. Escape attachment
-    # syntax in the returned text so it stays literal even when a serve client resubmits it.
-    return ATTACH_RE.sub(lambda match: "\\" + match[0], prompt)
+    return prompt
 
 
 def wants_aero_ui(stdin_tty: bool, stdout_tty: bool, env: dict) -> bool:
