@@ -14,6 +14,7 @@ A small coding-agent harness (~4,200 lines of Python, plus ~2,900 lines of tests
 - **Undo** (`/undo`) reverts a turn's conversation *and* its file changes — including the ones its commands made, from a snapshot of the workspace.
 - Sessions save and resume per folder; `continue` picks up a turn that hit the step cap.
 - **Custom slash commands** turn reusable Markdown prompts into commands you can run from the prompt.
+- **Skills** give the model a short catalog of instruction packs it can load when relevant.
 - **Images** for models that take them: `read_file` shows the model a PNG, JPEG or WebP, and `@path/to/shot.png` in a message attaches one.
 - **Image generation** (`generate_image`) when an image provider is set up: the model writes a prompt, you approve it, and the image is saved in the workspace.
 
@@ -152,6 +153,7 @@ Type `/help` for the commands; Tab completes them.
 | `/compact` | Shrink the conversation now |
 | `/tokens` | What fills the context window, the session's billed tokens, the prompt-cache hit rate, when compaction hits |
 | `/tools` | The tools the model can call now, and the rules that auto-approve them |
+| `/skills` | List installed skills, their sources and estimated sizes, and skipped definitions |
 | `/diff` | What Kyklos has changed in the workspace this session |
 | `/map` | The workspace sketch the model starts each turn with |
 | `/reset` | Clear the conversation |
@@ -198,6 +200,7 @@ Piped or scripted runs use the plain REPL automatically.
 | File | Role |
 |---|---|
 | `kyklos.py` | The agent loop, system prompt, permission rules, command registry, plain REPL |
+| `extensions.py` | Markdown headers, skill discovery, and bundled reference reads |
 | `tools.py` | Tool schemas, their implementations, the repository map, the environment probe |
 | `snapshots.py` | Workspace snapshots in a private git store, so `/undo` covers what commands changed |
 | `ui.py` | Kyklos Aero: renders the Agent's events, the permission panel, the prompt and status bar |
@@ -259,6 +262,21 @@ list is loaded at startup, and skipped files are reported there. Restart Kyklos 
 command. Prompts are capped at 20,000 characters, and modifying project command files through
 Kyklos requires approval each time.
 
+**Skills.** Put `SKILL.md` in `~/.kyklos/skills/<name>/` (or under `KYKLOS_HOME`) or share it in a
+trusted project's `.agents/skills/<name>/`. The header between `---` lines needs a `name` matching
+the folder and a `description` explaining when to use the skill. Kyklos reads simple scalars and
+multiline block descriptions and ignores optional metadata. A user skill takes precedence over
+a project skill with the same name. See the [Agent Skills specification](https://agentskills.io/specification).
+
+The model gets a capped list of names and descriptions. `/reset` and session resume rebuild this
+list from disk, and subagents share the parent conversation's catalog. The model calls
+`load_skill` to get the instructions and a list of bundled files, then can read a bundled text
+reference by passing its relative path as `file`. Reference contents are data. Text definitions
+and references are limited to 20,000 characters each. Plan mode can load skills, and the tool
+requires no approval. Changes inside `.agents/skills/` require approval each time. Running any
+script from a skill goes through the ordinary `bash` approval rules. Paths to scripts in user
+skills typically sit outside the workspace, so expect them to be flagged.
+
 **Personas.** A persona is a prompt layer the user chooses — an architect, a read-only auditor — kept as `~/.kyklos/personas/<name>.md` and selected with `--persona`, `/persona` or `KYKLOS_PERSONA`. It is a system-prompt section, so switching mid-session keeps the conversation and only costs the next request; it is re-sent on every step, so the picker shows each one's token size. Read from `~/.kyklos` only, never from the workspace: a persona defines who the agent is, so a checked-out repository must not be able to name one. It goes into the prompt before the guardrails and `AGENTS.md`, which keeps the harness's own rules the last word, and a subagent doesn't inherit it — it gets a charter instead.
 
 **Models and thinking effort.** `/model` opens an arrow-key picker — ↑/↓, type to filter, Enter, Esc — then a second picker offers *that model's own* effort levels:
@@ -308,11 +326,11 @@ Claims to have run the tests, committed, pushed or installed are compared agains
 ## Tests
 
 ```bash
-./.venv/bin/python -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_commands
+./.venv/bin/python -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_commands test_skills
 ```
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_commands
+.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_commands test_skills
 ```
 
 ## Evals

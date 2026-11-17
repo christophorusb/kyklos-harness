@@ -278,6 +278,10 @@ keyword arguments, unchanged:
 | `image` | `path`, `rel`, `mime`, `width`, `height`, `bytes` | `generate_image` saved an image: `path` is absolute, `rel` is workspace-relative. Sent before that call's `tool_result` |
 | `signal` | `kind`, plus `reason`, `left`, `repeats`, `size`, `report`, `count` | The harness stepping in: `nudge`, `budget_warning`, `repeat_warn`, `repeat_stop`, `redacted`, `parallel_batch`, `delegation_hint`, `truncated_call`, `map_note`, `images_sent`, `stopped_report` |
 
+`load_skill` uses ordinary tool call and result events and needs no permission request. Its result
+can contain skill instructions or bundled reference text. Render both as untrusted text (§1.4).
+Changes to project skill files use the standard per-call permissions (§5).
+
 **Nesting guarantee.** At each depth, a `tool_result` closes the most recent `tool_call` (and
 `call_id` makes that checkable). A `task` call's `tool_call` and `tool_result` bracket its
 subagent's `subagent_start` … `subagent_end`. Parallel explore tasks arrive one lane after
@@ -286,6 +290,7 @@ another, never interleaved.
 ### 7.2 Command output
 
 - `say {kind, text}`: `CommandContext.say`, where `kind` is `info`, `ok`, `warn` or `error`.
+  `/skills` lists the skills and any skipped definitions in an `info` message.
 - `view {name, data, fallback}`: `CommandContext.show` for `tokens`, `tools` and `diff`. A client
   that has no drawing for a view shows `fallback`, the plain text the REPL prints. A new view
   therefore works everywhere on the day it ships.

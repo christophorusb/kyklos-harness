@@ -23,7 +23,7 @@ from kyklos import (PRUNED_MARK, SUBAGENT_TOOLS, Agent, available_personas, choo
 from tools import MAX_PLAN_STEPS, ToolError, Tools, probe_commands
 
 
-def tool_call(call_id, name, **args):
+def tool_call(call_id, name, /, **args):
     return SimpleNamespace(
         id=call_id, type="function",
         function=SimpleNamespace(name=name, arguments=json.dumps(args)),
