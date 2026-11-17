@@ -4,6 +4,7 @@ Run:  python -m unittest test_kyklos -v
 """
 
 import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -12,6 +13,10 @@ from unittest import mock
 from types import SimpleNamespace
 
 from openai import APIConnectionError
+
+# Workspace snapshots cost a few git calls per turn. They're tested where undo is (they pass
+# workspace_snapshots=True); everywhere else they'd only slow the suite. Set before kyklos reads it.
+os.environ.setdefault("KYKLOS_SNAPSHOTS", "0")
 
 from kyklos import (PRUNED_MARK, SUBAGENT_TOOLS, Agent, available_personas, choose_persona,
                     choose_stream, collect_stream, error_detail, persona_path, preview)

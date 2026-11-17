@@ -10,7 +10,7 @@ A small coding-agent harness (~4,200 lines of Python, plus ~2,900 lines of tests
 - Six tools: `read_file`, `grep`, `glob`, `write_file`, `edit_file`, `bash` — plus `task` for subagents.
 - **Subagents** with their own empty context, so a long search costs the main conversation one result instead of every file read. Routable to a cheaper model with `/submodel`.
 - **Plan mode** (`/plan`) — read-only, for working out an approach before touching anything.
-- **Undo** (`/undo`) reverts a turn's conversation *and* its file edits.
+- **Undo** (`/undo`) reverts a turn's conversation *and* its file changes — including the ones its commands made, from a snapshot of the workspace.
 - Sessions save and resume per folder; `continue` picks up a turn that hit the step cap.
 - **Images** for models that take them: `read_file` shows the model a PNG, JPEG or WebP, and `@path/to/shot.png` in a message attaches one.
 - **Image generation** (`generate_image`) when an image provider is set up: the model writes a prompt, you approve it, and the image is saved in the workspace.
@@ -82,6 +82,7 @@ Kyklos works in the folder you launch it from. Set `WORKSPACE` in `.env` to pin 
 | `CONTEXT_WINDOW` | Override the detected window. Lower is faster and cheaper |
 | `COMPACT_ABOVE` | Compact once the conversation passes this many tokens (default 100000) |
 | `MAX_STEPS` | Model turns one request may take (default 50) |
+| `KYKLOS_SNAPSHOTS` | `0` limits `/undo` to the file tools' edits, without snapshotting the workspace (see [Undo](#how-it-works)) |
 | `KYKLOS_TRACE` | `0` turns off the session trace; a path writes it there instead (see [Evals](#evals)) |
 | `STREAM` | Stream the API call (default on). Transport only — nothing on screen changes. `0` to disable |
 | `SUBAGENT_MODEL`, `SUBAGENT_EFFORT` | Route subagents to a faster or cheaper model |
@@ -139,7 +140,7 @@ Type `/help` for the commands; Tab completes them.
 | Command | What it does |
 |---|---|
 | `/plan [task]` | Toggle read-only plan mode, or plan one task in it |
-| `/undo` | Revert the last turn's conversation and file edits |
+| `/undo` | Revert the last turn's conversation and the files it changed, by tools or commands |
 | `/save [file]`, `/resume [file]` | Save or load a JSONL session |
 | `/model [name]` | Pick the model, then its thinking effort. `--refresh` reloads the list |
 | `/effort [level]` | Change the thinking effort for the current model |
@@ -194,6 +195,7 @@ Piped or scripted runs use the plain REPL automatically.
 |---|---|
 | `kyklos.py` | The agent loop, system prompt, permission rules, command registry, plain REPL |
 | `tools.py` | Tool schemas, their implementations, the repository map, the environment probe |
+| `snapshots.py` | Workspace snapshots in a private git store, so `/undo` covers what commands changed |
 | `ui.py` | Kyklos Aero: renders the Agent's events, the permission panel, the prompt and status bar |
 | `kyklos`, `kyklos.cmd` | Launchers for macOS / Linux and Windows |
 | `test_kyklos.py`, `test_ui.py` | Offline tests: a scripted fake model drives the real loop and UI |
@@ -215,6 +217,8 @@ A reply without a tool call ends the turn, so three replies that aren't answers 
 **Generating images.** With an image provider set up in `.env` (`IMAGE_BASE_URL`, `IMAGE_API_KEY`, `IMAGE_MODEL`; all three or none), the model gets a `generate_image` tool: a prompt, a path in the workspace, and an optional size. The image provider is separate from the chat provider and never borrows its settings, so any chat model can ask for images and one provider's key can't reach the other's host. `IMAGE_API=images` speaks the OpenAI Images API (OpenAI, xAI, Together and others); `IMAGE_API=chat` asks a chat-served image model for an image reply, as OpenRouter serves Gemini's. Every call asks you first, showing the full prompt, where it is going and that image models usually bill per image; `a` allows it for the rest of the session. Before anything is sent, Kyklos checks the arguments (a `.png`, `.jpg` or `.webp` path inside the workspace, never `.git/` or a secret file) and takes known secret values out of the prompt. What comes back must really be a PNG, JPEG or WebP under 20 MB, and the file's extension is changed to match its content if the provider chose another format. The file is written like any other write, so `/undo` removes it. The tool isn't offered in plan mode, to subagents or in `--eval`, which runs unattended and shouldn't spend money.
 
 An edit answers with the lines as they now read, and a miss with the closest text in the file and the first line where it differs, so neither costs a re-read. After a write, `.py`, `.json` and `.toml` files are parsed in-process and a file that no longer parses is flagged in the result; nothing is executed to find out. `bash` output past 20,000 characters is cut in the middle for the model and saved whole under `.kyklos/scratch/output/` (secrets scrubbed, newest 20 kept), where it can be searched by path instead of run again.
+
+**Undo.** Each turn snapshots the workspace when it starts and when it ends, as git trees in a private store of Kyklos's own: a fresh temporary folder, removed when Kyklos exits. The workspace's own `.git` is never read or written, and none of your git setup applies (no hooks, filters, or line-ending conversion), so files come back byte for byte with their permissions and symlinks. `/undo` puts back every path that changed between the two — by `write_file` and `edit_file`, by a `sed -i`, an `rm`, a generator or a subagent alike — except a file that changed again after the turn ended: that change was yours, so it is left alone and named. Snapshots skip what Kyklos skips everywhere (`.venv`, `node_modules`, …), what the workspace's `.gitignore` ignores, `.kyklos/`, and secret files, whose contents are never copied; the file tools' own record still covers their writes to anything snapshots can't see. Files outside the workspace aren't covered. Without git, in your home folder or a drive root, or with `KYKLOS_SNAPSHOTS=0`, `/undo` reverts only the file tools' edits and says so. A snapshot costs two quick git calls per turn: git rehashes only the files whose size or modification time changed.
 
 **Subagents.** `task` hands a self-contained job to a fresh `Agent` with an empty context; only its answer comes back. `explore` mode is read-only and never asks permission; `general` can also edit and run commands. Subagents can't nest. Explore tasks sent in one message run at the same time, up to four at once, since they only read and never ask; anything else runs one at a time. The interface still draws one subagent after another: the others' steps are held back and replayed when their turn comes, each with its real duration. A subagent whose API call fails comes back as a failed tool call the parent can act on, rather than ending the turn. One that is stopped — by the step cap, or for repeating itself — is asked for a report of what it found, so its work reaches the parent as a partial answer rather than being lost. Route them elsewhere with `/submodel`, `SUBAGENT_MODEL`, or `--submodel`; the `task` line names the model when it differs. In a live test a subagent took 12 steps and read five files while the main context stayed at 6%.
 
@@ -275,11 +279,11 @@ Claims to have run the tests, committed, pushed or installed are compared agains
 ## Tests
 
 ```bash
-./.venv/bin/python -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen
+./.venv/bin/python -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots
 ```
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen
+.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots
 ```
 
 ## Evals

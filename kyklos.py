@@ -25,6 +25,7 @@ from types import SimpleNamespace
 from openai import APIConnectionError, APITimeoutError, InternalServerError, OpenAI, RateLimitError
 
 from imagegen import ImageError, ImageGenerator, image_config
+from snapshots import SnapshotError, WorkspaceSnapshots
 from tools import (SAFE_TOOLS, SCHEMAS, SHELL_NAME, ToolError, Tools, _match_edit, apply_edits, command_touches_secret,
                    edit_list,
                    GENERATED_IMAGE_SUFFIXES, describe_image, hide_env_names, image_info, load_image,
@@ -2320,7 +2321,8 @@ class Agent:
                  subagent_context_window: int | None = None, persona: str | None = None,
                  home: Path | None = None, stream: bool = True, notices_seen: set | None = None,
                  vision: bool | None = None, vision_override: bool | None = None,
-                 subagent_vision: bool | None = None, images: "ImageGenerator | None" = None):
+                 subagent_vision: bool | None = None, images: "ImageGenerator | None" = None,
+                 workspace_snapshots: bool | None = None):
         self.client = client
         self.model = model
         # Whether the model takes images: what the provider says (None: it didn't say), and the
@@ -2328,6 +2330,13 @@ class Agent:
         self.model_vision = vision
         self.vision_override = vision_override
         self.active_snapshots: dict[Path, bytes | None] | None = None
+        # Trees of the whole workspace, so /undo covers what commands changed too. Opened on the
+        # first turn; None until then, and for good once it can't be (snapshots_off says why).
+        self.snapshots: WorkspaceSnapshots | None = None
+        if workspace_snapshots is None:
+            workspace_snapshots = choose_snapshots(os.environ)
+        self.snapshots_off: str | None = None if workspace_snapshots else "KYKLOS_SNAPSHOTS is off"
+        self.last_undo: dict = {"left_alone": [], "uncovered": None}
         self._before_write = before_write or self._record_file_snapshot
         self.tools = Tools(workspace, before_write=self._before_write, sees_images=self.sees_images,
                            image_delegate=self.image_delegate)
@@ -2685,6 +2694,7 @@ class Agent:
         self.current_request = None  # the user message this turn is answering; never summarized away
         self.turn_log: list[tuple[str, str]] = []  # (request, final answer) of finished turns
         self.undo_stack: list[tuple[list, tuple | None, list, dict[Path, bytes | None]]] = []
+        self.turn_trees: list[list[str | None]] = []  # [start, end] workspace tree per undo_stack entry
         self.last_bash: tuple[str, str] | None = None  # the newest command that ran, and its result
         self.tools.plan_steps, self.tools.plan_active = [], 0  # a plan belongs to its conversation
 
@@ -2710,20 +2720,68 @@ class Agent:
                          f"$ {command[:300]}\n{tail}")
         return "\n\n".join(parts)
 
+    def _workspace_tree(self) -> str | None:
+        """The workspace as a snapshot tree, or None when snapshots aren't available."""
+        if self.depth != 0 or self.snapshots_off:
+            return None
+        if self.snapshots is None:
+            if is_broad_folder(self.tools.workspace):
+                self.snapshots_off = "this is your home folder or a drive root, too much to snapshot"
+                return None
+            try:
+                self.snapshots = WorkspaceSnapshots.open(self.tools.workspace)
+            except (SnapshotError, OSError) as e:
+                self.snapshots_off = str(e)
+                return None
+        tree = self.snapshots.snapshot()
+        if tree is None:
+            self._snapshots_failed(self.snapshots.disabled)
+        return tree
+
+    def _snapshots_failed(self, reason: str | None) -> None:
+        self.snapshots_off = reason or "the workspace couldn't be read"
+        if self.cancel is not None and self.cancel.is_set():
+            return  # called from send()'s finally: _emit would raise over the turn's own exception
+        self._emit("notice", text=f"/undo can no longer revert changes made by commands, only by "
+                                  f"the file tools: {self.snapshots_off}.")
+
     def undo(self) -> list[str] | None:
-        """Revert the last turn's conversation and any file changes it made via write_file/edit_file.
+        """Revert the last turn's conversation and the file changes it made.
+
+        Whatever changed in the workspace between the turn's start and end goes back, by commands as
+        well as the file tools, except files changed again since the turn ended: those are yours,
+        and are left alone and named in last_undo. Without snapshots (no git, or a workspace too
+        large), only write_file/edit_file changes are reverted, and last_undo says why.
         Returns sorted workspace-relative paths reverted, or None if there is nothing to undo."""
         if not self.undo_stack:
             return None
+        undone = self.messages
         self.messages, self.usage_mark, self.turn_log, snapshots = self.undo_stack.pop()
-        reverted = []
-        for p, old_bytes in snapshots.items():
+        undone = undone[len(self.messages):]
+        start, end = self.turn_trees.pop() if self.turn_trees else (None, None)
+        self.last_undo = {"left_alone": [], "uncovered": None}
+        reverted: set[str] = set()
+        by_tools = {self.tools._rel(p): (p, old) for p, old in snapshots.items()}
+        if self.snapshots is not None and start and end:
+            try:
+                # The file tools' own record is only needed for what snapshots can't see.
+                unseen = self.snapshots.ignored(sorted(by_tools))
+                done, kept = self.snapshots.restore(start, end)
+                reverted.update(done)
+                self.last_undo["left_alone"] = kept
+                by_tools = {rel: v for rel, v in by_tools.items() if rel in unseen}
+            except (SnapshotError, OSError) as e:
+                self._snapshots_failed(str(e))
+                self.last_undo["uncovered"] = self.snapshots_off
+        elif _ran_commands(undone):  # otherwise the file tools' record was the whole story
+            self.last_undo["uncovered"] = self.snapshots_off or "this turn has no snapshot"
+        for rel, (p, old_bytes) in by_tools.items():
             if old_bytes is None:
                 p.unlink(missing_ok=True)
             else:
                 p.parent.mkdir(parents=True, exist_ok=True)
                 p.write_bytes(old_bytes)
-            reverted.append(self.tools._rel(p))
+            reverted.add(rel)
         return sorted(reverted)
 
     def save_session(self, path: Path) -> None:
@@ -3125,6 +3183,7 @@ class Agent:
                 snapshots,
             ))
             self.active_snapshots = snapshots
+            self.turn_trees.append([self._workspace_tree(), None])
         answer, self.last_outcome = None, "error"
         try:
             answer = self._send_turn(user_text, preface)
@@ -3135,6 +3194,8 @@ class Agent:
         finally:
             if self.depth == 0:
                 self.active_snapshots = None
+                if self.turn_trees and self.turn_trees[-1][0]:
+                    self.turn_trees[-1][1] = self._workspace_tree()
             if self.cancel is None or not self.cancel.is_set():
                 self._emit("turn_end", steps=self.last_steps, outcome=self.last_outcome,
                            answer_chars=len(answer or ""), claims=len(self.last_claims))
@@ -3507,6 +3568,22 @@ def choose_stream(env) -> bool:
     if value in ("0", "false", "no", "off"):
         return False
     raise ValueError(f"STREAM must be 1 or 0 (got {env['STREAM']!r})")
+
+
+def _ran_commands(messages: list) -> bool:
+    """Whether these messages hold a bash call, or a task call whose subagent could have made one."""
+    return any((call.get("function") or {}).get("name") in ("bash", "task")
+               for m in messages if isinstance(m, dict) for call in (m.get("tool_calls") or []))
+
+
+def choose_snapshots(env) -> bool:
+    """Whether /undo snapshots the whole workspace (KYKLOS_SNAPSHOTS, default on). See snapshots.py."""
+    value = str(env.get("KYKLOS_SNAPSHOTS", "")).strip().lower()
+    if value in ("", "1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"KYKLOS_SNAPSHOTS must be 1 or 0 (got {env['KYKLOS_SNAPSHOTS']!r})")
 
 
 def choose_max_steps(env) -> int:
@@ -4161,6 +4238,11 @@ def _cmd_undo(ctx, arg):
         return
     ctx.agent.save_session(ctx.default_session)
     ctx.say("ok", f"Undid the last turn ({'reverted files: ' + ', '.join(reverted) if reverted else 'no files were changed'}).")
+    report = ctx.agent.last_undo
+    if report["left_alone"]:
+        ctx.say("warn", "Left alone, since they changed again after that turn: " + ", ".join(report["left_alone"]))
+    if report["uncovered"]:
+        ctx.say("warn", f"Changes made by commands weren't reverted, only the file tools' ({report['uncovered']}).")
 
 
 @command("save", "/save [file]", "Save the session (default ~/.kyklos/projects/<this folder>/last.jsonl)")
