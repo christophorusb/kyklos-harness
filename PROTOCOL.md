@@ -170,6 +170,10 @@ same command without the `rm` would come with `"prefix": "make"` and `"choices":
   Colour alone never carries the level (DESIGN.md §1.2).
 - `choices` is the exact set the terminal offers for this call: `y`, `n`, plus `p` when there is a
   prefix, plus `a` when the call touches no secret and has no danger or opaque finding.
+- For an MCP call, `tool` is the model-facing alias and `args` contains `server`, `tool` (the
+  original tool name), and `arguments` (the call's arguments). `display.kind` is `args`.
+  Show the server and original tool name alongside its arguments. An `a` grant applies only to
+  that tool for the session. MCP server processes run outside Kyklos's command sandbox.
 
 Result: `{"answer": "y" | "n" | "a" | "p", "prefix": string?, "reason": string?}`. `prefix`
 overrides the suggested one for `p`; `reason` goes to the model with a denial (`denial_note`).
@@ -282,6 +286,9 @@ keyword arguments, unchanged:
 can contain skill instructions or bundled reference text. Render both as untrusted text (§1.4).
 Changes to project skill files use the standard per-call permissions (§5).
 
+MCP calls and results use the same events. MCP results and stderr are redacted before delivery
+and remain untrusted data for rendering.
+
 **Nesting guarantee.** At each depth, a `tool_result` closes the most recent `tool_call` (and
 `call_id` makes that checkable). A `task` call's `tool_call` and `tool_result` bracket its
 subagent's `subagent_start` … `subagent_end`. Parallel explore tasks arrive one lane after
@@ -291,9 +298,12 @@ another, never interleaved.
 
 - `say {kind, text}`: `CommandContext.say`, where `kind` is `info`, `ok`, `warn` or `error`.
   `/skills` lists the skills and any skipped definitions in an `info` message.
+  `/mcp` reports server status and recent stderr through the same message.
 - `view {name, data, fallback}`: `CommandContext.show` for `tokens`, `tools` and `diff`. A client
   that has no drawing for a view shows `fallback`, the plain text the REPL prints. A new view
   therefore works everywhere on the day it ships.
+  The `tools` view includes `mcp_schema_tokens`, and the `tokens` view includes an MCP schema row
+  when MCP tools are offered.
 
 ### 7.3 `session/state`
 

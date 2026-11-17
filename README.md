@@ -15,6 +15,7 @@ A small coding-agent harness (~4,200 lines of Python, plus ~2,900 lines of tests
 - Sessions save and resume per folder; `continue` picks up a turn that hit the step cap.
 - **Custom slash commands** turn reusable Markdown prompts into commands you can run from the prompt.
 - **Skills** give the model a short catalog of instruction packs it can load when relevant.
+- **MCP tools** connect the model to stdio servers you configure.
 - **Images** for models that take them: `read_file` shows the model a PNG, JPEG or WebP, and `@path/to/shot.png` in a message attaches one.
 - **Image generation** (`generate_image`) when an image provider is set up: the model writes a prompt, you approve it, and the image is saved in the workspace.
 
@@ -154,6 +155,7 @@ Type `/help` for the commands; Tab completes them.
 | `/tokens` | What fills the context window, the session's billed tokens, the prompt-cache hit rate, when compaction hits |
 | `/tools` | The tools the model can call now, and the rules that auto-approve them |
 | `/skills` | List installed skills, their sources and estimated sizes, and skipped definitions |
+| `/mcp [restart <server>]` | Show MCP server status, PID, tool count, schema cost and recent stderr, or restart one server |
 | `/diff` | What Kyklos has changed in the workspace this session |
 | `/map` | The workspace sketch the model starts each turn with |
 | `/reset` | Clear the conversation |
@@ -201,6 +203,7 @@ Piped or scripted runs use the plain REPL automatically.
 |---|---|
 | `kyklos.py` | The agent loop, system prompt, permission rules, command registry, plain REPL |
 | `extensions.py` | Markdown headers, skill discovery, and bundled reference reads |
+| `mcp_client.py` | Stdio MCP configuration, process lifecycle, and tool discovery and calls |
 | `tools.py` | Tool schemas, their implementations, the repository map, the environment probe |
 | `snapshots.py` | Workspace snapshots in a private git store, so `/undo` covers what commands changed |
 | `ui.py` | Kyklos Aero: renders the Agent's events, the permission panel, the prompt and status bar |
@@ -277,6 +280,42 @@ requires no approval. Changes inside `.agents/skills/` require approval each tim
 script from a skill goes through the ordinary `bash` approval rules. Paths to scripts in user
 skills typically sit outside the workspace, so expect them to be flagged.
 
+**MCP tools.** Configure servers in `~/.kyklos/mcp.json` (or under `KYKLOS_HOME`). Kyklos only
+loads this file from outside the workspace. Each entry in `mcpServers` names one program with a
+`command` and optional `args` and `env`. The child starts from Kyklos's filtered command
+environment. An `env` value such as `"${SERVICE_TOKEN}"` forwards that variable to that server,
+and Kyklos redacts the value from its output and diagnostics.
+
+```json
+{
+  "mcpServers": {
+    "catalog": {
+      "command": "python3",
+      "args": ["/absolute/path/to/catalog_server.py"],
+      "env": {"SERVICE_TOKEN": "${SERVICE_TOKEN}"},
+      "readOnly": ["lookup"],
+      "timeout": 120
+    }
+  }
+}
+```
+
+MCP servers run **unsandboxed** with your account's filesystem and network access. Kyklos starts
+them from the user configuration directory and stops them when it exits. Each call needs
+approval unless you add its original tool name to the server's `autoApprove` list or choose
+`a` for that tool in the current session. The server's `readOnly` list controls which tools
+appear in plan mode. Both lists come from your configuration. `timeout` is in seconds and defaults
+to 120. Subagents and `--eval` run without MCP tools.
+
+`/reset` applies pending tool list updates. `/mcp restart <server>` starts that server again with
+the session's configuration and refreshes its tools. Restart Kyklos to load configuration edits.
+`/tools` and `/tokens` show the schema cost. Kyklos warns when the offered MCP schemas use more than
+10% of the context window.
+
+This version supports tools over stdio with the `2025-11-25`, `2025-06-18`, `2025-03-26` and
+`2024-11-05` initialization handshakes. HTTP, SSE, OAuth, resources, prompts, sampling, and roots
+are outside its scope. [MCP initialization lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle).
+
 **Personas.** A persona is a prompt layer the user chooses — an architect, a read-only auditor — kept as `~/.kyklos/personas/<name>.md` and selected with `--persona`, `/persona` or `KYKLOS_PERSONA`. It is a system-prompt section, so switching mid-session keeps the conversation and only costs the next request; it is re-sent on every step, so the picker shows each one's token size. Read from `~/.kyklos` only, never from the workspace: a persona defines who the agent is, so a checked-out repository must not be able to name one. It goes into the prompt before the guardrails and `AGENTS.md`, which keeps the harness's own rules the last word, and a subagent doesn't inherit it — it gets a charter instead.
 
 **Models and thinking effort.** `/model` opens an arrow-key picker — ↑/↓, type to filter, Enter, Esc — then a second picker offers *that model's own* effort levels:
@@ -326,11 +365,11 @@ Claims to have run the tests, committed, pushed or installed are compared agains
 ## Tests
 
 ```bash
-./.venv/bin/python -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_commands test_skills
+./.venv/bin/python -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_commands test_skills test_mcp
 ```
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_commands test_skills
+.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_commands test_skills test_mcp
 ```
 
 ## Evals

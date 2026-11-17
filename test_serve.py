@@ -102,7 +102,7 @@ class ServeTestCase(unittest.TestCase):
                 pass
         self.tmp.cleanup()
 
-    def serve(self, replies, script, start_params=None):
+    def serve(self, replies, script, start_params=None, agent_kwargs=None):
         """Handshake, then run the agent until `script(client)` (on its own thread) is done with it."""
         fake = FakeClient(replies)
         failures = []
@@ -126,8 +126,11 @@ class ServeTestCase(unittest.TestCase):
                                    "commands": [], "profiles": [], "profile": None})
         self.assertIsNotNone(start)
         agent = Agent(fake, "fake", self.ws, permission=self.ui.permission, ask=self.ui.ask_user,
-                      on_event=self.ui.observer)
-        self.ui.run(agent, self.session)
+                      on_event=self.ui.observer, **(agent_kwargs or {}))
+        try:
+            self.ui.run(agent, self.session)
+        finally:
+            agent.close()
         thread.join(WAIT)
         if failures:
             raise failures[0]

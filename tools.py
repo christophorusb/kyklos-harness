@@ -118,15 +118,16 @@ BEARER_RE = re.compile(r"\b(bearer\s+)((?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/=
 CONTEXT_SECRET_PATTERNS = (URI_PASSWORD_RE, URI_TOKEN_USER_RE, AUTH_HEADER_RE, BEARER_RE)
 
 
-def kill_process_tree(process: subprocess.Popen) -> None:
+def kill_process_tree(process: subprocess.Popen, group: int | None = None) -> None:
     """Stop a command and everything it started (SEC-06). Killing only the shell leaves its children,
-    like a dev server or a Start-Process, running on their own."""
+    like a dev server or a Start-Process, running on their own. When known, the group ID also
+    reaches descendants after the leader exits."""
     try:
         if IS_WINDOWS:
             subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)], capture_output=True, timeout=15)
         else:
             import signal
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            os.killpg(group if group is not None else os.getpgid(process.pid), signal.SIGKILL)
     except (OSError, subprocess.SubprocessError):
         pass
     if process.poll() is None:

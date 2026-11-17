@@ -798,8 +798,10 @@ class AeroUI:
                                style="sun" if data["plan_mode"] else ""),
                 self._view_row("tools", ", ".join(data["tools"]), style="aqua"),
                 self._view_row("no approval", ", ".join(data["safe"]) or "none"),
-                self._view_row("sandbox", sandbox, style="mint" if sandbox_on else "sun"),
-                Text("")]
+                self._view_row("sandbox", sandbox, style="mint" if sandbox_on else "sun")]
+        if data.get("mcp_schema_tokens"):
+            rows.append(self._view_row("MCP schemas", f"~{data['mcp_schema_tokens']:,} tokens"))
+        rows.append(Text(""))
         if data["rules"]:
             rows.append(Text("always allowed for the rest of this session", style="frost"))
             for kind, value in data["rules"]:
