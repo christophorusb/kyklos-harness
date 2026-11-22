@@ -7,10 +7,10 @@ A small coding-agent harness (~4,200 lines of Python, plus ~2,900 lines of tests
 ## Features
 
 **The loop**
-- Six tools: `read_file`, `grep`, `glob`, `write_file`, `edit_file`, `bash` — plus `task` for subagents.
+- Six workspace tools (`read_file`, `grep`, `glob`, `write_file`, `edit_file`, `bash`) — plus `code_graph` for codebase dependency and blast-radius queries, and `task` for subagents.
 - **Questions mid-turn** (`ask_user`): when the model is blocked on a decision that's yours, it asks and carries on with the answer, instead of guessing or ending the turn.
-- **Subagents** with their own empty context, so a long search costs the main conversation one result instead of every file read. Routable to a cheaper model with `/submodel`.
-- **Plan mode** (`/plan`) — read-only, for working out an approach before touching anything.
+- **Subagents** with their own empty context, so a long search costs the main conversation one result instead of every file read. `explore` tasks can chain via `id` and `depends_on` in topological waves, or route to a cheaper model with `/submodel`.
+- **Plan mode** (`/plan`) — read-only, for working out an approach before touching anything; `plan` accepts linear steps or a validated task DAG (`id` / `depends_on`).
 - **Undo** (`/undo`) reverts a turn's conversation *and* its file changes — including the ones its commands made, from a snapshot of the workspace.
 - Sessions save and resume per folder; `continue` picks up a turn that hit the step cap.
 - **Custom slash commands** turn reusable Markdown prompts into commands you can run from the prompt.
@@ -20,8 +20,8 @@ A small coding-agent harness (~4,200 lines of Python, plus ~2,900 lines of tests
 - **Image generation** (`generate_image`) when an image provider is set up: the model writes a prompt, you approve it, and the image is saved in the workspace.
 
 **Keeping turns cheap**
-- **Context compaction** in two stages: clear old tool results, then summarise — triggered at 75% of the window *or* `COMPACT_ABOVE` tokens, whichever comes first.
-- **A workspace sketch** in the system prompt, so turn one doesn't start blind.
+- **Context compaction** in two stages: clear old tool results, then summarise — triggered at 75% of the window *or* `COMPACT_ABOVE` tokens, whichever comes first — backed by a persistent `graph.json` knowledge overlay so reads, edits, blast radius and pinned notes survive summary truncation.
+- **A workspace sketch** in the system prompt, ranked by PageRank centrality, so turn one doesn't start blind.
 - **Token accounting** per session, shown live in the status bar.
 
 **Knowing what's happening**
@@ -163,6 +163,7 @@ Type `/help` for the commands; Tab completes them.
 | `/mcp [restart <server>]` | Show MCP server status, PID, tool count, schema cost and recent stderr, or restart one server |
 | `/diff` | What Kyklos has changed in the workspace this session |
 | `/map` | The workspace sketch the model starts each turn with |
+| `/graph [path]` | Show the workspace dependency graph, PageRank centrality, blast radius and pinned notes |
 | `/reset` | Clear the conversation |
 | `/exit` | Quit (or Ctrl+C twice at an empty prompt) |
 | `/<name> [args]` | Run a custom Markdown prompt from your user or project commands folder |
@@ -180,7 +181,7 @@ In `u` mode a command still asks if it carries a red finding, names a secret fil
 
 The choice is never remembered, and the status bar carries `bash: unflagged runs` while it's on.
 
-**Where Kyklos keeps its data:** `~/.kyklos` (or `KYKLOS_HOME`) — `trusted.json`, `settings.json`, a day-cached `models.json`, and `projects/<folder-slug>/` holding each folder's last session and input history.
+**Where Kyklos keeps its data:** `~/.kyklos` (or `KYKLOS_HOME`) — `trusted.json`, `settings.json`, a day-cached `models.json`, and `projects/<folder-slug>/` holding each folder's last session, input history and `graph.json` knowledge overlay.
 
 ## The interface: Kyklos Aero
 
@@ -207,13 +208,14 @@ Piped or scripted runs use the plain REPL automatically.
 | File | Role |
 |---|---|
 | `kyklos.py` | The agent loop, system prompt, permission rules, command registry, plain REPL |
+| `graph.py` | Multi-language dependency graph, PageRank centrality, persistent `graph.json` overlay, and Task DAG validation |
 | `extensions.py` | Markdown headers, skill discovery, and bundled reference reads |
 | `mcp_client.py` | Stdio MCP configuration, process lifecycle, and tool discovery and calls |
 | `tools.py` | Tool schemas, their implementations, the repository map, the environment probe |
 | `snapshots.py` | Workspace snapshots in a private git store, so `/undo` covers what commands changed |
 | `ui.py` | Kyklos Aero: renders the Agent's events, the permission panel, the prompt and status bar |
 | `kyklos`, `kyklos.cmd` | Launchers for macOS / Linux and Windows |
-| `test_kyklos.py`, `test_ui.py` | Offline tests: a scripted fake model drives the real loop and UI |
+| `test_kyklos.py`, `test_ui.py`, `test_graph.py` | Offline tests: a scripted fake model drives the real loop, UI and graph tooling |
 | `eval.py`, `evals/`, `test_eval.py` | Fixture tasks run against a real model, and the offline tests that keep their checks honest |
 | `DESIGN.md`, `design/aero_preview.py` | The UI design system, and a dependency-free preview of it |
 
@@ -223,7 +225,7 @@ The `Agent` never prints: it emits events (`model_start`, `tool_call`, `tool_res
 
 A reply without a tool call ends the turn, so three replies that aren't answers get one nudge (one per turn in total) instead: an empty reply, a tool call written out as text (which runs nothing), and an answer given while the plan still has steps never started. Each is told from the reply and Kyklos's own state, and each shows as a notice, so you see when it happened.
 
-**Tools.** `read_file` (with line numbers), `grep`, `glob`, `write_file`, `edit_file` (unique string replacement, tolerant of trailing whitespace and indentation shifts), `bash` (PowerShell on Windows). Search skips `.git`, `.venv`, `node_modules` and binary files.
+**Tools.** `read_file` (with line numbers), `grep`, `glob`, `write_file`, `edit_file` (unique string replacement, tolerant of trailing whitespace and indentation shifts), `code_graph` (read-only dependency, blast-radius, shortest-path, linked-test and pinned-note queries across Python, JS/TS, Go and Rust; available in plan mode too, while excluding secret files and outside symlinks), `plan` (accepts linear short steps or validated `{id, step, depends_on?}` DAG step objects), and `bash` (PowerShell on Windows). Search skips `.git`, `.venv`, `node_modules` and binary files.
 
 `grep` takes `context` (lines around each match, written as `grep -n -C` writes them) and `output` (`files` or `count` when the matching lines themselves aren't needed). `edit_file` takes `replace_all`, or a list of `edits` applied in order and all-or-nothing, shown as one diff to approve.
 
@@ -237,7 +239,7 @@ An edit answers with the lines as they now read, and a miss with the closest tex
 
 **Questions.** `ask_user` puts one question to you without ending the turn: a panel with the question and up to six numbered options, answered on one line. A number picks an option (several, comma-separated, when the model allows more than one), anything else is your own answer, and Enter alone skips; the answer goes back to the model as the tool result. Asking needs no approval, since answering is already your call. The model is told to ask only about decisions that are yours to make — not for permission, not to confirm a plan it can carry out, not for anything its tools can find out — and a turn may ask at most three. It's offered in plan mode, where ambiguities get settled, and never to subagents, which answer to another agent: one that tries is told to make the most reasonable assumption and name it in its report. With nobody to answer (a piped run, `--eval`), the model is told so and to go on and state what it assumed.
 
-**Subagents.** `task` hands a self-contained job to a fresh `Agent` with an empty context; only its answer comes back. `explore` mode is read-only and never asks permission; `general` can also edit and run commands. Subagents can't nest. Explore tasks sent in one message run at the same time, up to four at once, since they only read and never ask; anything else runs one at a time. The interface still draws one subagent after another: the others' steps are held back and replayed when their turn comes, each with its real duration. A subagent whose API call fails comes back as a failed tool call the parent can act on, rather than ending the turn. One that is stopped — by the step cap, or for repeating itself — is asked for a report of what it found, so its work reaches the parent as a partial answer rather than being lost. Route them elsewhere with `/submodel`, `SUBAGENT_MODEL`, or `--submodel`; the `task` line names the model when it differs. In a live test a subagent took 12 steps and read five files while the main context stayed at 6%.
+**Subagents.** `task` hands a self-contained job to a fresh `Agent` with an empty context; only its answer comes back. `explore` mode is read-only and never asks permission; `general` can also edit and run commands. Subagents can't nest. Explore tasks sent in one message run at the same time, up to four at once, since they only read and never ask; anything else runs one at a time. Explore tasks can also declare `id` and `depends_on` to run in topological waves (`validate_dag`), forwarding completed prerequisite outputs into downstream tasks and rejecting cycles. The interface still draws one subagent after another: the others' steps are held back and replayed when their turn comes, each with its real duration. A subagent whose API call fails comes back as a failed tool call the parent can act on, rather than ending the turn. One that is stopped — by the step cap, or for repeating itself — is asked for a report of what it found, so its work reaches the parent as a partial answer rather than being lost. Route them elsewhere with `/submodel`, `SUBAGENT_MODEL`, or `--submodel`; the `task` line names the model when it differs. In a live test a subagent took 12 steps and read five files while the main context stayed at 6%.
 
 **Background subagents.** Opt in with `KYKLOS_BACKGROUND_SUBAGENTS=1` in the harness's `.env`,
 then restart Kyklos. The main agent can start one read-only job with `task_start`, continue
@@ -245,7 +247,7 @@ independent work, and collect the report with `task_wait` using the returned job
 two minutes to finish. The worker reads the live workspace, so use it for files the main agent
 can leave alone while it works. Stop cancels the job with the turn. Job IDs expire when the turn ends.
 
-**Workspace sketch.** The system prompt carries a generated list of source files and what each defines — names only, no signatures or line numbers, since a regex reading code gets names right and parameter lists wrong. Python names come from the real `ast`. Capped per file and overall (~340 tokens here). `/map` shows it.
+**Workspace sketch.** The system prompt carries a generated list of source files and what each defines — names only, no signatures or line numbers, since a regex reading code gets names right and parameter lists wrong. Linked modules are promoted by PageRank centrality (`graph.py`) so core dependencies surface first while unlinked files stay shallow-first; Python names come from the real `ast`. Capped per file and overall (~340 tokens here). `/map` shows the sketch and `/graph [path]` inspects the full dependency graph, blast radius and pinned notes.
 
 The sketch is scanned once per conversation and then left alone, because providers that cache prompts key the cache on the prefix: rewriting the system prompt after every turn that edited a file made each following request a cache miss from its first token. Files that change are named in a short note in front of your next message instead, and folded into the prompt when it is rewritten anyway (`/reset`, a resumed session, compaction). `/tokens` shows how much of the prompt the provider says it read from cache, when it says.
 
@@ -349,7 +351,7 @@ are outside its scope. [MCP initialization lifecycle](https://modelcontextprotoc
 
 **Context window.** `CONTEXT_WINDOW` wins if set; otherwise Ollama cloud is asked via `/api/show`; otherwise 128k. Local Ollama isn't asked — it reports the model's trained maximum while the server runs with a smaller limit, so set `CONTEXT_WINDOW` to `OLLAMA_CONTEXT_LENGTH`.
 
-**Compaction.** At 75% of the window *or* `COMPACT_ABOVE` tokens (100k), whichever is first, everything older than the most recent ~20% is shrunk: first by clearing old tool results (no API call, and usually enough), then by summarising — with the current request and a verbatim log of earlier requests and answers attached, so facts can't be lost to a weak summary. The current step is always kept whole and a tool call is never split from its result. A summary is also followed by where the work stands as Kyklos recorded it: the plan, the files written this session, and the last command if it failed. The plan is saved with the session too.
+**Compaction.** At 75% of the window *or* `COMPACT_ABOVE` tokens (100k), whichever is first, everything older than the most recent ~20% is shrunk: first by clearing old tool results (no API call, and usually enough), then by summarising — with the current request and a verbatim log of earlier requests and answers attached, so facts can't be lost to a weak summary. The current step is always kept whole and a tool call is never split from its result. A summary is also followed by where the work stands as Kyklos recorded it: the plan (linear steps or DAG), the files written this session, the last command if it failed, and the persistent `graph.json` knowledge overlay (tracking reads, edits, test runs, edited modules' blast-radius dependents, linked tests and pinned notes — reloaded automatically across sessions). The plan is saved with the session too.
 
 The absolute cap matters because every step re-sends the whole conversation: a 178k conversation costs 178k per step whether the ceiling is 128k or 1M. On a real 234-call session, capping at 100k would have cut prompt tokens **39%** (27.7M → 16.8M).
 
@@ -357,14 +359,14 @@ The absolute cap matters because every step re-sends the whole conversation: a 1
 
 ## Safety
 
-- `read_file`, `grep` and `glob` run without asking. Everything else asks first, after validating paths and edits and showing a diff: `y` once, `p` for a `bash` prefix rule, `a` for the session, `n` denies and sends your reason back to the model.
+- `read_file`, `grep`, `glob`, `plan` and `code_graph` run without asking. Everything else asks first, after validating paths and edits and showing a diff: `y` once, `p` for a `bash` prefix rule, `a` for the session, `n` denies and sends your reason back to the model.
 - **Every `bash` prompt says what the command would do** — what it deletes or overwrites, whether it reaches the network, inspects host posture (`lsof`, `crontab`, `systemsetup`, `profiles`, `fdesetup`, `socketfilterfw`, `launchctl`, `ps aux`), leaves the workspace, runs as administrator, or pipes a download into a shell. When connected to a remote `BASE_URL`, host and outside-workspace commands explicitly remind you which provider host will receive the output. A red finding turns the panel coral, removes `p` and `a`, and **always stops for approval even when `bash` was previously allowed for the session**. A yellow "can't read" finding (a program Kyklos has no rules for, inline code, a script whose contents aren't shown) removes `a` and stops for approval the same way, so one `a always bash` pressed on an ordinary prompt never covers unreadable commands; `p prefix` stays, since a prefix names exactly what you trusted. Kyklos works this out itself and never asks the model, since a model steered by text planted in a file would describe a destructive command as routine.
 - **OS-level command sandboxing** (`/tools` shows the active backend; where there is none, as on Windows or on Linux without `bwrap`, or with `KYKLOS_SANDBOX=off`, Kyklos says so at startup and in the bash-approval choice, since commands then run directly on your machine). On macOS (`sandbox-exec`) and Linux (`bwrap`, when installed), `bash` commands run inside a kernel sandbox: file writes are restricted to the workspace and temp directories (with `.git/hooks`, `.git/config`, `.husky`, `.vscode`, and `AGENTS.md` write-protected against shell tampering, and `.git` itself impossible to rename or replace; under `bwrap`, which can only hold an existing file read-only, any of these a command creates is moved to `.kyklos/quarantine/` and reported), sensitive host stores (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.kyklos`, the token stores of `gh`, `gcloud`, `az`, 1Password, gopass and pass, `~/.vault-token`, the cargo, RubyGems, Terraform and yarn credential files, Keychains, Cookies, browser profiles) **and your own document folders** (`~/Documents`, `~/Desktop`, `~/Downloads`, `~/Pictures`, `~/Movies`, `~/Videos`, `~/Music`) are unreadable even if approved — the workspace is readable even when it sits inside one of them, so a repo under `~/Desktop` works normally while its siblings stay out of reach — and outbound network access is denied by default unless you explicitly approve a command that declares network or package-install activity (`KYKLOS_SANDBOX_NET=1` keeps network open inside the sandbox; `KYKLOS_SANDBOX=off` disables OS sandboxing). On macOS, `KYKLOS_SANDBOX_PORTS=5173,4173` opens just those localhost ports, so a dev server — or a browser test against one — can run inside the sandbox without opening the network. It is off by default, takes single ports from 1024 up (no ranges), and `/tools` shows what is open. **It limits which ports, not which interface:** a server that listens on every interface (`0.0.0.0`, the default for Express and `python -m http.server`) is reachable from your network on that port while it runs, because no sandbox rule can restrict who a listener serves. Bind `127.0.0.1` (Vite's default), and know that whatever else already listens on a listed port is reachable from the sandbox too. Everything else — other ports, other hosts, the same port on another machine — stays refused. For the case where nothing in the sandbox needs to listen, `KYKLOS_SANDBOX_CONNECT=5173` is the safer variant: commands may *connect* to that localhost port and nothing may bind or accept on any, so it suits a dev server you start in your own terminal and a browser test or `curl` against it (Playwright's `reuseExistingServer`), and exposes nothing — there is no listener in the sandbox to reach. Whatever listens on that port is still reachable from the sandbox. Git settings are read-only inside the sandbox, because settings like `core.fsmonitor` and `core.hooksPath` are commands your own `git status` would later run unconfined: commits, branches, merges and tags work as usual, while `git init`, `git config`, `git remote add` and `git push -u` have to be run in your own terminal (Kyklos tells the model so when one fails). A tool that needs the macOS Keychain cannot find it from inside the sandbox (the folder is hidden on purpose), and macOS may answer with a **"Keychain Not Found" dialog** on your screen. If one appears, **click Cancel, never "Reset To Defaults"**: nothing is missing, and it is the sandbox that hides the keychain from the tool. Chrome started by hand raised one in testing, so give it `--use-mock-keychain --password-store=basic` (Playwright passes both itself); anything else that reads the Keychain can hit the same wall and is best run outside Kyklos. When a command fails mentioning the Keychain, or a hand-started Chrome times out, Kyklos tells the model all of this as well, so it stops retrying and tells you. On macOS, temp directories are writable but **not executable**: a command can download a payload into `/tmp` or `/var/folders` and cannot then run it, which is the second half of the `curl | sh` pattern. The workspace stays executable so builds can run what they compile; toolchains that compile into `$TMPDIR` and execute from there (`go test`) need `KYKLOS_SANDBOX_EXEC_TMP=1`.
 - Prefix rules for interpreters name what they run (`py -3 tools/build.py`, never bare `py`), and inline code (`py -c`, `node -e`, `bash -c`) never gets one.
 - Paths can't leave the workspace; `write_file` / `edit_file` refuse anything inside `.git/`, and persistent instruction or hook files (`AGENTS.md`, `.husky/`, `.pre-commit-config.yaml`, `.gitmodules`, `.vscode/{tasks,launch,settings}.json`), CI configuration that runs on push (`.github/workflows/`, `.github/actions/`, `.gitlab-ci.yml`, `.circleci/`, `.buildkite/`, `Jenkinsfile`, `.travis.yml`, `azure-pipelines.yml`, `bitbucket-pipelines.yml`) and `.envrc` always require per-call approval, from the file tools and from bash alike.
 - **Secret files** — `.env`, `.env.*` (bar `.example`/`.sample`/`.template`), `.npmrc`, `.pypirc`, `.netrc`, `.git-credentials`, `.pgpass`, `credentials.json`, `kubeconfig`, `*.tfvars`, `*.tfstate*`, `service-account*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.kdbx`, `id_rsa*`, `id_ed25519*`, `id_ecdsa*` — can't be read, written or edited, `grep` skips them, and a `bash` command naming one (including globs like `*.tfvars`) always asks, even with `bash` allowed for the session.
 - **Commands can't see secrets**, in the environment or in output: Kyklos's `.env` and anything named like a secret (`*_KEY`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*CREDENTIAL*`, `*_AUTH`, `*AUTHORIZATION`, `*_DSN`, `*_COOKIE`), or holding a URL with credentials in it (`DATABASE_URL=postgres://app:pw@db`, but not a password-less local one), is stripped from every command's environment (`KYKLOS_PASS_ENV` lets specific ones through), and values are redacted from tool output before the model or screen see them — secret-named values from both the host environment and the workspace's own `.env*` files, passwords in any URL, tokens used as a URL's user (Sentry DSNs, `https://<token>@github.com`), `Authorization:` header values and `Bearer` tokens, JWTs, `npm_…`, `pypi-…`, `hf_…`, `sk_live_…`, `sk-…`, `ghp_…`, `AKIA…`, `xox…`, `AIza…` and private-key blocks.
-- **Terminal & state hygiene.** Untrusted command strings and outputs have ANSI/OSC/APC/DCS escapes (such as OSC 52 clipboard writes and OSC 8 link spoofing) and bare carriage-return line overwrites stripped before rendering, and `~/.kyklos/` state files (`last.jsonl`, `history`, `settings.json`, `trusted.json`, `models.json`) are written with owner-only `0700`/`0600` permissions.
+- **Terminal & state hygiene.** Untrusted command strings and outputs have ANSI/OSC/APC/DCS escapes (such as OSC 52 clipboard writes and OSC 8 link spoofing) and bare carriage-return line overwrites stripped before rendering, and `~/.kyklos/` state files (`last.jsonl`, `history`, `graph.json`, `settings.json`, `trusted.json`, `models.json`) are written with owner-only `0700`/`0600` permissions.
 - The system prompt tells the model that file contents and command output are data, not instructions — planted directions get reported to you, not followed.
 - Ctrl+C or a timeout stops **the whole process tree**. `bash` gets no keyboard, so a command that would stop to ask something fails immediately instead of hanging; mid-turn, unfinished calls are marked "Interrupted" so the conversation stays valid.
 - Errors — bad path, ambiguous edit, timeout, invalid JSON — go back to the model as tool results, so it can correct itself.
@@ -383,11 +385,11 @@ Claims to have run the tests, committed, pushed or installed are compared agains
 ## Tests
 
 ```bash
-./.venv/bin/python -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_commands test_skills test_mcp
+./.venv/bin/python -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_commands test_skills test_mcp test_graph
 ```
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_commands test_skills test_mcp
+.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_commands test_skills test_mcp test_graph
 ```
 
 ## Evals
