@@ -382,6 +382,35 @@ The absolute cap matters because every step re-sends the whole conversation: a 1
 
 Claims to have run the tests, committed, pushed or installed are compared against what ran — and whether it *succeeded*, since a denied or failing command is as much a gap as none. It reports to you, never to the model, and only on past-tense claims, so advice and hedging stay quiet.
 
+## What Kyklos hands off
+
+Some work stays outside Kyklos, mostly because of how the sandbox and guardrails are built rather than for lack of time. For these, the model does what it can in the workspace (writes the code, the tests, the plan) and hands the rest to you, to do yourself or give to a larger agent such as Claude Code, Antigravity or Codex. Each of those has its own security model: a handoff moves the work into that model and does not make it safe, so look at what you hand over when it is sensitive.
+
+**Blocked on purpose**
+
+| Limit | Why | Hand off |
+|---|---|---|
+| **Browsers** | `GUARDRAILS.md` rule 7: a rendered page is untrusted input that can carry instructions | Visual checks, end-to-end and Playwright runs, screenshots of a running site, filling in forms. Kyklos writes the tests and ends its turn with the start command, URL, pages to check and expected results |
+| **Web research** | No web fetch or search tool; the sandbox cuts off the network, and any network command is red and needs approval | Reading docs, comparing libraries, checking API changes, looking up error messages online |
+| **GitHub and remotes** | `git init`, `git config`, `git remote add` and `git push -u` fail in the sandbox; `~/.ssh` and the `gh` token store are unreadable | Pushing, opening PRs, replying to review comments, watching and fixing CI, creating repos. Local commits and branches work |
+| **Your credentials** | Secret files are blocked, secrets are stripped from command environments, and `~/.aws`, `~/.kube`, `~/.docker` and Keychains are hidden | Deploys, cloud CLIs (`aws`, `gcloud`, `kubectl`, `docker push`), migrations on real databases, logged-in API calls, publishing packages |
+| **Keychain and signing** | The sandbox hides `~/Library/Keychains`, and rule 1 forbids `security` | Code signing, notarization, Xcode signing, App Store and TestFlight uploads |
+| **Privileges and host setup** | Rule 1 forbids `sudo`, `su`, `osascript` prompts and debuggers; installers are red network commands | System packages, `brew install`, toolchain setup, browser binaries, OS settings |
+| **GUI and device apps** | Rule 5 prefers headless runs, and there is no screen to drive | iOS and Android simulators, desktop app UI checks, menu-bar apps |
+| **Outside the workspace** | Paths can't leave the workspace, and sibling folders under `~/Desktop` and `~/Documents` are unreadable | Changes that span several repositories, or one Kyklos session per repository |
+
+**Limits of what's built today**
+
+| Limit | Detail | Hand off |
+|---|---|---|
+| **Long runs** | A `bash` call stops after 600 seconds and a turn after `MAX_STEPS` (50); nothing manages a process that keeps running | Builds or test suites over 10 minutes, watchers, multi-hour refactors, benchmarks |
+| **Parallel work** | Subagents can't nest; background subagents are read-only, one per turn, and get two minutes | Parallel work across branches or worktrees, large fan-out jobs, separate PRs at once |
+| **Scheduled or cloud runs** | Kyklos is a local process; `--eval` runs unattended but only on this machine | Nightly or recurring jobs, work in the cloud |
+| **No sandbox on some hosts** | Windows and Linux without `bwrap` have no OS sandbox, and the port allowlist is macOS only | On those hosts, risky or network-heavy work goes to a tool with its own sandbox |
+| **Model strength** | Kyklos runs whatever model `.env` names, often a local one; vision depends on the model or a vision submodel | Hard design calls, tricky debugging, security reviews and large reasoning tasks may need a stronger model, in Kyklos or elsewhere |
+
+Some things look like handoffs and aren't: edits to CI configuration, hooks, `AGENTS.md` and `.envrc`, `bash` commands Kyklos can't read, and `generate_image` only need your approval for each call. A network command can also run in Kyklos once you approve it, but that is an exception you grant each time, not the normal path.
+
 ## Tests
 
 ```bash
