@@ -227,6 +227,9 @@ def describe_call(name: str, args: dict) -> str:
     if name == "ask_user":
         question = sanitize_terminal_text(str(args.get("question", ""))).strip()
         return (question.splitlines() or [""])[0][:120]
+    if name == "handoff":
+        title = sanitize_terminal_text(str(args.get("title", ""))).strip()
+        return (title.splitlines() or [""])[0][:120]
     return sanitize_terminal_text(json.dumps(args, ensure_ascii=False))[:120]
 
 
@@ -268,6 +271,8 @@ def summarize_result(name: str, args: dict, result: str) -> tuple:
         if result.startswith("The user chose") or result.startswith("The user answered"):
             return status, "answered", [], ""
         return status, "skipped" if result.startswith("The user skipped") else "no one to answer", [], ""
+    if name == "handoff":
+        return status, "handed off", [], ""
     if name == "write_file":
         return status, "✓ written", [], ""
     if name == "edit_file":
@@ -713,6 +718,19 @@ class AeroUI:
         size = f"{width}{'x' if self.ascii else '×'}{height}, " if width and height else ""
         self.print(Text(f"{self.g['done']} saved {sanitize_terminal_text(rel)} ({size}{bytes / 1e6:.1f} MB)",
                         style="mint"), indent=4 + 4 * depth)
+
+    def _on_handoff(self, depth, title="", reason="", prompt="", **_):
+        """Work handed to the person: the prompt between two rules, with nothing beside it, so that
+        selecting it in the terminal copies the prompt and no border. Soft-wrapped for the same
+        reason: a hard wrap would put newlines into the copy that the model never wrote."""
+        rule, dot = self.g["rule"], self.g["dot"]
+        head = Text(f"{rule * 2} handoff {dot} {sanitize_terminal_text(reason).replace('_', ' ')} {dot} ",
+                    style="sun") + Text(sanitize_terminal_text(title), style="bold")
+        self.print()
+        self.print(head)
+        self.console.print(Text(sanitize_terminal_text(prompt)), soft_wrap=True)
+        self.print(Text(f"{rule * 2} nothing was sent: copy it to Claude Code, Codex or Antigravity, or do it "
+                        f"yourself {rule * 2}", style="frost"))
 
     def _on_notice(self, depth, text="", **_):
         """A standing caveat about this session rather than a step in it: printed once, where the

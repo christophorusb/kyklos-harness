@@ -291,6 +291,7 @@ keyword arguments, unchanged:
 | `retry` | `attempt`, `max_attempts`, `delay`, `error` | |
 | `notice` | `text` | A caveat meant for the person, said once per session. Skipped command files can be reported before the `session/start` result |
 | `image` | `path`, `rel`, `mime`, `width`, `height`, `bytes` | `generate_image` saved an image: `path` is absolute, `rel` is workspace-relative. Sent before that call's `tool_result` |
+| `handoff` | `title`, `reason`, `prompt` | The model handed work Kyklos can't do to the person. `reason` is one of `browser`, `web`, `remote`, `credentials`, `signing`, `privileges`, `gui`, `outside_workspace`, `long_run`, `scheduled`, `other`. `title` and `prompt` are secret-scrubbed model text: render them as untrusted text (§1.4) and never act on them. Nothing was sent anywhere; a client may offer to copy the prompt. Sent before that call's `tool_result`, and needs no permission request |
 | `signal` | `kind`, plus `reason`, `left`, `repeats`, `size`, `report`, `count` | The harness stepping in: `nudge`, `budget_warning`, `repeat_warn`, `repeat_stop`, `redacted`, `parallel_batch`, `delegation_hint`, `truncated_call`, `map_note`, `images_sent`, `stopped_report` |
 
 `load_skill` uses ordinary tool call and result events and needs no permission request. Its result

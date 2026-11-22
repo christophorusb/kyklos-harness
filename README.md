@@ -239,6 +239,8 @@ An edit answers with the lines as they now read, and a miss with the closest tex
 
 **Questions.** `ask_user` puts one question to you without ending the turn: a panel with the question and up to six numbered options, answered on one line. A number picks an option (several, comma-separated, when the model allows more than one), anything else is your own answer, and Enter alone skips; the answer goes back to the model as the tool result. Asking needs no approval, since answering is already your call. The model is told to ask only about decisions that are yours to make — not for permission, not to confirm a plan it can carry out, not for anything its tools can find out — and a turn may ask at most three. It's offered in plan mode, where ambiguities get settled, and never to subagents, which answer to another agent: one that tries is told to make the most reasonable assumption and name it in its report. With nobody to answer (a piped run, `--eval`), the model is told so and to go on and state what it assumed.
 
+**Handoffs.** `handoff` shows you work Kyklos can't do (see [What Kyklos hands off](#what-kyklos-hands-off)): a title, a reason such as `browser`, `remote` or `credentials`, and one self-contained prompt with the goal, the workspace path and files, what was already done, the steps, the expected results and what to report back. The terminal prints the prompt between two rules with no border beside it, so selecting it copies only the prompt; Kyklos Desktop draws it as a card with a Copy button. Nothing is sent anywhere and no other program starts, so it needs no approval. Secret values are removed from it first, and a turn may hand off at most twice. It's offered in plan mode, and never to subagents, which put the steps in their report for the agent that delegated them.
+
 **Subagents.** `task` hands a self-contained job to a fresh `Agent` with an empty context; only its answer comes back. `explore` mode is read-only and never asks permission; `general` can also edit and run commands. Subagents can't nest. Explore tasks sent in one message run at the same time, up to four at once, since they only read and never ask; anything else runs one at a time. Explore tasks can also declare `id` and `depends_on` to run in topological waves (`validate_dag`), forwarding completed prerequisite outputs into downstream tasks and rejecting cycles. The interface still draws one subagent after another: the others' steps are held back and replayed when their turn comes, each with its real duration. A subagent whose API call fails comes back as a failed tool call the parent can act on, rather than ending the turn. One that is stopped — by the step cap, or for repeating itself — is asked for a report of what it found, so its work reaches the parent as a partial answer rather than being lost. Route them elsewhere with `/submodel`, `SUBAGENT_MODEL`, or `--submodel`; the `task` line names the model when it differs. In a live test a subagent took 12 steps and read five files while the main context stayed at 6%.
 
 **Background subagents.** Opt in with `KYKLOS_BACKGROUND_SUBAGENTS=1` in the harness's `.env`,
@@ -384,7 +386,7 @@ Claims to have run the tests, committed, pushed or installed are compared agains
 
 ## What Kyklos hands off
 
-Some work stays outside Kyklos, mostly because of how the sandbox and guardrails are built rather than for lack of time. For these, the model does what it can in the workspace (writes the code, the tests, the plan) and hands the rest to you, to do yourself or give to a larger agent such as Claude Code, Antigravity or Codex. Each of those has its own security model: a handoff moves the work into that model and does not make it safe, so look at what you hand over when it is sensitive.
+Some work stays outside Kyklos, mostly because of how the sandbox and guardrails are built rather than for lack of time. For these, the model does what it can in the workspace (writes the code, the tests, the plan) and hands the rest to you with the `handoff` tool: one self-contained prompt, shown as a card, to do yourself or give to a larger agent such as Claude Code, Antigravity or Codex. Each of those has its own security model: a handoff moves the work into that model and does not make it safe, so look at what you hand over when it is sensitive.
 
 **Blocked on purpose**
 
@@ -414,11 +416,11 @@ Some things look like handoffs and aren't: edits to CI configuration, hooks, `AG
 ## Tests
 
 ```bash
-./.venv/bin/python -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_commands test_skills test_mcp test_graph
+./.venv/bin/python -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_handoff test_commands test_skills test_mcp test_graph
 ```
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_commands test_skills test_mcp test_graph
+.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_handoff test_commands test_skills test_mcp test_graph
 ```
 
 ## Evals

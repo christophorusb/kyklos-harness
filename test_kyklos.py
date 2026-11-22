@@ -935,8 +935,9 @@ class PlanModeTests(unittest.TestCase):
         self.assertIn("PLAN MODE", agent.messages[0]["content"])
         self.assertEqual(agent.send("propose a change"), "Here is the plan.")
         # plan is read-only and belongs here most of all: plan mode is where a plan is written.
-        # ask_user too: plan mode is where ambiguities get settled.
-        self.assertEqual(client.offered[0], {"read_file", "grep", "glob", "task", "plan", "ask_user"})
+        # ask_user too: plan mode is where ambiguities get settled. handoff changes nothing, and a
+        # plan can include the part someone else has to do.
+        self.assertEqual(client.offered[0], {"read_file", "grep", "glob", "task", "plan", "ask_user", "handoff"})
         self.assertEqual((self.ws / "app.py").read_text(), "x = 1\n")
 
         tool_outputs = [m["content"] for m in client.calls[1] if m["role"] == "tool"]
