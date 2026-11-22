@@ -27,6 +27,7 @@ A small coding-agent harness (~4,200 lines of Python, plus ~2,900 lines of tests
 **Knowing what's happening**
 - **Every `bash` prompt explains the command** in plain language before you answer `y` or `n`.
 - **Answer claims are checked** against what the turn actually ran.
+- **Self-checking:** before a turn ends, the model is asked once to back up its claims and to check code it changed, and each answer says whether its code was checked.
 - `/tokens`, `/tools`, `/diff` — what fills the window, what can run, what changed on disk.
 - **A scratch directory** for throwaway scripts, inside the workspace so imports resolve.
 
@@ -87,6 +88,7 @@ Kyklos works in the folder you launch it from. Set `WORKSPACE` in `.env` to pin 
 | `COMPACT_ABOVE` | Compact once the conversation passes this many tokens (default 100000) |
 | `MAX_STEPS` | Model turns one request may take (default 50) |
 | `KYKLOS_SNAPSHOTS` | `0` limits `/undo` to the file tools' edits, without snapshotting the workspace (see [Undo](#how-it-works)) |
+| `KYKLOS_SELF_CHECK` | `0` stops asking the model to back up its claims and check changed code before answering (see [Self-checking](#safety)) |
 | `KYKLOS_TRACE` | `0` turns off the session trace; a path writes it there instead (see [Evals](#evals)) |
 | `STREAM` | Stream the API call (default on). Transport only — nothing on screen changes. `0` to disable |
 | `KYKLOS_BACKGROUND_SUBAGENTS` | `1` lets the main model run one read-only background task per turn (default off) |
@@ -382,7 +384,24 @@ The absolute cap matters because every step re-sends the whole conversation: a 1
 ! this answer says it ran the tests, but no test command ran this turn
 ```
 
-Claims to have run the tests, committed, pushed or installed are compared against what ran — and whether it *succeeded*, since a denied or failing command is as much a gap as none. It reports to you, never to the model, and only on past-tense claims, so advice and hedging stay quiet.
+Claims to have run the tests, committed, pushed or installed are compared against what ran — and whether it *succeeded*, since a denied or failing command is as much a gap as none. It reports to you, and only on past-tense claims, so advice and hedging stay quiet. With self-checking on (the default), the model hears about it too, while it can still act: see below.
+
+**Self-checking.** Before a turn's answer stands, Kyklos looks at two things and, if either is off, sends the model one message and lets it carry on instead of ending the turn:
+
+- **The answer's story.** The claims above ("I ran the tests", "committed", …) that nothing this turn backs up. The model runs what it claimed or corrects the answer; a claim about an earlier turn is fine once it says so.
+- **Unchecked code.** Code changed this turn and no check passed after the last change. A check is a test run, a type check, a lint or a build (`pytest`, `unittest`, `npm test`, `tsc`, `mypy`, `ruff`, `eslint`, `cargo check`, `go vet`, `npm run build`, `py_compile` and the like) that exited 0. The message names the changed files and the tests the code graph links to them, and asks for the narrowest check that covers the change, or, when none fits (nothing set up, or it needs a browser, credentials or the network), for the answer to say so instead. A check that ran after the change and failed is put to the model the same way, unless the answer already reports the failure.
+
+**Kyklos never runs a check itself.** The model runs it through `bash`, under the same approvals and sandbox as any other command, so self-checking adds no new way for anything to run, and a repository can't choose a command that runs unasked. Each kind of message goes at most once per turn, both together share one message, and none is sent in plan mode, to subagents, after a cut-off reply, with fewer than two steps left, when the answer asks you a question, or when it already says why it couldn't check. Code means source files by extension: docs, data, config and `.kyklos/scratch/` don't count.
+
+With snapshots on, "changed" is read off the workspace itself (from the turn's start, and from just after the last check), so a `sed -i` or a generator counts as much as `edit_file`; without them, only the file tools' edits are seen. Under the answer you then see one of:
+
+```
+✓ checked after the last code change
+! code changed this turn, and no check passed after the last change
+! the last check after the code changes failed
+```
+
+Nothing is shown for a turn that changed no code. The state is `checked` on `turn_end` and in the `session/prompt` result, and the trace keeps it as a label. `KYKLOS_SELF_CHECK=0` turns the messages and the line off.
 
 ## What Kyklos hands off
 
@@ -416,11 +435,11 @@ Some things look like handoffs and aren't: edits to CI configuration, hooks, `AG
 ## Tests
 
 ```bash
-./.venv/bin/python -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_handoff test_commands test_skills test_mcp test_graph
+./.venv/bin/python -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_handoff test_self_check test_commands test_skills test_mcp test_graph
 ```
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_handoff test_commands test_skills test_mcp test_graph
+.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_handoff test_self_check test_commands test_skills test_mcp test_graph
 ```
 
 ## Evals

@@ -104,7 +104,7 @@ before the handshake.
 |---|---|---|
 | `initialize` | `protocol_version`, `client: {name, version}` | `protocol_version`, `kyklos_version`, `workspace`, `sandbox: {kind, label, warning}`, `commands: [{name, usage, summary}]`, `profiles`, `profile` |
 | `session/start` | `resume: null \| "last" \| path` | `state` (§7.3), `note: {kind, text} \| null`, `commands: [{name, usage, summary, source?}]` |
-| `session/prompt` | `text` | `answer`, `outcome`, `steps`, `secs`, `claims: [{label, missing}]` |
+| `session/prompt` | `text` | `answer`, `outcome`, `steps`, `secs`, `claims: [{label, missing}]`, `checked` |
 | `session/cancel` | *(notification)* | none: the in-flight `session/prompt` returns with `outcome: "interrupted"` |
 | `command/run` | `text` (the whole line, `/model gpt-5`) | `then_send: string \| null`, `exit: bool` |
 | `session/state` | none | `state` |
@@ -115,7 +115,10 @@ before the handshake.
 - **`session/prompt`** is `Agent.send`. `outcome` is the agent's `last_outcome` (`answer`,
   `cut_off`, `step_limit`, `repeat_stop`, `compaction_stop`, `interrupted`, `error`). `claims` is
   `last_claims`: answer claims the turn didn't back up, which the terminal prints as `! this answer
-  says it …`. The client shows them, and no client may hide them. The session is saved before the
+  says it …`. The client shows them, and no client may hide them. `checked` is `last_check`: `checked`,
+  `unchecked` or `failing` when the turn changed code, otherwise `null` (always `null` with
+  `KYKLOS_SELF_CHECK=0`); the terminal prints it under the answer as `✓ checked after the last code
+  change` or a `!` line, and clients should show it the same way. The session is saved before the
   result is sent, exactly as `AeroUI.turn` does.
 - **`commands`** from `initialize` lists built-ins. Use the list from `session/start` when it is
   present. It includes custom commands loaded after folder trust, each with a `source` of `user`
@@ -275,7 +278,7 @@ keyword arguments, unchanged:
 | Event | Data | Notes |
 |---|---|---|
 | `turn_start` | — | |
-| `turn_end` | `steps`, `outcome`, `answer_chars`, `claims` | Not sent for a cancelled parallel subagent |
+| `turn_end` | `steps`, `outcome`, `answer_chars`, `claims`, `checked` | Not sent for a cancelled parallel subagent |
 | `model_start` | `purpose` | `turn` or `summary` (compaction) |
 | `model_end` | `purpose`, `secs`, `prompt_tokens`, `completion_tokens`, `cached_tokens`, `finish_reason`, `error` | Usage fields may be missing; see the `no_usage` notice |
 | `model_progress` | `purpose`, `reasoning_chars`, `tool_chars` | Streaming only. Running totals of reasoning and tool-call argument characters received so far in this call, never their text, sent at most once a second (the first at once). Lets a client show a long wait is alive. Counts restart on a retry. Never replayed from a parallel lane's backlog |

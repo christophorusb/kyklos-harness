@@ -1805,6 +1805,63 @@ def unsupported_claims(answer: str, runs: list[tuple[str, str]]) -> list[tuple[s
     return out
 
 
+# ---- self-checking: the model checks its own work before the turn ends ----------------------------
+# The claim check above reports to you. This tells the model too, once per turn and while it can
+# still act: an answer whose story the turn didn't back up, and code changed with no passing check
+# since the last change. Kyklos never runs a check itself: the model runs it through bash, under
+# the same approvals and sandbox as any other command, so self-checking adds no new way for
+# anything to run. KYKLOS_SELF_CHECK=0 turns it off.
+
+CHECKED, UNCHECKED, FAILING = "checked", "unchecked", "failing"
+CHECK_NOTES = {  # what the person sees under an answer, by check state
+    CHECKED: ("✓", "checked after the last code change"),
+    UNCHECKED: ("!", "code changed this turn, and no check passed after the last change"),
+    FAILING: ("!", "the last check after the code changes failed"),
+}
+# Files whose change calls for a check. Docs, data and config are left out: a check rarely covers
+# them, and writes of .json and .toml are already parsed in-process.
+CODE_SUFFIXES = frozenset({
+    ".py", ".pyi", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".vue", ".svelte",
+    ".go", ".rs", ".java", ".kt", ".kts", ".scala", ".swift", ".m", ".mm", ".c", ".h", ".cc", ".cpp",
+    ".cxx", ".hpp", ".hh", ".cs", ".fs", ".rb", ".php", ".ex", ".exs", ".erl", ".hs", ".lua", ".dart",
+    ".zig", ".sh", ".bash", ".zsh", ".ps1", ".sql",
+})
+# A command that checks code: the tests the claim check knows, plus type checks, linters and builds.
+CHECK_COMMAND_RE = re.compile(
+    CLAIM_CHECKS[0][2].pattern + "|"
+    r"\b(?:py\.test|tsc|vue-tsc|svelte-check|mypy|pyright|ruff|flake8|pylint|eslint|biome|"
+    r"py_compile|compileall|clippy|shellcheck)\b|"
+    r"\bcargo\s+(?:check|build|clippy)\b|\bgo\s+(?:build|vet)\b|"
+    r"\b(?:npm|yarn|pnpm|bun)\s+(?:run\s+)?(?:build|lint|typecheck|type-check|check|test:\S+)\b|"
+    r"\b(?:swift|dotnet)\s+(?:build|test)\b|(?:\b(?:mvn|gradle)|\./gradlew)\b[^|;&]*\b(?:test|check|build|verify)\b|"
+    r"\bmake\s+\w*(?:check|build|lint)\w*\b|\bbundle\s+exec\s+rspec\b",
+    re.I)
+# An answer that already says it couldn't or didn't check isn't asked again: it has said why.
+CHECK_DECLINED_RE = re.compile(
+    r"\b(?:did\s*n[o']t|could\s*n[o']t|can\s*n[o']t|cannot|unable\s+to|was\s*n[o']t\s+able\s+to|"
+    r"have\s*n[o']t|has\s*n[o']t|not)\s+(?:yet\s+|been\s+|be\s+)?"
+    r"(?:run|ran|test|verif|check|build|compil|execut)\w*|\b(?:untested|unverified)\b", re.I)
+# Nor one that already reports the failing check.
+FAILURE_ACKNOWLEDGED_RE = re.compile(r"\b(?:fail\w*|broken|errors?)\b", re.I)
+MAX_NAMED_FILES = 6
+
+
+def is_code_path(rel: str) -> bool:
+    """Whether a workspace-relative path is code whose change calls for a check."""
+    rel = rel.replace("\\", "/")
+    return os.path.splitext(rel)[1].lower() in CODE_SUFFIXES and not rel.startswith(".kyklos/")
+
+
+def choose_self_check(env) -> bool:
+    """Whether the model is asked to check its work before answering (KYKLOS_SELF_CHECK, default on)."""
+    value = str(env.get("KYKLOS_SELF_CHECK", "")).strip().lower()
+    if value in ("", "1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"KYKLOS_SELF_CHECK must be 1 or 0 (got {env['KYKLOS_SELF_CHECK']!r})")
+
+
 def is_auto_allowed(name: str, args: dict, always_allowed: set[str], auto_bash: bool = False,
                     workspace: Path | None = None) -> bool:
     """True if a tool call may run without prompting the user.
@@ -2426,7 +2483,7 @@ TRACE_FIELDS = {  # event -> the data fields copied into its row, each still che
     "background_task": ("job_id", "status", "secs"),
     "signal": ("kind", "reason", "left", "repeats", "size", "report", "count"),
     "turn_start": (),
-    "turn_end": ("steps", "outcome", "answer_chars", "claims"),
+    "turn_end": ("steps", "outcome", "answer_chars", "claims", "checked"),
     "plan": ("active",),
     "handoff": ("reason",),
 }
@@ -2613,8 +2670,10 @@ class Agent:
                  subagent_vision: bool | None = None, images: "ImageGenerator | None" = None,
                  workspace_snapshots: bool | None = None, inherited_skills: SkillCatalog | None = None,
                  enable_mcp: bool = True, background_subagents: bool = False, code_graph: bool = False,
-                 knowledge: KnowledgeOverlay | None = None):
+                 knowledge: KnowledgeOverlay | None = None, self_check: bool | None = None):
         self.client = client
+        # Whether the model is asked to check its own work before a turn ends (see CHECK_NOTES).
+        self.self_check = choose_self_check(os.environ) if self_check is None else self_check
         self.model = model
         self.code_graph = code_graph
         # Whether the model takes images: what the provider says (None: it didn't say), and the
@@ -2681,6 +2740,7 @@ class Agent:
         self.always_allowed: set[str] = always_allowed if always_allowed is not None else set()
         self.last_steps = 0
         self.last_claims: list[tuple[str, str]] = []  # answer claims this turn didn't back up
+        self.last_check: str | None = None  # CHECKED, UNCHECKED or FAILING; None when no code changed
         self._repo_map: str | None = None  # the sketch frozen into the system prompt; None = scan again
         self._map_known = ""  # the newest sketch the model has been told about: the prompt's, plus notes
         self._map_dirty = False  # a file was written since _map_known was taken
@@ -3961,7 +4021,8 @@ class Agent:
                     self.turn_trees[-1][1] = self._workspace_tree()
             if self.cancel is None or not self.cancel.is_set():
                 self._emit("turn_end", steps=self.last_steps, outcome=self.last_outcome,
-                           answer_chars=len(answer or ""), claims=len(self.last_claims))
+                           answer_chars=len(answer or ""), claims=len(self.last_claims),
+                           checked=self.last_check)
 
     def _send_turn(self, user_text: str, preface: str = "") -> str:
         # The preface is Kyklos's, not the user's: it rides in front, so the message still ends
@@ -3978,7 +4039,13 @@ class Agent:
         tools_run = 0
         hinted = False  # the delegation nudge is once per turn, not once per tool call
         self.last_claims = []
+        self.last_check = None
         commands_run: list[tuple[str, str]] = []  # (command, result), to check the answer's story
+        code_edits: dict[str, int] = {}  # code the file tools changed -> the call that last changed it
+        # The last check command that ran: (its call number, whether it passed, the command, the
+        # workspace tree just after it, or None without snapshots).
+        last_check: tuple[int, bool, str, str | None] | None = None
+        self_checked: set[str] = set()  # self-check reasons already raised this turn: each once
         last_signature, repeats = None, 0  # (tool, arguments, result) of the previous call, and its run
         # A fifth of the budget from the end, and never fewer than two steps: enough room to act on it.
         budget_warning = self.max_steps - max(2, self.max_steps // 5)
@@ -4053,6 +4120,25 @@ class Agent:
                     self._emit("notice", text=to_user)
                     self.messages.append({"role": "user", "content": f"[Kyklos: {to_model}]"})
                     continue
+                if self.self_check and self.depth == 0 and not self.plan_mode and not truncated:
+                    content = msg.content or ""
+                    claims = unsupported_claims(content, commands_run)
+                    state, changed = self._check_state(code_edits, last_check)
+                    # Two steps at least: one to check, one to answer.
+                    note = None if step > self.max_steps - 2 else \
+                        self._self_check_note(content, claims, state, changed, last_check, self_checked)
+                    if note:
+                        to_model, to_user, reasons = note
+                        self_checked.update(reasons)
+                        self._emit("signal", kind="self_check", reason="_".join(reasons))
+                        if content.strip():
+                            self._emit("thought", text=content)
+                        else:
+                            entry["content"] = EMPTY_REPLY_MARK
+                        self._emit("notice", text=to_user)
+                        self.messages.append({"role": "user", "content": f"[Kyklos: {to_model}]"})
+                        continue
+                    self.last_check = state
                 self.turn_log.append((user_text, msg.content or ""))
                 self.last_outcome = "cut_off" if truncated else "answer"
                 self.last_claims = unsupported_claims(msg.content or "", commands_run)
@@ -4113,6 +4199,13 @@ class Agent:
                         self.last_bash = (bash_command, result)
                         touched = sorted({self.tools._rel(p) for *_, snaps in self.undo_stack for p in snaps})
                         self.knowledge.record_test_run(bash_command, _succeeded(result), touched)
+                        if self.self_check and CHECK_COMMAND_RE.search(bash_command):
+                            last_check = (tools_run, _succeeded(result), bash_command, self._workspace_tree())
+                if self.self_check and tc.function.name in ("write_file", "edit_file") and \
+                        result.startswith(("Wrote ", "Edited ")):
+                    edited = self._edited_code_path(tc.function.arguments)
+                    if edited:
+                        code_edits[edited] = tools_run
                 signature = (tc.function.name, _canonical_args(tc.function.arguments), result)
                 repeats = repeats + 1 if signature == last_signature else 1
                 last_signature = signature
@@ -4264,6 +4357,95 @@ class Agent:
                     f"The answer stopped at step {active} of {len(steps)}; Kyklos asked the model to finish "
                     f"or say why.", "plan")
         return None
+
+    def _edited_code_path(self, arguments: str) -> str | None:
+        """The workspace-relative path a successful write_file/edit_file changed, if it is code
+        outside the scratch directory."""
+        try:
+            path = json.loads(arguments).get("path")
+            rel = self.tools._rel(self.tools._resolve(str(path)))
+        except (ValueError, AttributeError, ToolError, OSError):
+            return None
+        if not is_code_path(rel) or is_scratch_path(self.tools.workspace, rel):
+            return None
+        return rel
+
+    def _check_state(self, code_edits: dict[str, int],
+                     last_check: tuple[int, bool, str, str | None] | None) -> tuple[str | None, list[str]]:
+        """(CHECKED, UNCHECKED, FAILING, or None when no code changed this turn; the code files changed).
+
+        With snapshots, the workspace itself is compared: from the turn's start to now for what
+        changed, and from just after the last check to now for whether anything changed since, by
+        the file tools, a command or a subagent alike. Without them only the file tools' edits are
+        seen, ordered against the check by call number."""
+        start = self.turn_trees[-1][0] if self.depth == 0 and self.turn_trees else None
+        now = self._workspace_tree() if start else None
+        if start and now and self.snapshots is not None:
+            try:
+                changed = sorted(p for p in self.snapshots.changes(start, now) if is_code_path(p))
+                if not changed:
+                    return None, []
+                if last_check is None:
+                    return UNCHECKED, changed
+                if last_check[3]:
+                    since = [p for p in self.snapshots.changes(last_check[3], now) if is_code_path(p)]
+                    if since:
+                        return UNCHECKED, changed
+                    return (CHECKED if last_check[1] else FAILING), changed
+            except SnapshotError:
+                pass
+        if not code_edits:
+            return None, []
+        changed = sorted(code_edits)
+        if last_check is None or last_check[0] < max(code_edits.values()):
+            return UNCHECKED, changed
+        return (CHECKED if last_check[1] else FAILING), changed
+
+    def _linked_tests(self, changed: list[str]) -> list[str]:
+        """Test files the code graph links to these, so the model can run the narrowest check."""
+        try:
+            tests = WorkspaceGraph(self.tools.workspace).blast_radius(changed, depth=1)["tests"]
+        except Exception:  # a hint only: a graph that can't be built must never cost the turn
+            return []
+        return [t for t in tests if t not in changed][:5]
+
+    def _self_check_note(self, content: str, claims: list[tuple[str, str]], state: str | None,
+                         changed: list[str], last_check, raised: set[str]) -> tuple[str, str, list[str]] | None:
+        """(what to tell the model, what to tell the user, the reasons) when this answer should
+        wait for a check, or None. Each reason is raised once per turn."""
+        to_model, to_user, reasons = [], [], []
+        if claims and "claims" not in raised:
+            for label, missing in claims:
+                to_model.append(f"your answer says it {label}, but {missing}.")
+            to_model.append("Run it now if it should have run, or correct the answer so it says only what "
+                            "this turn did (a claim about an earlier turn is fine if you say so).")
+            to_user.append("the answer claimed work this turn didn't show")
+            reasons.append("claims")
+        if state == UNCHECKED and "unchecked" not in raised and "?" not in content \
+                and not CHECK_DECLINED_RE.search(content):
+            named = ", ".join(changed[:MAX_NAMED_FILES])
+            if len(changed) > MAX_NAMED_FILES:
+                named += f" and {len(changed) - MAX_NAMED_FILES} more"
+            tests = self._linked_tests(changed)
+            linked = f" (the code graph links these tests: {', '.join(tests)})" if tests else ""
+            to_model.append(f"you changed code this turn ({named}) and no check has passed since the last "
+                            f"change. Run the narrowest check that covers it{linked}: the related tests, a "
+                            f"type check, a lint or a build. If none fits (nothing is set up, or it needs a "
+                            f"browser, credentials or the network), run nothing and say so in your answer.")
+            to_user.append("code changed with no check after it")
+            reasons.append("unchecked")
+        elif state == FAILING and "failing" not in raised and not FAILURE_ACKNOWLEDGED_RE.search(content):
+            command = plain_line(last_check[2])[:200] if last_check else "the last check"
+            to_model.append(f"the last check after your changes failed: `{command}`. Fix what it reports, or "
+                            f"if this turn's changes didn't cause it, say so in your answer with the evidence.")
+            to_user.append("the last check after the changes failed")
+            reasons.append("failing")
+        if not reasons:
+            return None
+        message = " ".join(to_model)
+        return (message[0].upper() + message[1:],
+                f"Self-check: {' and '.join(to_user)}, so Kyklos asked the model to check before answering.",
+                reasons)
 
     def _should_hint_delegation(self) -> bool:
         """Once the conversation is half way to compaction, further reading here is expensive.
@@ -5815,6 +5997,9 @@ def plain_repl(agent: "Agent", default_session: Path, **ctx_extras) -> None:
             print(f"\n{sanitize_terminal_text(agent.send(text))}")
             for label, missing in agent.last_claims:
                 print(f"  \033[33m! this answer says it {label}, but {missing}\033[0m")
+            if agent.last_check in CHECK_NOTES:
+                mark, text = CHECK_NOTES[agent.last_check]
+                print(f"  \033[{'32' if agent.last_check == CHECKED else '33'}m{mark} {text}\033[0m")
             agent.save_session(default_session)
             used = agent.context_tokens()
             print(f"\033[2m(context: ~{used:,} / {agent.context_window:,} tokens, {used / agent.context_window:.0%})\033[0m\n")

@@ -26,7 +26,8 @@ from rich.panel import Panel
 from rich.text import Text
 from rich.theme import Theme
 
-from kyklos import (BASH_MODE_CAVEAT, BASH_MODE_EXPLANATION, BROAD_WARNING, EXIT, NO_APPROVER_NOTE,
+from kyklos import (BASH_MODE_CAVEAT, BASH_MODE_EXPLANATION, BROAD_WARNING, CHECK_NOTES, CHECKED, EXIT,
+                    NO_APPROVER_NOTE,
                     TRUST_EXPLANATION, CommandContext, command_list, edit_preview,
                     __version__, apply_permission_answer, denial_note, ensure_private_dir,
                     error_detail, has_danger, has_opaque, parse_question_answer, permission_options,
@@ -1388,6 +1389,10 @@ class AeroUI:
             # Reported to you, not to the model, and as a mismatch rather than a verdict: the claim
             # may be about an earlier turn.
             self.print(Text(f"! this answer says it {label}, but {missing}", style="sun"), indent=2)
+        check = getattr(agent, "last_check", None)
+        if check in CHECK_NOTES:
+            mark, text = CHECK_NOTES[check]
+            self.print(Text(f"{mark} {text}", style="mint" if check == CHECKED else "sun"), indent=2)
         agent.save_session(default_session)
 
     def run(self, agent, default_session: Path, one_shot: str = None, notice: tuple = None, **ctx_extras) -> None:

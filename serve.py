@@ -485,7 +485,8 @@ class ServeUI:
         self._done(rid, {
             "answer": answer, "outcome": agent.last_outcome, "steps": agent.last_steps,
             "secs": round(time.monotonic() - started, 3),
-            "claims": [{"label": label, "missing": missing} for label, missing in agent.last_claims]})
+            "claims": [{"label": label, "missing": missing} for label, missing in agent.last_claims],
+            "checked": agent.last_check})
 
     def _command(self, rid, params: dict) -> bool:
         """Run a slash command. Returns True if it was /exit."""
