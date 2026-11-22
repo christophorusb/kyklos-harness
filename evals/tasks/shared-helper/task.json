@@ -1,0 +1,5 @@
+{
+  "prompt": "Prices print with one decimal place: format_price(1050) gives '$10.5'. Amounts should always show cents, like '$10.50'. Fix it.",
+  "summary": "the obvious fix breaks another caller; only the tests show it",
+  "timeout": 600
+}

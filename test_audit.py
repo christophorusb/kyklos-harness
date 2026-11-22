@@ -8,8 +8,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from audit import (Case, answer_corpus, audit_answers, audit_commands, command_corpus,
-                   replay_session, session_corpora)
+from audit import (Case, answer_corpus, audit_answers, audit_commands, audit_pattern, audit_self_check,
+                   check_command_corpora, command_corpus, decline_corpora, replay_attempts, replay_session,
+                   session_corpora)
+from kyklos import CHECK_COMMAND_RE, CHECK_DECLINED_RE, CHECKED, FAILING, UNCHECKED, check_state_by_order
 
 
 def assistant(content="", bash=()):
@@ -199,6 +201,127 @@ class ReplayAgreesWithLiveTests(unittest.TestCase):
 
         self.assertEqual(live, replayed)
         self.assertTrue(live)  # the fixture is a real mismatch, so this compares something
+
+
+def file_call(call_id, name, path):
+    return {"role": "assistant", "content": "", "tool_calls": [{"id": call_id, "type": "function", "function": {
+        "name": name, "arguments": json.dumps({"path": path, "content": "x = 1\n"})}}]}
+
+
+class SelfCheckReplayTests(unittest.TestCase):
+    """Rebuilding, from a saved session, what self-checking sees when an answer would end a turn."""
+
+    def attempts(self, lines):
+        path = write_session(lines)
+        self.addCleanup(path.unlink)
+        return replay_attempts(path)
+
+    def test_edits_and_checks_are_ordered_by_call(self):
+        attempts = self.attempts([
+            {"role": "user", "content": "fix it"},
+            file_call("w1", "write_file", "app.py"), result("w1", "Wrote 6 chars to app.py"),
+            assistant(bash=[("b", "pytest -q")]), result("b", "exit code 0\n3 passed"),
+            assistant("Done."),
+            {"role": "user", "content": "one more thing"},
+            assistant(bash=[("b2", "pytest -q")]), result("b2", "exit code 1\n1 failed"),
+            file_call("w2", "edit_file", "app.py"), result("w2", "Edited app.py."),
+            assistant("Done again."),
+        ])
+        states = [check_state_by_order(a.code_edits, a.last_check) for a in attempts]
+        self.assertEqual(states, [CHECKED, UNCHECKED])  # the second turn edited after its check
+        self.assertEqual([a.turn for a in attempts], [1, 2])
+
+    def test_only_successful_code_edits_outside_scratch_count(self):
+        [attempt] = self.attempts([
+            {"role": "user", "content": "go"},
+            file_call("1", "write_file", "README.md"), result("1", "Wrote 6 chars to README.md"),
+            file_call("2", "write_file", ".kyklos/scratch/probe.py"), result("2", "Wrote 6 chars to .kyklos/scratch/probe.py"),
+            file_call("3", "write_file", "app.py"), result("3", "The user denied this write_file call."),
+            assistant("Done."),
+        ])
+        self.assertEqual(attempt.code_edits, {})
+
+    def test_a_failing_check_after_the_edit(self):
+        [attempt] = self.attempts([
+            {"role": "user", "content": "go"},
+            file_call("1", "write_file", "app.py"), result("1", "Wrote 6 chars to app.py"),
+            assistant(bash=[("2", "npx tsc --noEmit")]), result("2", "exit code 2\nerror TS2322"),
+            assistant("Done."),
+        ])
+        self.assertEqual(check_state_by_order(attempt.code_edits, attempt.last_check), FAILING)
+
+    def test_kyklos_notes_continue_the_turn_and_a_prefixed_message_starts_one(self):
+        attempts = self.attempts([
+            {"role": "user", "content": "go"},
+            assistant(bash=[("1", "pytest -q")]), result("1", "exit code 0"),
+            assistant("Done. I ran the tests."),
+            {"role": "user", "content": "[Kyklos: you changed code this turn (app.py) and no check has passed.]"},
+            assistant("Done."),
+            {"role": "user", "content": "[Kyklos: files have changed since the workspace sketch: a.py]\n\nnext task"},
+            assistant("Nothing ran here."),
+        ])
+        self.assertEqual([a.turn for a in attempts], [1, 1, 2])
+        self.assertEqual(attempts[1].commands, [("pytest -q", "exit code 0")])  # carried past the note
+        self.assertEqual(attempts[2].commands, [])
+
+    def test_each_reason_is_counted_once_per_turn(self):
+        path = write_session([
+            {"role": "user", "content": "go"},
+            file_call("1", "write_file", "app.py"), result("1", "Wrote 6 chars to app.py"),
+            assistant("Done."),
+            {"role": "user", "content": "[Kyklos: you changed code this turn (app.py).]"},
+            assistant("Done."),
+        ])
+        self.addCleanup(path.unlink)
+        rate, states = audit_self_check([path])
+        self.assertEqual([f.kind for f in rate.fired], ["unchecked"])
+        self.assertEqual(states[UNCHECKED], 2)
+
+
+class SelfCheckPatternTests(unittest.TestCase):
+    """The two patterns self-checking leans on, held to the audit's corpora."""
+
+    def test_every_check_is_recognised_and_nothing_else(self):
+        checks, others = check_command_corpora()
+        self.assertGreater(len(checks), 40)
+        self.assertEqual(audit_pattern("", checks, CHECK_COMMAND_RE, True).fired, [])
+        self.assertEqual(audit_pattern("", others, CHECK_COMMAND_RE, False).fired, [])
+
+    def test_reasons_are_recognised_and_plain_answers_are_not(self):
+        declines, plain = decline_corpora()
+        self.assertEqual(audit_pattern("", declines, CHECK_DECLINED_RE, True).fired, [])
+        self.assertEqual(audit_pattern("", plain, CHECK_DECLINED_RE, False).fired, [])
+
+    def test_the_cases_the_first_audit_found(self):
+        """`can't` slipped past a pattern written for `couldn't`, and a bare `not` read descriptions
+        of the code as reasons for not checking it."""
+        self.assertTrue(CHECK_DECLINED_RE.search("I can't run the tests without the database."))
+        self.assertFalse(CHECK_DECLINED_RE.search("The migration does not run twice anymore."))
+
+
+class SelfCheckReplayAgreesWithLiveTests(unittest.TestCase):
+    def test_a_replayed_session_reproduces_the_live_self_check(self):
+        from kyklos import Agent
+        from test_kyklos import FakeClient, allow_all, reply, tool_call
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ws = Path(tmp.name)
+        live = []
+        agent = Agent(FakeClient([reply(tool_calls=[tool_call("1", "write_file", path="app.py", content="x = 1\n")]),
+                                  reply("Done."),
+                                  reply("Done. I couldn't run a check here.")]),
+                      "fake", ws, permission=allow_all, workspace_snapshots=False, self_check=True,
+                      on_event=lambda event, depth=0, **d: live.append(d.get("reason"))
+                      if event == "signal" and d.get("kind") == "self_check" else None)
+        agent.send("fix it")
+        path = ws / "session.jsonl"
+        agent.save_session(path)
+        rate, states = audit_self_check([path])
+        self.assertEqual(live, ["unchecked"])
+        self.assertEqual([f.kind for f in rate.fired], live)
+        self.assertEqual(states[UNCHECKED], 2)
+        self.assertEqual(agent.last_check, UNCHECKED)
 
 
 if __name__ == "__main__":

@@ -94,6 +94,26 @@ class FixtureTests(unittest.TestCase):
         proc = subprocess.run([sys.executable, "-B", str(root / "check.py")], cwd=ws, capture_output=True, text=True)
         self.assertNotEqual(proc.returncode, 0)
 
+    def test_the_obvious_fix_fails_shared_helper(self):
+        """The point of the task: formatting inside the shared helper fixes the report and breaks
+        order_total, which only running the tests shows."""
+        task = evals.load_tasks(["shared-helper"])[0]
+        root = Path(tempfile.mkdtemp(prefix="kyklos-eval-test-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        ws = root / "ws"
+        shutil.copytree(task["dir"] / "repo", ws)
+        (root / "before.json").write_text(json.dumps(evals.manifest(ws)), encoding="utf-8")
+        money = ws / "money.py"
+        money.write_text(money.read_text().replace("    return cents / 100", '    return f"{cents / 100:.2f}"')
+                         .replace('    return "$" + str(to_dollars(cents))', '    return "$" + to_dollars(cents)'))
+        shutil.copy(HERE / "evals" / "checklib.py", root / "checklib.py")
+        shutil.copy(task["dir"] / "check.py", root / "check.py")
+        proc = subprocess.run([sys.executable, "-B", str(root / "check.py"), str(root / "answer.txt"),
+                               str(root / "before.json")], cwd=ws, capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("test_order_total_is_a_number", proc.stdout + proc.stderr)
+        self.assertNotIn("test_whole_and_part_dollars", proc.stdout + proc.stderr)  # the report itself is fixed
+
     def test_unknown_task_names_are_refused(self):
         with self.assertRaises(SystemExit):
             evals.load_tasks(["no-such-task"])
@@ -117,7 +137,7 @@ class TraceSummaryTests(unittest.TestCase):
             {"event": "compact", "depth": 0, "stage": "summarized"},
             {"event": "model_end", "depth": 0, "error": "APIConnectionError"},
             {"event": "turn_end", "depth": 1, "outcome": "answer"},
-            {"event": "turn_end", "depth": 0, "outcome": "step_limit"},
+            {"event": "turn_end", "depth": 0, "outcome": "step_limit", "checked": "unchecked"},
         ]
         path = Path(tempfile.mkdtemp()) / "trace.jsonl"
         self.addCleanup(shutil.rmtree, path.parent, True)
@@ -129,6 +149,7 @@ class TraceSummaryTests(unittest.TestCase):
         self.assertEqual((m["tools"], m["tool_failures"]), (2, 1))  # a failing command is not a failed tool
         self.assertEqual((m["api_errors"], m["compactions"], m["outcome"]), (1, 1, "step_limit"))
         self.assertEqual(m["signals"], {"nudge:empty": 1, "parallel_batch": 1})
+        self.assertEqual(m["checked"], "unchecked")
 
     def test_a_missing_trace_is_empty_not_an_error(self):
         m = evals.summarize_trace(Path(tempfile.gettempdir()) / "no-such-trace.jsonl")

@@ -1837,10 +1837,18 @@ CHECK_COMMAND_RE = re.compile(
     r"\bmake\s+\w*(?:check|build|lint)\w*\b|\bbundle\s+exec\s+rspec\b",
     re.I)
 # An answer that already says it couldn't or didn't check isn't asked again: it has said why.
+# A bare "not" is left out on purpose: "the migration does not run twice" describes the code, and
+# reading it as a reason would let the change through unchecked. audit.py measures both directions.
 CHECK_DECLINED_RE = re.compile(
-    r"\b(?:did\s*n[o']t|could\s*n[o']t|can\s*n[o']t|cannot|unable\s+to|was\s*n[o']t\s+able\s+to|"
-    r"have\s*n[o']t|has\s*n[o']t|not)\s+(?:yet\s+|been\s+|be\s+)?"
-    r"(?:run|ran|test|verif|check|build|compil|execut)\w*|\b(?:untested|unverified)\b", re.I)
+    r"\b(?:did\s*n[o']t|could\s*n[o']t|can'?t|cannot|can\s+not|unable\s+to|was\s*n[o']t\s+able\s+to|"
+    r"have\s*n[o']t|has\s*n[o']t|(?:has|have|had|was|were)\s+not|not\s+yet)\s+(?:yet\s+|been\s+|be\s+)?"
+    r"(?:run|ran|test|verif|check|build|compil|execut)\w*|"
+    r"(?:^|[.:;!]\s+)not\s+(?:yet\s+)?(?:tested|verified|checked|run|built|compiled)\b|"
+    r"\b(?:untested|unverified)\b|"
+    r"\bno\s+(?:tests?|checks?|test\s+(?:suite|runner|setup)|linters?|type\s*checker)\b|"
+    r"\bnothing\s+(?:to\s+(?:run|test|check)|was\s+(?:run|tested|checked))\b|"
+    r"\bskipped\s+(?:the\s+|running\s+(?:the\s+)?)?(?:tests?|checks?|build|type\s*check|lint)|"
+    r"\bleft\s+(?:the\s+)?(?:testing|tests?|checks?|verification)\s+(?:to|for)\s+you\b", re.I | re.M)
 # Nor one that already reports the failing check.
 FAILURE_ACKNOWLEDGED_RE = re.compile(r"\b(?:fail\w*|broken|errors?)\b", re.I)
 MAX_NAMED_FILES = 6
@@ -1850,6 +1858,31 @@ def is_code_path(rel: str) -> bool:
     """Whether a workspace-relative path is code whose change calls for a check."""
     rel = rel.replace("\\", "/")
     return os.path.splitext(rel)[1].lower() in CODE_SUFFIXES and not rel.startswith(".kyklos/")
+
+
+def check_state_by_order(code_edits: dict[str, int], last_check) -> str | None:
+    """The check state from call order alone: whether the last check command (call number, passed,
+    …) came after the last code edit (path -> call number). What _check_state falls back to without
+    snapshots, and what audit.py replays saved sessions with."""
+    if not code_edits:
+        return None
+    if last_check is None or last_check[0] < max(code_edits.values()):
+        return UNCHECKED
+    return CHECKED if last_check[1] else FAILING
+
+
+def self_check_reasons(content: str, claims: list, state: str | None, raised=frozenset()) -> list[str]:
+    """Why this answer should wait for a check ("claims", "unchecked", "failing"), or [] to let it
+    stand. `raised` holds the reasons already put to the model this turn: each goes once."""
+    reasons = []
+    if claims and "claims" not in raised:
+        reasons.append("claims")
+    if state == UNCHECKED and "unchecked" not in raised and "?" not in content \
+            and not CHECK_DECLINED_RE.search(content):
+        reasons.append("unchecked")
+    elif state == FAILING and "failing" not in raised and not FAILURE_ACKNOWLEDGED_RE.search(content):
+        reasons.append("failing")
+    return reasons
 
 
 def choose_self_check(env) -> bool:
@@ -4394,12 +4427,7 @@ class Agent:
                     return (CHECKED if last_check[1] else FAILING), changed
             except SnapshotError:
                 pass
-        if not code_edits:
-            return None, []
-        changed = sorted(code_edits)
-        if last_check is None or last_check[0] < max(code_edits.values()):
-            return UNCHECKED, changed
-        return (CHECKED if last_check[1] else FAILING), changed
+        return check_state_by_order(code_edits, last_check), sorted(code_edits)
 
     def _linked_tests(self, changed: list[str]) -> list[str]:
         """Test files the code graph links to these, so the model can run the narrowest check."""
@@ -4413,16 +4441,17 @@ class Agent:
                          changed: list[str], last_check, raised: set[str]) -> tuple[str, str, list[str]] | None:
         """(what to tell the model, what to tell the user, the reasons) when this answer should
         wait for a check, or None. Each reason is raised once per turn."""
-        to_model, to_user, reasons = [], [], []
-        if claims and "claims" not in raised:
+        reasons = self_check_reasons(content, claims, state, raised)
+        if not reasons:
+            return None
+        to_model, to_user = [], []
+        if "claims" in reasons:
             for label, missing in claims:
                 to_model.append(f"your answer says it {label}, but {missing}.")
             to_model.append("Run it now if it should have run, or correct the answer so it says only what "
                             "this turn did (a claim about an earlier turn is fine if you say so).")
             to_user.append("the answer claimed work this turn didn't show")
-            reasons.append("claims")
-        if state == UNCHECKED and "unchecked" not in raised and "?" not in content \
-                and not CHECK_DECLINED_RE.search(content):
+        if "unchecked" in reasons:
             named = ", ".join(changed[:MAX_NAMED_FILES])
             if len(changed) > MAX_NAMED_FILES:
                 named += f" and {len(changed) - MAX_NAMED_FILES} more"
@@ -4433,15 +4462,11 @@ class Agent:
                             f"type check, a lint or a build. If none fits (nothing is set up, or it needs a "
                             f"browser, credentials or the network), run nothing and say so in your answer.")
             to_user.append("code changed with no check after it")
-            reasons.append("unchecked")
-        elif state == FAILING and "failing" not in raised and not FAILURE_ACKNOWLEDGED_RE.search(content):
+        if "failing" in reasons:
             command = plain_line(last_check[2])[:200] if last_check else "the last check"
             to_model.append(f"the last check after your changes failed: `{command}`. Fix what it reports, or "
                             f"if this turn's changes didn't cause it, say so in your answer with the evidence.")
             to_user.append("the last check after the changes failed")
-            reasons.append("failing")
-        if not reasons:
-            return None
         message = " ".join(to_model)
         return (message[0].upper() + message[1:],
                 f"Self-check: {' and '.join(to_user)}, so Kyklos asked the model to check before answering.",

@@ -458,8 +458,23 @@ PASS  long-log         steps  8  tools  8  tokens   34k  cache 70%     19s
 PASS  parallel-lookup  steps  6  tools 11  tokens   28k  cache 59%     13s
 ```
 
-Each task in `evals/tasks/` is a small repository, a prompt, a `check.py` that decides pass or fail, and a reference solution that `test_eval.py` holds the check to: every check must fail the untouched repository and pass the solution, or it measures nothing. The tasks are chosen to land on the harness's own mechanisms — a failure buried past the 20,000-character output cut, a version bump where a blind replace-all rewrites history, a rename with a near-miss name, a read-only question with a stale doc as a decoy, three independent lookups that could go to parallel subagents.
+Each task in `evals/tasks/` is a small repository, a prompt, a `check.py` that decides pass or fail, and a reference solution that `test_eval.py` holds the check to: every check must fail the untouched repository and pass the solution, or it measures nothing. The tasks are chosen to land on the harness's own mechanisms — a failure buried past the 20,000-character output cut, a version bump where a blind replace-all rewrites history, a rename with a near-miss name, a read-only question with a stale doc as a decoy, three independent lookups that could go to parallel subagents, and a bug report whose obvious fix, in a shared helper, breaks another caller that only the tests show (`shared-helper`, with a prompt that never mentions tests).
 
 Each run gets a fresh copy under the system temp folder and runs `kyklos.py --eval` there with nobody at the keyboard. `--eval` swaps the person for a fixed policy — approve edits and commands, including ones Kyklos can't read, but never a red finding or a secret — and Kyklos refuses it unless the folder is one `eval.py` made (inside the temp folder, with a marker file) and the OS sandbox is on. The check runs the model's code too, so it runs in the same sandbox. Your model picks and model catalog are copied in; nothing else from `~/.kyklos` is. A persona is off unless `--persona` names one. Results are appended to `evals/results/<time>.jsonl`, one row per run, which is kept out of git.
+
+**Measuring self-checking.** Each run's line ends with the state of the code when the turn ended (`code checked`, `unchecked` or `failing`), and its `self_check:…` signals count how often the model was asked. `--no-self-check` runs the same tasks with `KYKLOS_SELF_CHECK=0`, so the two can be compared on the task built for it:
+
+```bash
+./.venv/bin/python eval.py shared-helper --repeat 5
+./.venv/bin/python eval.py shared-helper --repeat 5 --no-self-check
+```
+
+`audit.py` measures the other side without spending tokens: whether self-checking recognises a check command when it sees one (and nothing else), whether it recognises an answer that already says why nothing was checked (without taking a plain description of the code for one), and, given saved sessions, how often it would hold an answer back:
+
+```bash
+./.venv/bin/python audit.py ~/.kyklos/projects/*/last.jsonl
+```
+
+A replayed session sees only the file tools' edits, since command edits need the workspace, so live counts can be higher. Its first run found two gaps that are now fixed: `can't` never read as a reason, and a bare `not` read descriptions like "the migration does not run twice" as one.
 
 **The trace.** Every session writes one, not only evals: a JSONL row per event to `~/.kyklos/projects/<folder>/traces/` (the newest 50 kept, owner-only permissions). It records numbers and fixed labels only — tokens and cache reads per API call, each tool call's outcome, size and duration, and each time the harness stepped in (a nudge, a budget warning, a repeat, a parallel batch) — and never a path, a command, a prompt or an answer, so it can be read or shared without exposing the work. `KYKLOS_TRACE=0` turns it off.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Rates for Kyklos's own checkers, measured on input nobody picked case by case.
 
-Both checkers here err towards silence on purpose. The explainer (`explain_command`) and the
+The checkers here err towards silence on purpose. The explainer (`explain_command`) and the
 answer's-story check (`unsupported_claims`) are only worth anything while you still believe them,
 and a check that cries wolf gets ignored. The test suite pins that with controls: a few benign
 commands that must stay quiet, a few hedged sentences that must not read as claims.
@@ -18,6 +18,11 @@ Two kinds of firing are worth keeping apart, because only one is a miscalibratio
     honest by design (`must_be_asked` prompts rather than trust ignorance), but it still costs a
     prompt in auto-bash mode, so the rate is a coverage list worth reading.
 
+Self-checking (`self_check_reasons`) is measured the same way, from both sides: how often it would
+hold back an answer from a replayed session, and how well its two patterns read their input --
+check commands it must recognise, and answers that already say why nothing was checked, which it
+must recognise without mistaking a plain answer for one.
+
 Nothing here is a pass/fail gate, and nothing here is a verdict: it prints rates and names every
 case that fired, in groups, so you can decide which groups you consider wrong. Run it:
 
@@ -33,7 +38,9 @@ from dataclasses import dataclass, field
 from itertools import product
 from pathlib import Path
 
-from kyklos import explain_command, unsupported_claims
+from kyklos import (CHECK_COMMAND_RE, CHECK_DECLINED_RE, CHECKED, FAILING, UNCHECKED, _succeeded,
+                    check_state_by_order, explain_command, is_code_path, self_check_reasons,
+                    unsupported_claims)
 
 
 # ---- cases and results --------------------------------------------------------------------------
@@ -49,7 +56,7 @@ class Case:
 @dataclass(frozen=True)
 class Fired:
     case: Case
-    kind: str   # "danger", "warn", "opaque" or "claim"
+    kind: str   # "danger", "warn", "opaque", "claim", "missed", "read in", or self-check reasons
     why: str
 
 
@@ -197,6 +204,74 @@ def answer_corpus() -> list[Case]:
     return cases
 
 
+# ---- self-checking: what counts as a check, and what counts as saying why there was none ----------
+# Two patterns decide whether an answer waits. CHECK_COMMAND_RE must know a check when it sees one
+# (a miss asks the model for a check it already ran), and must not read an ordinary command as one
+# (that would let unchecked code through). CHECK_DECLINED_RE must recognise an answer that already
+# says why nothing was checked (a miss asks again), and must not read a plain answer as one (that
+# would skip the check).
+
+CHECKS = {
+    "tests": ("pytest -q", "pytest tests/test_api.py::test_login", "python -m unittest test_kyklos",
+              "python3 -m unittest discover -s tests", "npm test", "npm run test", "pnpm test",
+              "yarn test:unit", "bun test", "npx vitest run", "npx jest src", "go test ./...",
+              "cargo test", "make test", "uv run pytest -x", "tox -e py312", "bundle exec rspec",
+              "./gradlew test", "mvn -q test", "dotnet test", "swift test"),
+    "type checks": ("npx tsc --noEmit", "tsc -p .", "mypy src", "pyright", "vue-tsc --noEmit",
+                    "npm run typecheck", "cargo check", "go vet ./..."),
+    "lints": ("ruff check .", "flake8 app.py", "pylint pkg", "npx eslint src", "npm run lint",
+              "cargo clippy", "shellcheck run.sh", "biome check src"),
+    "builds": ("npm run build", "pnpm build", "cargo build", "go build ./...", "make build",
+               "python3 -m py_compile app.py", "python -m compileall src", "swift build"),
+    "chained": ("cd web && npm test", "source .venv/bin/activate && pytest -q",
+                "npm run build 2>&1 | tail -20", "pytest -q; echo done"),
+}
+NOT_CHECKS = ("ls -la", "git status", "git diff", "cat test_api.py", "grep -rn test src",
+              "npm install", "pip install -r requirements.txt", "python app.py", "node server.js",
+              "go run .", "npm start", "echo build", "mkdir build", "rm -rf build",
+              "sed -i 's/a/b/' src/app.py", "git commit -m 'fix the tests'", "find . -name '*_test.go'",
+              "head -n 30 Makefile", "open coverage/index.html", "python -m http.server 8000")
+
+DECLINES = {
+    "no runner": ("I couldn't run the tests: there's no test runner set up here.",
+                  "I couldn't run any checks, since nothing is set up in this folder.",
+                  "I wasn't able to run the build, because it needs network access.",
+                  "I can't run the tests without the database."),
+    "not yet": ("I haven't run the tests yet.", "I didn't run the type checker.",
+                "The change has not been tested.", "This hasn't been verified against the real API.",
+                "Not tested: it needs a browser, so I handed that part off."),
+    "one word": ("This is untested.", "The fix is unverified.", "Untested, as there are no tests."),
+    "other wording": ("There are no tests in this project, so I skipped that step.",
+                      "No checks exist for this module.",
+                      "Nothing to run here: the repo has no test suite.",
+                      "I left testing to you, since it needs your credentials."),
+}
+PLAIN_ANSWERS = {
+    "done": ("Done.", "Fixed the off-by-one in range_sum.", "Renamed the function and updated callers.",
+             "Updated the parser to accept trailing commas.", "Added a check for empty input.",
+             "The handler now returns 404 for missing users."),
+    "describing behaviour": ("The migration does not run twice anymore.",
+                             "Empty lists are not checked twice now; the loop exits early.",
+                             "The build step can't be skipped by accident any more.",
+                             "It doesn't compile the templates on every request now."),
+    "naming tests": ("I added a test for the empty case in test_parser.py.",
+                     "The new test covers the 404 path.", "Tests for the CLI live in tests/test_cli.py."),
+}
+
+
+def check_command_corpora() -> tuple[list[Case], list[Case]]:
+    """(commands that check code, commands that don't)."""
+    checks = [Case(group, c) for group, commands in CHECKS.items() for c in commands]
+    return checks, [Case("not a check", c) for c in NOT_CHECKS]
+
+
+def decline_corpora() -> tuple[list[Case], list[Case]]:
+    """(answers that say why nothing was checked, plain answers that don't)."""
+    declines = [Case(group, s) for group, sentences in DECLINES.items() for s in sentences]
+    plain = [Case(group, s) for group, sentences in PLAIN_ANSWERS.items() for s in sentences]
+    return declines, plain
+
+
 # ---- real turns, replayed out of saved sessions ---------------------------------------------------
 # `Agent.save_session` writes the whole conversation to JSONL, tool calls and results included, so a
 # saved session is already the corpus: every finished turn can be handed back to the checker exactly
@@ -209,16 +284,56 @@ def _is_image_result(content) -> bool:
     return isinstance(content, str) and content.startswith("[Kyklos: the image")
 
 
-def replay_session(path: Path) -> list[tuple[str, list[tuple[str, str]]]]:
-    """(final answer, commands run) for each finished turn in a saved session.
+def _is_kyklos_note(content) -> bool:
+    """Whether a user-role message is Kyklos alone speaking mid-turn ("[Kyklos: …]": a nudge or a
+    self-check), so the turn goes on. A note riding in front of the user's own words, such as the
+    workspace-sketch note, is followed by them and starts a turn like any other message."""
+    if isinstance(content, list):
+        content = next((p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"), "")
+    text = content.strip() if isinstance(content, str) else ""
+    return text.startswith("[Kyklos: ") and text.endswith("]") and "]\n\n" not in text
 
-    A turn ends at an assistant message with no tool calls, which is the same test the live loop
-    uses. Commands are paired with their results by tool-call id, so a denied or errored call keeps
-    the result text that `unsupported_claims` reads for an exit code.
+
+@dataclass
+class Attempt:
+    """One reply that would end its turn, with what the turn had done by then: the inputs the live
+    loop hands to `unsupported_claims` and `self_check_reasons` at that moment."""
+    answer: str
+    commands: list[tuple[str, str]]
+    code_edits: dict[str, int]  # code path -> the call that last changed it
+    last_check: tuple | None  # (call number, passed, command, None), as the loop records it
+    turn: int  # which turn of the session: self-check raises each reason once per turn
+
+
+def _edited_code(arguments: str, result: str) -> str | None:
+    """The code path a successful write_file/edit_file changed, outside the scratch directory."""
+    if not result.startswith(("Wrote ", "Edited ")):
+        return None
+    try:
+        path = str(json.loads(arguments or "{}").get("path", "")).replace("\\", "/")
+    except (ValueError, AttributeError):
+        return None
+    if not path or "/.kyklos/" in f"/{path}" or not is_code_path(path):
+        return None
+    return path
+
+
+def replay_attempts(path: Path) -> list[Attempt]:
+    """Every reply in a saved session that would end its turn, with the turn's commands, code edits
+    and last check so far.
+
+    A reply ends a turn when it has no tool calls, the same test the live loop uses. A turn starts at
+    the user's message and runs through Kyklos's own mid-turn notes, so a reply after a nudge sees
+    the whole turn, as it did live. Results are paired with calls by tool-call id, so a denied or
+    errored call keeps the text that is read for an exit code. Without the workspace, edits made by
+    commands can't be seen: only the file tools' edits count, as in a session without snapshots.
     """
-    turns: list[tuple[str, list[tuple[str, str]]]] = []
+    attempts: list[Attempt] = []
+    turn, calls_run = 0, 0
     commands: list[tuple[str, str]] = []
-    pending: dict[str, str] = {}
+    code_edits: dict[str, int] = {}
+    last_check = None
+    pending: dict[str, tuple[str, str]] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
@@ -229,30 +344,54 @@ def replay_session(path: Path) -> list[tuple[str, list[tuple[str, str]]]]:
         if obj.get("_meta") == "state":
             continue
         role = obj.get("role")
-        if role == "user" and _is_image_result(obj.get("content")):
-            continue  # the images a read_file call read, sent on mid-turn: not the user speaking
+        if role == "user" and (_is_image_result(obj.get("content")) or _is_kyklos_note(obj.get("content"))):
+            continue  # Kyklos speaking mid-turn, or the images a read_file call read: not the user
         if role == "user":
-            commands, pending = [], {}
+            turn += 1
+            calls_run, commands, code_edits, last_check, pending = 0, [], {}, None, {}
         elif role == "assistant":
             calls = obj.get("tool_calls") or []
             for tc in calls:
                 fn = tc.get("function") or {}
-                if fn.get("name") != "bash":
-                    continue
-                try:
-                    command = str(json.loads(fn.get("arguments") or "{}").get("command", ""))
-                except ValueError:
-                    command = ""
-                if command:
-                    pending[tc.get("id", "")] = command
+                if fn.get("name") in ("bash", "write_file", "edit_file"):
+                    pending[tc.get("id", "")] = (fn["name"], fn.get("arguments") or "")
             if not calls:
-                turns.append((obj.get("content") or "", list(commands)))
-                commands, pending = [], {}
+                attempts.append(Attempt(obj.get("content") or "", list(commands), dict(code_edits),
+                                        last_check, turn))
         elif role == "tool":
-            command = pending.pop(obj.get("tool_call_id", ""), "")
-            if command:
-                commands.append((command, obj.get("content") or ""))
-    return turns
+            calls_run += 1
+            name, arguments = pending.pop(obj.get("tool_call_id", ""), ("", ""))
+            result = obj.get("content") or ""
+            if not isinstance(result, str):
+                continue
+            if name == "bash":
+                try:
+                    command = str(json.loads(arguments or "{}").get("command", ""))
+                except (ValueError, AttributeError):
+                    command = ""
+                if not command:
+                    continue
+                commands.append((command, result))
+                ran = result.startswith("exit code ") or "timed out" in result[:60]
+                if ran and CHECK_COMMAND_RE.search(command):
+                    last_check = (calls_run, _succeeded(result), command, None)
+            elif name:
+                edited = _edited_code(arguments, result)
+                if edited:
+                    code_edits[edited] = calls_run
+    return attempts
+
+
+def session_label(path: Path) -> str:
+    """A short name for a saved session in the report. Every project's session is `last.jsonl`, so
+    the folder it sits in tells them apart."""
+    folder = path.parent.name
+    return f"{'…' + folder[-27:] if len(folder) > 28 else folder}/{path.name}"
+
+
+def replay_session(path: Path) -> list[tuple[str, list[tuple[str, str]]]]:
+    """(answer, commands run in its turn so far) for each reply that would end a turn."""
+    return [(a.answer, a.commands) for a in replay_attempts(path)]
 
 
 def session_corpora(paths: list[Path]) -> tuple[list[Case], list[tuple[Case, list[tuple[str, str]]]]]:
@@ -265,7 +404,7 @@ def session_corpora(paths: list[Path]) -> tuple[list[Case], list[tuple[Case, lis
     commands: list[Case] = []
     answers: list[tuple[Case, list[tuple[str, str]]]] = []
     for path in paths:
-        name = path.name
+        name = session_label(path)
         for answer, runs in replay_session(path):
             if answer.strip():
                 answers.append((Case(f"replayed: {name}", answer), runs))
@@ -295,6 +434,43 @@ def audit_answers(cases: list[tuple[Case, list[tuple[str, str]]]]) -> Rate:
             rate.fired.append(Fired(case, "claim", f"{label}: {why}"))
             break
     return rate
+
+
+def audit_pattern(what: str, cases: list[Case], pattern, should_match: bool) -> Rate:
+    """How often a pattern gets these cases wrong: misses when they should match, and matches when
+    they shouldn't."""
+    rate = Rate(what, list(cases))
+    for case in cases:
+        if bool(pattern.search(case.text)) != should_match:
+            rate.fired.append(Fired(case, "missed" if should_match else "read in",
+                                    "not recognised" if should_match else "recognised, wrongly"))
+    return rate
+
+
+def audit_self_check(paths: list[Path]) -> tuple[Rate, dict[str, int]]:
+    """How often self-checking would hold back a replayed answer, and the check state of every answer
+    that came after a code change. Reasons are raised once per turn, as live, so an answer after a
+    self-check note counts only for what is new."""
+    rate = Rate("replayed answers self-checking would hold back", [])
+    states = {CHECKED: 0, UNCHECKED: 0, FAILING: 0}
+    for path in paths:
+        raised: dict[int, set[str]] = {}
+        for attempt in replay_attempts(path):
+            if not attempt.answer.strip():
+                continue
+            case = Case(f"replayed: {session_label(path)}", attempt.answer)
+            rate.cases.append(case)
+            state = check_state_by_order(attempt.code_edits, attempt.last_check)
+            if state:
+                states[state] += 1
+            claims = unsupported_claims(attempt.answer, attempt.commands)
+            seen = raised.setdefault(attempt.turn, set())
+            reasons = self_check_reasons(attempt.answer, claims, state, seen)
+            seen.update(reasons)
+            if reasons:
+                detail = f"code {state}" if state else "no code changed"
+                rate.fired.append(Fired(case, "+".join(reasons), detail))
+    return rate, states
 
 
 # ---- the report ----------------------------------------------------------------------------------
@@ -330,7 +506,8 @@ def report(rate: Rate, examples: int = 6, split_opaque: bool = False) -> None:
             if shown > examples:
                 print(f"    … and {len(seen) - examples} more distinct reasons")
                 break
-            text = f.case.text if len(f.case.text) <= 68 else f.case.text[:65] + "..."
+            flat = " ".join(f.case.text.split())  # an answer's own line breaks would break the report's
+            text = flat if len(flat) <= 68 else flat[:65] + "..."
             print(f"    [{f.kind}] {text}")
             print(f"            → {f.why}")
 
@@ -356,6 +533,24 @@ def main(argv: list[str]) -> int:
 
     report(audit_commands(commands), split_opaque=True)
     report(audit_answers(answers))
+
+    checks, not_checks = check_command_corpora()
+    declines, plain = decline_corpora()
+    report(audit_pattern("check commands self-checking wouldn't recognise", checks, CHECK_COMMAND_RE, True))
+    report(audit_pattern("other commands self-checking would take for a check", not_checks,
+                         CHECK_COMMAND_RE, False))
+    report(audit_pattern("answers saying why nothing was checked, not recognised (asked again)", declines,
+                         CHECK_DECLINED_RE, True))
+    report(audit_pattern("plain answers taken as saying why nothing was checked (check skipped)", plain,
+                         CHECK_DECLINED_RE, False))
+    if paths:
+        rate, states = audit_self_check(paths)
+        report(rate)
+        after = sum(states.values())
+        print(f"\n  answers after a code change: {after}"
+              + (f"  ·  checked {states[CHECKED]}  ·  unchecked {states[UNCHECKED]}  ·  failing {states[FAILING]}"
+                 if after else "")
+              + "\n  (replayed from the file tools' edits; command edits need the workspace, so live counts can be higher)")
     print("\nNeither number is a verdict. A group you consider correctly flagged is a group to move"
           "\nout of the corpus; one you consider wrong is a gap in the checker.\n")
     return 0

@@ -3,6 +3,7 @@
     ./.venv/bin/python eval.py                            # every task once, with your usual model
     ./.venv/bin/python eval.py fix-off-by-one long-log    # just these
     ./.venv/bin/python eval.py --repeat 3 --model kimi-k3 --profile cloud
+    ./.venv/bin/python eval.py shared-helper --repeat 5 --no-self-check   # the same, self-check off
     ./.venv/bin/python eval.py --list
 
 Each run copies a task's repo into a fresh folder under the system temp directory and runs
@@ -67,7 +68,7 @@ def summarize_trace(path: Path) -> dict:
                 continue
     m = {"model": None, "steps": 0, "sub_steps": 0, "tools": 0, "tool_failures": 0, "subagents": 0,
          "prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0, "cache_seen": 0,
-         "api_errors": 0, "compactions": 0, "outcome": None}
+         "api_errors": 0, "compactions": 0, "outcome": None, "checked": None}
     signals: Counter = Counter()
     for r in rows:
         event, depth = r.get("event"), r.get("depth", 0)
@@ -96,6 +97,7 @@ def summarize_trace(path: Path) -> dict:
             signals[r.get("kind", "?") + (f":{r['reason']}" if r.get("reason") else "")] += 1
         elif event == "turn_end" and depth == 0:
             m["outcome"] = r.get("outcome")
+            m["checked"] = r.get("checked")
     m["signals"] = dict(sorted(signals.items()))
     return m
 
@@ -123,7 +125,7 @@ def run_check(task: dict, root: Path, ws: Path) -> tuple[bool, str]:
     return proc.returncode == 0, verdict or f"FAIL: the check exited {proc.returncode} without a verdict"
 
 
-def run_one(task: dict, forward: list[str], keep: bool) -> dict:
+def run_one(task: dict, forward: list[str], keep: bool, self_check: bool = True) -> dict:
     root = Path(tempfile.mkdtemp(prefix=f"kyklos-eval-{task['name']}-")).resolve()
     (root / EVAL_MARKER).write_text("made by eval.py\n", encoding="utf-8")
     ws, home, trace = root / "ws", root / "home", root / "trace.jsonl"
@@ -137,6 +139,7 @@ def run_one(task: dict, forward: list[str], keep: bool) -> dict:
     env = dict(os.environ, WORKSPACE=str(ws), KYKLOS_HOME=str(home), KYKLOS_EVAL_ROOT=str(root),
                KYKLOS_TRACE=str(trace))
     env.pop("KYKLOS_UI", None)
+    env["KYKLOS_SELF_CHECK"] = "1" if self_check else "0"  # explicit, so a shell setting can't skew a comparison
     cmd = [sys.executable, str(HERE / "kyklos.py"), "--eval", *forward, task["prompt"]]
     started, timed_out = time.monotonic(), False
     proc = subprocess.Popen(cmd, cwd=ws, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -158,7 +161,7 @@ def run_one(task: dict, forward: list[str], keep: bool) -> dict:
     else:
         passed, verdict = run_check(task, root, ws)
     row = {"task": task["name"], "passed": passed, "verdict": verdict, "secs": round(secs, 1),
-           **summarize_trace(trace)}
+           "self_check": self_check, **summarize_trace(trace)}
     if keep:
         row["kept"] = str(root)
     else:
@@ -172,9 +175,10 @@ def describe(row: dict) -> str:
     tokens = short_tokens(row["prompt_tokens"] + row["completion_tokens"])
     subs = f"  sub {row['subagents']} ({row['sub_steps']} steps)" if row["subagents"] else ""
     signals = "  " + " ".join(f"{k}×{v}" for k, v in row["signals"].items()) if row["signals"] else ""
+    checked = f"  code {row['checked']}" if row.get("checked") else ""
     return (f"{'PASS' if row['passed'] else 'FAIL'}  {row['task']:<16} steps {row['steps']:>2}  "
             f"tools {row['tools']:>2}{subs}  tokens {tokens:>5}  cache {cache:>3}  {row['secs']:>5.0f}s"
-            f"{signals}")
+            f"{checked}{signals}")
 
 
 def main(argv: list[str]) -> int:
@@ -188,6 +192,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--submodel")
     parser.add_argument("--persona", default="off", help="default off, so a persona can't skew results")
     parser.add_argument("--out", type=Path, help="results file (default evals/results/<time>.jsonl)")
+    parser.add_argument("--no-self-check", action="store_true",
+                        help="run with KYKLOS_SELF_CHECK=0, to compare against the default")
     args = parser.parse_args(argv)
     tasks = load_tasks(args.tasks)
     if args.list:
@@ -210,7 +216,7 @@ def main(argv: list[str]) -> int:
     rows = []
     for task in tasks:
         for n in range(1, args.repeat + 1):
-            row = {"run": n, **run_one(task, forward, args.keep)}
+            row = {"run": n, **run_one(task, forward, args.keep, self_check=not args.no_self_check)}
             rows.append(row)
             with out.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(row) + "\n")
@@ -230,6 +236,10 @@ def main(argv: list[str]) -> int:
           f"\n{passed}/{len(rows)} passed  ·  {short_tokens(tokens)} tokens  ·  cache not reported")
     if signals:
         print("harness signals: " + ", ".join(f"{k} {v}" for k, v in sorted(signals.items())))
+    states = Counter(r["checked"] for r in rows if r.get("checked"))
+    if states:
+        print("code at the end: " + ", ".join(f"{k} {v}" for k, v in sorted(states.items()))
+              + ("" if not args.no_self_check else "  (self-check off)"))
     models = sorted({r["model"] for r in rows if r["model"]})
     if models:
         print(f"model: {', '.join(models)}")
