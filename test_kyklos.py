@@ -2531,7 +2531,7 @@ class RetryAndObserverTests(unittest.TestCase):
         self.assertEqual(answer, "All done.")
         self.assertEqual(buf.getvalue(), "")  # zero direct print() calls inside Agent
         # Every API call (2 for the parent, 2 for the subagent) is wrapped in model_start / model_end.
-        model = [(ev, depth) for ev, depth, _ in events if ev.startswith("model_")]
+        model = [(ev, depth) for ev, depth, _ in events if ev in ("model_start", "model_end")]
         self.assertEqual(model, [("model_start", 0), ("model_end", 0), ("model_start", 1), ("model_end", 1),
                                  ("model_start", 1), ("model_end", 1), ("model_start", 0), ("model_end", 0)])
         # The answer forms at both depths, and only ever as content: reasoning is captured into the
@@ -4918,6 +4918,41 @@ class StreamTransportTests(unittest.TestCase):
                          ["Half an ans", "Whole ", "answer."])
 
 
+    def test_progress_counts_reasoning_and_tool_arguments_but_not_their_text(self):
+        """A long think or a big tool argument streams for minutes with nothing drawn. The count is
+        how a UI shows that wait is alive, and only the count leaves: reasoning stays unshown."""
+        seen = []
+        chunks = [delta_chunk(reasoning_content="abcd"), delta_chunk(content="Hi"),
+                  delta_chunk(tool_calls=[SimpleNamespace(
+                      index=0, id="c", function=SimpleNamespace(name="bash", arguments='{"command"'))]),
+                  delta_chunk(reasoning_content="ef")]
+        collect_stream(iter(chunks), on_progress=lambda kind, n: seen.append((kind, n)))
+        self.assertEqual(seen, [("reasoning", 4), ("tool", 10), ("reasoning", 2)])
+
+    def test_model_progress_is_throttled_and_carries_running_totals(self):
+        from unittest import mock
+        import kyklos as kyklos_mod
+
+        class ThinkingClient(FakeClient):
+            def _create(self, **kwargs):
+                super()._create(**kwargs)
+                return iter([delta_chunk(reasoning_content="x" * 300) for _ in range(5)]
+                            + [delta_chunk(content="Done.")])
+
+        def progress_events(interval):
+            events = []
+            with mock.patch.object(kyklos_mod, "MODEL_PROGRESS_INTERVAL", interval):
+                Agent(ThinkingClient([reply(content="unused")]), "fake", self.ws, permission=allow_all,
+                      on_event=lambda event, **data: events.append((event, data))).send("go")
+            return [d for e, d in events if e == "model_progress"]
+
+        # The first piece is reported at once; the rest wait out the interval.
+        slow = progress_events(3600)
+        self.assertEqual(slow, [{"depth": 0, "purpose": "turn", "reasoning_chars": 300, "tool_chars": 0}])
+        every = progress_events(0)
+        self.assertEqual([d["reasoning_chars"] for d in every], [300, 600, 900, 1200, 1500])
+        self.assertTrue(all("text" not in d for d in every))
+
     def test_a_dying_stream_is_closed_not_abandoned(self):
         """An abandoned stream holds its connection out of the pool, which is the failure mode this
         change exists to stop causing -- so the retry must not leak one per attempt."""
@@ -5724,6 +5759,189 @@ class ParallelSubagentTests(unittest.TestCase):
         self.assertEqual(agent.send("go"), "Carried on.")
         self.assertIn("bad key", [m for m in agent.messages if m["role"] == "tool"][0]["content"])
         assert_tool_results_paired(self, agent.messages)
+
+
+class BackgroundSubagentTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ws = Path(self.tmp.name)
+        (self.ws / "app.py").write_text("answer = 42\n")
+        self.events = []
+
+    def agent(self, client, **kwargs):
+        return Agent(client, "fake", self.ws, on_event=self.observe, **kwargs)
+
+    def observe(self, event, depth=0, **data):
+        self.events.append((event, depth, data))
+
+    def start(self, call_id="start"):
+        return tool_call(call_id, "task_start", description="Inspect a different module", prompt="Investigate")
+
+    def job_id(self):
+        return next(data["job_id"] for event, _, data in self.events
+                    if event == "background_task" and data["status"] == "running")
+
+    def statuses(self):
+        return [data["status"] for event, _, data in self.events if event == "background_task"]
+
+    def test_main_model_and_tools_advance_while_worker_is_blocked(self):
+        import threading
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def worker():
+            entered.set()
+            self.assertTrue(release.wait(5), "the parent never advanced")
+            return reply("Worker report", prompt_tokens=10, completion_tokens=2)
+
+        def do_parent_work():
+            self.assertTrue(entered.wait(5), "the worker did not launch")
+            self.assertFalse(release.is_set())
+            return reply(tool_calls=[tool_call("read", "read_file", path="app.py")])
+
+        def collect():
+            self.assertIn("answer = 42", next(d["result"] for e, _, d in self.events
+                                             if e == "tool_result" and d["call_id"] == "read"))
+            self.assertFalse(agent._background_job.done.is_set())
+            release.set()
+            return reply(tool_calls=[tool_call("wait", "task_wait", job_id=self.job_id())])
+
+        def collect_again():
+            return reply(tool_calls=[tool_call("again", "task_wait", job_id=self.job_id())])
+
+        client = RoutingClient([reply(tool_calls=[self.start()]), do_parent_work, collect,
+                                collect_again, reply("Done", prompt_tokens=20, completion_tokens=3)],
+                               {"Investigate": [worker]})
+        agent = self.agent(client, background_subagents=True)
+        self.assertEqual(agent.send("go"), "Done")
+        self.assertEqual(self.statuses(), ["running", "ready"])
+        self.assertTrue(all(depth == 0 for _, depth, _ in self.events))
+        results = {m["tool_call_id"]: m["content"] for m in agent.messages if m["role"] == "tool"}
+        self.assertEqual((results["wait"], results["again"]), ("Worker report", "Worker report"))
+        self.assertEqual(agent.session_tokens, 35)
+        assert_tool_results_paired(self, agent.messages)
+
+    def test_background_tools_are_opt_in_plan_safe_and_parent_only(self):
+        self.assertNotIn("task_start", self.agent(FakeClient([])).tool_names)
+        self.assertNotIn("task_start", self.agent(FakeClient([]), depth=1, background_subagents=True).tool_names)
+        self.assertNotIn("task_start", self.agent(FakeClient([]), tool_names={"read_file", "task_start", "task_wait"},
+                                                  background_subagents=True).tool_names)
+        parent = self.agent(FakeClient([]), plan_mode=True, background_subagents=True)
+        self.assertTrue({"task_start", "task_wait"} <= parent.tool_names)
+        self.assertNotIn("write_file", parent.tool_names)
+        self.assertIn("too late", parent.run_tool("task_start", self.start().function.arguments))
+        child, _ = parent._spawn("explore", background=True)
+        self.addCleanup(child.close)
+        self.assertEqual(child.tool_names, {"read_file", "grep", "glob"})
+        self.assertFalse(child.permission("write_file", {}, set())[0])
+
+    def test_failed_worker_returns_a_tool_error(self):
+        def collect():
+            return reply(tool_calls=[tool_call("wait", "task_wait", job_id=self.job_id())])
+
+        client = RoutingClient([reply(tool_calls=[self.start()]), collect, reply("Recovered")],
+                               {"Investigate": [ValueError("provider is unavailable")]})
+        agent = self.agent(client, background_subagents=True)
+        self.assertEqual(agent.send("go"), "Recovered")
+        self.assertEqual(self.statuses(), ["running", "failed"])
+        self.assertIn("provider is unavailable", next(d["result"] for e, _, d in self.events
+                                                      if e == "tool_result" and d["call_id"] == "wait"))
+        assert_tool_results_paired(self, agent.messages)
+
+    def test_uncollected_report_gets_one_reminder_and_is_marked_unused(self):
+        def early_answer():
+            self.assertTrue(agent._background_job.done.wait(5))
+            return reply("Draft")
+
+        client = RoutingClient([reply(tool_calls=[self.start(), self.start("second")]), early_answer,
+                                reply("Final")], {"Investigate": [reply("Unused", prompt_tokens=8)]})
+        agent = self.agent(client, background_subagents=True)
+        self.assertEqual(agent.send("go"), "Final")
+        self.assertEqual(self.statuses(), ["running", "ready", "unused"])
+        self.assertEqual(agent.session_tokens, 8)
+        self.assertEqual(sum(d.get("reason") == "background_task" for _, _, d in self.events), 1)
+        self.assertIn("one background job per turn", next(d["result"] for e, _, d in self.events
+                                                          if e == "tool_result" and d["call_id"] == "second"))
+        self.assertNotIn("Unused", json.dumps(agent.messages))
+
+    def test_interrupt_during_wait_discards_late_result_and_expires_id(self):
+        import threading
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def worker():
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return reply("Late report", prompt_tokens=8)
+
+        def wait_reply():
+            self.assertTrue(entered.wait(5))
+            return reply(tool_calls=[tool_call("wait", "task_wait", job_id=self.job_id())])
+
+        def interrupt_wait(event, depth=0, **data):
+            self.observe(event, depth, **data)
+            if event == "tool_call" and data["call_id"] == "wait":
+                job = agent._background_job
+                patcher = mock.patch.object(job.done, "wait", side_effect=KeyboardInterrupt)
+                patcher.start()
+                self.addCleanup(patcher.stop)
+                self.wait_patch = patcher
+
+        client = RoutingClient([reply(tool_calls=[self.start()]), wait_reply], {"Investigate": [worker]})
+        agent = self.agent(client, background_subagents=True, stream=False)
+        agent.on_event = interrupt_wait
+        with self.assertRaises(KeyboardInterrupt):
+            agent.send("go")
+        agent.repair_after_interrupt()
+        self.wait_patch.stop()
+        job = agent._background_worker
+        self.assertTrue(job.cancel.is_set())
+        self.assertEqual(self.statuses(), ["running", "cancelled"])
+
+        agent.on_event = self.observe
+        client.replies.extend([reply(tool_calls=[self.start("new"), tool_call("old", "task_wait", job_id=job.job_id)]),
+                               reply("Next turn")])
+        self.assertEqual(agent.send("go again"), "Next turn")
+        release.set()
+        self.assertTrue(job.done.wait(5))
+        client.replies.append(reply("Still working"))
+        self.assertEqual(agent.send("another turn"), "Still working")
+        self.assertEqual(agent.session_tokens, 8)
+        self.assertEqual(self.statuses(), ["running", "cancelled"])
+        results = {m["tool_call_id"]: m["content"] for m in agent.messages if m["role"] == "tool"}
+        self.assertIn("previous background worker", results["new"])
+        self.assertIn("unknown background job", results["old"])
+        self.assertNotIn("Late report", json.dumps(agent.messages))
+        assert_tool_results_paired(self, agent.messages)
+
+    def test_deadline_returns_while_worker_is_still_blocked(self):
+        import threading
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def worker():
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return reply("Too late")
+
+        def wait_reply():
+            self.assertTrue(entered.wait(5))
+            agent._background_job.deadline = 0
+            return reply(tool_calls=[tool_call("wait", "task_wait", job_id=self.job_id())])
+
+        client = RoutingClient([reply(tool_calls=[self.start()]), wait_reply, reply("Continued")],
+                               {"Investigate": [worker]})
+        agent = self.agent(client, background_subagents=True)
+        self.assertEqual(agent.send("go"), "Continued")
+        job = agent._background_worker
+        self.assertTrue(job.cancel.is_set())
+        self.assertFalse(job.done.is_set())
+        release.set()
+        self.assertTrue(job.done.wait(5))
+        self.assertEqual(self.statuses(), ["running", "timed_out"])
+        self.assertIn("timed out", next(d["result"] for e, _, d in self.events
+                                        if e == "tool_result" and d["call_id"] == "wait"))
 
 
 class TraceTests(unittest.TestCase):

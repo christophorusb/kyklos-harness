@@ -16,11 +16,13 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from kyklos import NO_APPROVER_NOTE, Agent
+from kyklos import (DEFAULT_MAX_STEPS, NO_APPROVER_NOTE, Agent, edit_settings, load_settings,
+                    runtime_preferences, save_settings, update_runtime_preferences)
 from serve import (BUSY, INVALID_PARAMS, METHOD_NOT_FOUND, NOT_READY, PARSE_ERROR, PROTOCOL_VERSION, ServeUI,
                    line_counts)
-from test_kyklos import FakeClient, reply, tool_call
+from test_kyklos import FakeClient, RoutingClient, reply, tool_call
 
 HERE = Path(__file__).parent
 WAIT = 15  # seconds a client waits for any one message before the test fails
@@ -102,9 +104,9 @@ class ServeTestCase(unittest.TestCase):
                 pass
         self.tmp.cleanup()
 
-    def serve(self, replies, script, start_params=None, agent_kwargs=None):
+    def serve(self, replies, script, start_params=None, agent_kwargs=None, client_factory=FakeClient):
         """Handshake, then run the agent until `script(client)` (on its own thread) is done with it."""
-        fake = FakeClient(replies)
+        fake = client_factory(replies)
         failures = []
 
         def drive():
@@ -306,6 +308,48 @@ class TurnTests(ServeTestCase):
 
 
 class CancelTests(ServeTestCase):
+    def test_cancel_background_wait_and_resume_over_rpc(self):
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def worker():
+            entered.set()
+            if not release.wait(5):
+                return AssertionError("the server did not cancel the turn while the worker was blocked")
+            return reply("Late report")
+
+        def wait_for_report():
+            self.assertTrue(entered.wait(5))
+            result = fake.calls[-1][-1]["content"]
+            job_id = result.split()[-1].rstrip(".")
+            return reply(content="Collecting the report.",
+                         tool_calls=[tool_call("wait", "task_wait", job_id=job_id)])
+
+        def script(c):
+            rid = c.call("session/prompt", text="start and collect")
+            c.expect(lambda m: m.get("method") == "session/update"
+                     and m["params"]["event"] == "tool_call"
+                     and m["params"]["data"]["name"] == "task_wait")
+            c.notify("session/cancel")
+            self.assertEqual(c.result(rid)["result"]["outcome"], "interrupted")
+            release.set()
+            self.assertEqual(c.result(c.call("session/prompt", text="next turn"))["result"]["answer"], "Recovered")
+            self.shutdown(c)
+
+        start = tool_call("start", "task_start", description="Inspect file", prompt="Inspect")
+        fake = RoutingClient([reply(tool_calls=[start]), wait_for_report, reply("Recovered")],
+                             {"Inspect": [worker]})
+        agent, _ = self.serve([], script, agent_kwargs={"background_subagents": True},
+                              client_factory=lambda _: fake)
+        self.assertTrue(agent._background_worker.done.wait(5))
+        updates = self.client.updates()
+        self.assertEqual([u["seq"] for u in updates], list(range(1, len(updates) + 1)))
+        self.assertTrue(all(u["depth"] == 0 for u in updates))
+        self.assertEqual([u["data"]["status"] for u in self.client.updates("background_task")],
+                         ["running", "cancelled"])
+        self.assertTrue(any(u["event"] == "answer_delta" for u in updates))
+        self.assertNotIn("Late report", self.session.read_text())
+
     def test_cancel_while_a_permission_prompt_is_open(self):
         def script(c):
             rid = c.call("session/prompt", text="go")
@@ -390,6 +434,89 @@ class CommandTests(ServeTestCase):
 
         self.serve([], script)
         self.assertTrue(self.result["exit"])
+
+
+class SettingsTests(ServeTestCase):
+    def test_update_reset_and_environment_precedence(self):
+        home = self.ui.settings_home = self.ws / "home"
+        save_settings(home, {"persona": "reviewer", "profiles": {"local": {"model": "fake"}}})
+
+        def script(c):
+            self.assertTrue(self.init["capabilities"]["runtime_settings"])
+            current = c.result(c.call("settings/read"))["result"]
+            self.assertEqual(current["fields"]["stream"],
+                             {"value": False, "active": False, "default": True,
+                              "source": "environment", "variable": "STREAM"})
+            self.assertFalse(current["restart_required"])
+
+            for changes in ({"max_steps": True}, {"max_steps": 0}, {"max_steps": 1.5},
+                            {"background_subagents": "true"}, {"api_key": "sensitive"},
+                            {"max_steps": 75, "stream": True}):
+                with self.subTest(changes=list(changes)):
+                    self.assertEqual(c.result(c.call("settings/update", changes=changes))["error"]["code"],
+                                     INVALID_PARAMS)
+            self.assertNotIn("runtime", load_settings(home))
+
+            updated = c.result(c.call("settings/update", changes={
+                "max_steps": 75, "background_subagents": True}))["result"]
+            self.assertTrue(updated["restart_required"])
+            self.assertEqual(updated["fields"]["max_steps"]["active"], DEFAULT_MAX_STEPS)
+            effective = runtime_preferences(load_settings(home), {})
+            self.assertEqual(effective["max_steps"]["value"], 75)
+            self.assertTrue(effective["background_subagents"]["value"])
+            self.assertEqual(runtime_preferences(load_settings(home), {"MAX_STEPS": "30"})["max_steps"]["value"], 30)
+
+            reset = c.result(c.call("settings/update", changes={
+                "max_steps": None, "background_subagents": None}))["result"]
+            self.assertFalse(reset["restart_required"])
+            self.assertEqual(reset["fields"]["max_steps"]["source"], "default")
+            self.assertEqual(load_settings(home), {"persona": "reviewer", "profiles": {"local": {"model": "fake"}}})
+            self.shutdown(c)
+
+        with patch.dict(os.environ, {"STREAM": "0"}):
+            os.environ.pop("MAX_STEPS", None)
+            os.environ.pop("KYKLOS_BACKGROUND_SUBAGENTS", None)
+            self.serve([], script, agent_kwargs={"stream": False})
+
+    def test_overlapping_writes_keep_persona_and_runtime_settings(self):
+        home = self.ws / "home"
+        waiting = threading.Event()
+        result = queue.Queue()
+
+        def update():
+            waiting.set()
+            try:
+                result.put(update_runtime_preferences(home, {}, {"max_steps": 70}))
+            except Exception as exc:
+                result.put(exc)
+
+        with edit_settings(home) as settings:
+            settings["persona"] = "reviewer"
+            writer = threading.Thread(target=update, daemon=True)
+            writer.start()
+            self.assertTrue(waiting.wait(5))
+        writer.join(5)
+        self.assertFalse(writer.is_alive())
+        updated = result.get_nowait()
+        if isinstance(updated, Exception):
+            raise updated
+        self.assertEqual(updated["max_steps"]["value"], 70)
+        self.assertEqual(load_settings(home), {"persona": "reviewer", "runtime": {"max_steps": 70}})
+
+    def test_invalid_settings_file_is_preserved(self):
+        home = self.ui.settings_home = self.ws / "home"
+        home.mkdir()
+        path = home / "settings.json"
+        malformed = '{"persona": "reviewer",'
+        path.write_text(malformed)
+
+        def script(c):
+            for method, params in (("settings/read", {}), ("settings/update", {"changes": {"max_steps": 75}})):
+                self.assertIn("error", c.result(c.call(method, **params)))
+            self.assertEqual(path.read_text(), malformed)
+            self.shutdown(c)
+
+        self.serve([], script)
 
 
 class CallbackTests(unittest.TestCase):

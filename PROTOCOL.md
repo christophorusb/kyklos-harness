@@ -56,7 +56,7 @@ kyklos --serve                     # also accepts --profile NAME, --plan, --trus
 ```
 
 `.env`, profiles, personas and saved picks are read exactly as they are in the terminal. A desktop
-app adds no configuration of its own.
+app can manage a small set of runtime preferences saved by Kyklos in `settings.json`.
 
 ## 3. Lifecycle
 
@@ -108,6 +108,8 @@ before the handshake.
 | `session/cancel` | *(notification)* | none: the in-flight `session/prompt` returns with `outcome: "interrupted"` |
 | `command/run` | `text` (the whole line, `/model gpt-5`) | `then_send: string \| null`, `exit: bool` |
 | `session/state` | none | `state` |
+| `settings/read` | none | `fields`, `restart_required` |
+| `settings/update` | `changes` | same as `settings/read` |
 | `shutdown` | none | `null`, then the process exits |
 
 - **`session/prompt`** is `Agent.send`. `outcome` is the agent's `last_outcome` (`answer`,
@@ -122,6 +124,13 @@ before the handshake.
   to send (such as `/plan <request>` or a custom prompt) comes back as `then_send`, which the
   client passes unchanged to `session/prompt`. For a custom command, the server first sends a
   `say` notification with the source file. Show it before submitting the expanded prompt.
+- **Runtime settings** are available when `initialize.capabilities.runtime_settings` is true.
+  Each field has `value` (on next startup), `active` (in this session), `default`, `source`
+  (`default`, `saved`, or `environment`), and `variable` (the matching environment variable).
+  Updates accept only `background_subagents` and `stream` (booleans) and `max_steps` (positive
+  JSON safe integer). Use `null` to clear a saved preference. Environment overrides are read-only.
+  All fields in a patch are validated before anything is saved. A running session keeps its active
+  settings, so restart it to apply a change. No provider settings or credentials are returned.
 - **Busy:** while a turn runs, only `session/cancel`, `session/state` and `shutdown` are accepted.
   Anything else gets error `-32001 busy`. The terminal can't run `/model` mid-turn either.
 - **Errors:** `-32001 busy` (above). `-32002 api_error` is an API failure that ends a turn, with
@@ -269,12 +278,14 @@ keyword arguments, unchanged:
 | `turn_end` | `steps`, `outcome`, `answer_chars`, `claims` | Not sent for a cancelled parallel subagent |
 | `model_start` | `purpose` | `turn` or `summary` (compaction) |
 | `model_end` | `purpose`, `secs`, `prompt_tokens`, `completion_tokens`, `cached_tokens`, `finish_reason`, `error` | Usage fields may be missing; see the `no_usage` notice |
+| `model_progress` | `purpose`, `reasoning_chars`, `tool_chars` | Streaming only. Running totals of reasoning and tool-call argument characters received so far in this call, never their text, sent at most once a second (the first at once). Lets a client show a long wait is alive. Counts restart on a retry. Never replayed from a parallel lane's backlog |
 | `answer_delta` | `text` | Transient: may be discarded and redrawn by a retry. Never put it in history; the answer is `session/prompt`'s result |
 | `thought` | `text` | Content written alongside tool calls |
 | `tool_call` | `call_id`, `name`, `arguments` | `arguments` is the raw JSON string the model sent, which may be invalid |
 | `tool_result` | `call_id`, `name`, `result`, `secs` | `result` is already secret-scrubbed. Status is read off its first words, as `result_status` does |
 | `subagent_start` | `description`, `mode`, `model`, `effort`, `routed` | |
 | `subagent_end` | the same, plus `steps`, `secs` | `secs` is wall time; a parallel lane's events may have been replayed late |
+| `background_task` | `job_id`, `description`, `status`, `secs` | Emitted at depth 0 for an opt-in read-only background task. Status is `running`, `ready`, `failed`, `cancelled`, `timed_out`, or `unused`. Nested worker events are omitted. |
 | `plan` | `steps`, `active` | The resolved plan, never the call's arguments |
 | `compact` | `stage`, `before`, `after`, `pruned` | `stage` is `pruned` or `summarized` |
 | `retry` | `attempt`, `max_attempts`, `delay`, `error` | |

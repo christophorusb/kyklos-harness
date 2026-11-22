@@ -376,6 +376,7 @@ class AeroUI:
         self.agent = None
         self._live = None
         self._thinking: dict[int, tuple] = {}   # depth -> (start time, purpose)
+        self._received: dict[int, int] = {}     # depth -> reasoning + tool-call chars streamed so far
         self._running: dict[int, tuple] = {}    # depth -> (tool name, label, start time)
         self._pending: dict[int, dict] = {}     # depth -> info about the call in progress
         self._subs: list[dict] = []             # running subagents, innermost last
@@ -463,6 +464,7 @@ class AeroUI:
         self._turn_active = False
         self._pause_live()
         self._thinking.clear()
+        self._received.clear()
         self._running.clear()
         self._pending.clear()
         self._subs.clear()
@@ -527,9 +529,12 @@ class AeroUI:
             # Once text is arriving, "thinking" is the wrong word for what the wait is.
             what = "compacting context" if purpose == "summary" else \
                 ("answering" if self._answer else "thinking")
+            # A count that keeps rising is the sign a long wait is a model at work, not a dead line.
+            received = self._received.get(0)
+            got = f"{short_tokens(received)} chars received {self.g['dot']} " if received else ""
             rows.append(Text("  ") + Text(glyph, style=color) +
-                        Text(f" {what} {self.g['dot']} {int(time.monotonic() - start)}s "
-                             f"{self.g['dot']} ctrl+c to interrupt", style="frost"))
+                        Text(f" {what} {self.g['dot']} {int(time.monotonic() - start)}s {self.g['dot']} "
+                             f"{got}ctrl+c to interrupt", style="frost"))
             rows.extend(self._answer_preview())
         if self._turn_active and self.agent:  # the status line the prompt's toolbar shows while idle
             rows.append(self.status_text(self.agent))
@@ -548,8 +553,13 @@ class AeroUI:
         if depth == 0:
             self._answer = ""
 
+    def _on_model_progress(self, depth, reasoning_chars=0, tool_chars=0, **_):
+        if depth in self._thinking:
+            self._received[depth] = reasoning_chars + tool_chars
+
     def _on_model_end(self, depth, **_):
         self._thinking.pop(depth, None)
+        self._received.pop(depth, None)
         # Dropped as the reply lands: what happens next is either `answer()` printing the box or
         # tool rows scrolling past, and neither should sit under a copy of the text.
         if depth == 0:
@@ -688,6 +698,10 @@ class AeroUI:
         # after the fact, and the time since its block appeared would say it took no time at all.
         self._last_sub = {"steps": steps, "secs": time.monotonic() - sub["start"] if secs is None else secs,
                           "model": model or sub.get("model"), "effort": effort or sub.get("effort")}
+
+    def _on_background_task(self, depth, description="", status="", **_):
+        label = f"Background task: {sanitize_terminal_text(description)} · {status.replace('_', ' ')}"
+        self.print(Text(label, style="orchid"), indent=2)
 
     def _on_compact(self, depth, stage="", before=0, after=0, pruned=0, **_):
         what = f"cleared {_plural(pruned, 'old tool result')}" if stage == "pruned" else "summarized older turns"

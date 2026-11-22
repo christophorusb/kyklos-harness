@@ -21,6 +21,8 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 
+from graph import WorkspaceGraph, validate_dag
+
 MAX_OUTPUT_CHARS = 20_000  # keep tool results from flooding the context window
 MAX_SEARCH_RESULTS = 200
 MAX_SEARCH_FILE_BYTES = 2_000_000
@@ -791,13 +793,11 @@ def _declared_names(source: str) -> list[str]:
 def repository_map(workspace: Path, budget_tokens: int = MAP_TOKEN_BUDGET) -> str:
     """A sketch of the workspace: which source files exist and what each one defines."""
     rows = []
-    # Shallow paths first: when the budget runs out, top-level modules are likelier to be the
-    # entry points than something eight directories down, and alphabetical order would be arbitrary.
-    for path in sorted(workspace.rglob("*"), key=lambda p: (len(p.relative_to(workspace).parts), p)):
+    # Imported/referenced hubs come first by PageRank centrality, then shallow paths first.
+    ranked_rels = WorkspaceGraph(workspace).ranked_files()
+    for rel in ranked_rels:
+        path = workspace / rel
         if path.suffix not in MAP_SUFFIXES or not path.is_file():
-            continue
-        parts = path.relative_to(workspace).parts
-        if SKIP_DIRS.intersection(parts) or any(p.startswith(".") for p in parts[:-1]):
             continue
         try:
             source = path.read_text(encoding="utf-8", errors="replace")
@@ -817,7 +817,7 @@ def repository_map(workspace: Path, budget_tokens: int = MAP_TOKEN_BUDGET) -> st
             shown.append(name)
             used += len(name) + 2
         extra = f", +{len(names) - len(shown)} more" if len(names) > len(shown) else ""
-        rows.append(f"{path.relative_to(workspace).as_posix()}: {', '.join(shown) or '…'}{extra}")
+        rows.append(f"{rel}: {', '.join(shown) or '…'}{extra}")
     if not rows:
         return ""
     kept, used = [], 0
@@ -1415,7 +1415,7 @@ def load_image(p: Path, shown_as: str) -> dict:
 
 
 class Tools:
-    def __init__(self, workspace: Path, before_write=None, sees_images=None, image_delegate=None):
+    def __init__(self, workspace: Path, before_write=None, sees_images=None, image_delegate=None, overlay=None):
         self.workspace = workspace.resolve()
         self.before_write = before_write
         # Whether the model on the other end accepts images; asked at each read, because /model
@@ -1425,10 +1425,11 @@ class Tools:
         # The subagent model that can look at an image this model can't, or None; see
         # Agent.image_delegate. Asked at each read, for the same reason as sees_images.
         self.image_delegate = image_delegate or (lambda: None)
+        self.overlay = overlay
         self.pending_images: list[dict] = []
-        # The plan the model is working through. Steps are linear, so one index is the whole
-        # state: everything before `plan_active` is done, everything after is still to do.
+        # The plan the model is working through. Steps may be linear strings or DAG nodes.
         self.plan_steps: list[str] = []
+        self.plan_dag: list[dict] = []
         self.plan_active = 0
 
     # ---- helpers -----------------------------------------------------------
@@ -1676,6 +1677,26 @@ class Tools:
                               "run in their own terminal." if timeout > MAX_BASH_TIMEOUT else "")
                     raise ToolError(f"bash timeout must be between 1 and {MAX_BASH_TIMEOUT} seconds "
                                     f"(got {timeout}).{longer}")
+        elif name == "code_graph":
+            unknown = sorted(set(args) - {"action", "target", "to", "depth", "note"})
+            if unknown:
+                raise TypeError(f"code_graph() got an unexpected keyword argument {unknown[0]!r}")
+            action = args.get("action")
+            if not isinstance(action, str) or action not in ("summary", "impact", "neighbors", "path", "tests", "note"):
+                raise ToolError("code_graph() action must be one of: summary, impact, neighbors, path, tests, note")
+            if "depth" in args:
+                depth = args["depth"]
+                if isinstance(depth, bool) or not isinstance(depth, int) or not 1 <= depth <= 5:
+                    raise ToolError(f"code_graph() depth must be an integer between 1 and 5, not {depth!r}")
+            for key in ("target", "to"):
+                val = args.get(key)
+                if val is not None:
+                    if not isinstance(val, str):
+                        raise TypeError(f"code_graph() {key} must be a string path")
+                    if val.strip():
+                        resolved = self._resolve(val)
+                        if is_secret_file(resolved):
+                            raise ToolError(f"Refusing to inspect {val}: it likely contains secrets.")
 
     def _rel(self, p: Path) -> str:
         return p.relative_to(self.workspace).as_posix()
@@ -1993,6 +2014,30 @@ class Tools:
                      "aside. Tell the user.")
         return note
 
+    def code_graph(self, action: str = "summary", target: str = "", to: str = "",
+                   depth: int = 2, note: str = "") -> str:
+        """Inspect codebase dependencies, PageRank centrality, blast radius, or pin a note."""
+        if action not in ("summary", "impact", "neighbors", "path", "tests", "note"):
+            raise ToolError("action must be one of: summary, impact, neighbors, path, tests, note")
+        if isinstance(depth, bool) or not isinstance(depth, int) or not 1 <= depth <= 5:
+            raise ToolError(f"depth must be an integer between 1 and 5, not {depth!r}")
+        rel_target = ""
+        if target and target.strip():
+            p = self._resolve(target)
+            if is_secret_file(p):
+                raise ToolError(f"Refusing to inspect {target}: it likely contains secrets.")
+            rel_target = self._rel(p)
+        rel_to = ""
+        if to and to.strip():
+            p_to = self._resolve(to)
+            if is_secret_file(p_to):
+                raise ToolError(f"Refusing to inspect {to}: it likely contains secrets.")
+            rel_to = self._rel(p_to)
+        out = WorkspaceGraph(self.workspace).query(
+            action=action, target=rel_target, to=rel_to, depth=depth, overlay=self.overlay, note=note
+        )
+        return self._truncate(out)
+
     # ---- the plan ----------------------------------------------------------
     # The one tool that changes nothing: it exists so the model's intent reaches the user as
     # structure instead of prose. Raw reasoning arrives faster than anyone can read it, and a
@@ -2000,18 +2045,49 @@ class Tools:
     # tests" is a stage, and a stage can be drawn. The UI renders it; nothing here prints.
 
     def plan(self, steps: list = None, active: int = None) -> str:
-        """Set the steps for this task, or mark which one is in progress."""
+        """Set the steps for this task (linear strings or DAG nodes), or mark which one is in progress."""
         if steps is None and active is None:
             raise ToolError("plan needs steps (to set the plan) or active (to say which step is in progress)")
-        new_steps = self.plan_steps
+        new_steps, new_dag = self.plan_steps, self.plan_dag
         if steps is not None:
-            if not isinstance(steps, list) or not all(isinstance(s, str) for s in steps):
-                raise ToolError("steps must be a list of strings, one per step")
+            if not isinstance(steps, list) or not steps:
+                raise ToolError("steps must be a non-empty list of strings or DAG step objects")
             if not 1 <= len(steps) <= MAX_PLAN_STEPS:
                 raise ToolError(f"a plan has 1 to {MAX_PLAN_STEPS} steps, not {len(steps)}")
-            new_steps = [plain_line(s) for s in steps]
-            if not all(new_steps):  # a step that was only whitespace or escapes says nothing
-                raise ToolError("every step needs some text of its own")
+            if all(isinstance(s, str) for s in steps):
+                new_steps = [plain_line(s) for s in steps]
+                if not all(new_steps):  # a step that was only whitespace or escapes says nothing
+                    raise ToolError("every step needs some text of its own")
+                new_dag = []
+            elif all(isinstance(s, dict) for s in steps):
+                cleaned_dag = []
+                for idx, item in enumerate(steps):
+                    unknown = sorted(set(item) - {"id", "step", "depends_on"})
+                    if unknown:
+                        raise ToolError(f"DAG step {idx} has unexpected field {unknown[0]!r}")
+                    raw_id, raw_step = item.get("id"), item.get("step")
+                    if not isinstance(raw_id, str) or not plain_line(raw_id):
+                        raise ToolError(f"DAG step {idx} needs a non-empty string 'id'")
+                    if not isinstance(raw_step, str) or not plain_line(raw_step):
+                        raise ToolError("every step needs some text of its own")
+                    raw_deps = item.get("depends_on", [])
+                    if raw_deps is None:
+                        raw_deps = []
+                    if not isinstance(raw_deps, list) or not all(isinstance(d, str) and plain_line(d) for d in raw_deps):
+                        raise ToolError(f"depends_on for {raw_id!r} must be a list of step id strings")
+                    cleaned_dag.append({
+                        "id": plain_line(raw_id),
+                        "step": plain_line(raw_step),
+                        "depends_on": [plain_line(d) for d in raw_deps],
+                    })
+                try:
+                    validate_dag(cleaned_dag)
+                except ValueError as e:
+                    raise ToolError(str(e))
+                new_steps = [node["step"] for node in cleaned_dag]
+                new_dag = cleaned_dag
+            else:
+                raise ToolError("steps must be a list of strings, or a list of {id, step, depends_on} objects")
         if not new_steps:
             raise ToolError("there is no plan yet: call plan with steps before marking one active")
         # A new plan starts on its first step unless told otherwise; an `active`-only call moves
@@ -2021,7 +2097,7 @@ class Tools:
                 or not 0 <= new_active <= len(new_steps):
             raise ToolError(f"active is the 1-based step in progress, or 0 once the plan is finished, "
                             f"not {new_active!r} (this plan has {len(new_steps)} steps)")
-        self.plan_steps, self.plan_active = new_steps, new_active
+        self.plan_steps, self.plan_dag, self.plan_active = new_steps, new_dag, new_active
         return self.plan_text()
 
     def plan_text(self) -> str:
@@ -2031,17 +2107,23 @@ class Tools:
         if not self.plan_steps:
             return "No plan set."
         rows = []
+        has_dag = len(self.plan_dag) == len(self.plan_steps)
         for i, step in enumerate(self.plan_steps, 1):
             done = self.plan_active == 0 or i < self.plan_active
             mark = "x" if done else (">" if i == self.plan_active else " ")
-            rows.append(f"  [{mark}] {i}. {step}")
+            if has_dag:
+                node = self.plan_dag[i - 1]
+                deps = f" [depends on: {', '.join(node['depends_on'])}]" if node.get("depends_on") else ""
+                rows.append(f"  [{mark}] {i}. [{node['id']}] {step}{deps}")
+            else:
+                rows.append(f"  [{mark}] {i}. {step}")
         head = ("every step done" if self.plan_active == 0
                 else f"step {self.plan_active} of {len(self.plan_steps)} in progress")
         return f"Plan ({head}):\n" + "\n".join(rows)
 
 
 # Tools that run without asking. Everything else goes through the permission prompt.
-SAFE_TOOLS = {"read_file", "grep", "glob", "plan"}
+SAFE_TOOLS = {"read_file", "grep", "glob", "plan", "code_graph"}
 
 SCHEMAS = [
     {
@@ -2165,9 +2247,9 @@ SCHEMAS = [
                 "type": "object",
                 "properties": {
                     "steps": {
-                        "type": "array", "items": {"type": "string"},
-                        "description": "The whole plan, in order, as short imperative phrases of at "
-                                       "most about seven words. Replaces any previous plan.",
+                        "type": "array",
+                        "description": "The whole plan: short imperative strings of at most about seven words, "
+                                       "or DAG step objects {id, step, depends_on?}. Replaces any previous plan.",
                     },
                     "active": {"type": "integer", "description": "The 1-based step now in progress, "
                                                                  "or 0 when every step is done"},
@@ -2194,3 +2276,31 @@ SCHEMAS = [
         },
     },
 ]
+
+CODE_GRAPH_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "code_graph",
+        "description": (
+            "Query the codebase dependency, PageRank centrality, blast-radius, and test-coupling graph. "
+            "Use 'summary' for the most central files, 'impact' to see reverse dependents and linked tests "
+            "before changing a file, 'neighbors' for imports and callers, 'tests' for linked test files, "
+            "'path' for a dependency chain between two files, or 'note' to pin a persistent architectural note."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["summary", "impact", "neighbors", "path", "tests", "note"],
+                },
+                "target": {"type": "string", "description": "Workspace-relative source file path"},
+                "to": {"type": "string", "description": "Second file path for action='path'"},
+                "depth": {"type": "integer", "description": "Blast-radius traversal hops (1-5, default 2)"},
+                "note": {"type": "string", "description": "Architectural constraint to pin for action='note'"},
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+    },
+}

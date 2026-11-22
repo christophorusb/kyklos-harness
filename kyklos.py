@@ -19,19 +19,23 @@ import tempfile
 import textwrap
 import threading
 import time
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
+from queue import Empty, SimpleQueue
 from types import SimpleNamespace
+from uuid import uuid4
 
 from openai import APIConnectionError, APITimeoutError, InternalServerError, OpenAI, RateLimitError
 
 from extensions import (MAX_FRONTMATTER_CHARS, MAX_INSTRUCTIONS_CHARS, PROJECT_SKILLS_DIR, SkillCatalog,
                         discover_skills, header_pair, split_frontmatter, unquote_header_value)
+from graph import KnowledgeOverlay, WorkspaceGraph, validate_dag
 from imagegen import ImageError, ImageGenerator, image_config
 from mcp_client import MCP_PREFIX, MCP, MCPError, MCPTool, schema_tokens
 from snapshots import SnapshotError, WorkspaceSnapshots
-from tools import (SAFE_TOOLS, SCHEMAS, SHELL_NAME, ToolError, Tools, _match_edit, apply_edits, command_touches_secret,
-                   edit_list,
+from tools import (CODE_GRAPH_SCHEMA, SAFE_TOOLS, SCHEMAS, SHELL_NAME, ToolError, Tools, _match_edit,
+                   apply_edits, command_touches_secret, edit_list, is_secret_file,
                    GENERATED_IMAGE_SUFFIXES, describe_image, hide_env_names, image_info, load_image,
                    is_scratch_path, MISSING_TOOL_ADVICE, missing_unix_tools, plain_line, probe_commands,
                    probe_sandbox,
@@ -57,6 +61,8 @@ PROJECT_EXTENSION_PATHS = {tuple(path.split("/")): f"{path}/"
                            for path in (PROJECT_COMMANDS_DIR, PROJECT_SKILLS_DIR)}
 MCP_SCHEMA_WINDOW_SHARE = 0.10
 MAX_API_RETRIES = 3
+# How often a streaming call reports how much reasoning and tool-call text has arrived (seconds).
+MODEL_PROGRESS_INTERVAL = 1.0
 RETRY_BASE_DELAY = 1.0
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
@@ -153,11 +159,53 @@ TASK_SCHEMA = {
                 "prompt": {"type": "string", "description": "Complete, self-contained instructions, "
                                                             "including what the answer should contain"},
                 "mode": {"type": "string", "enum": ["explore", "general"], "description": "Default explore"},
+                "id": {"type": "string", "description": "Optional identifier when ordering tasks in depends_on"},
+                "depends_on": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional ids of explore tasks in this same call that must finish first",
+                },
             },
             "required": ["description", "prompt"],
         },
     },
 }
+
+BACKGROUND_TASK_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "task_start",
+            "description": ("Start one read-only explore subagent in the background. Returns a job ID "
+                            "immediately so you can do independent work before collecting the report."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": TASK_SCHEMA["function"]["parameters"]["properties"]["description"],
+                    "prompt": TASK_SCHEMA["function"]["parameters"]["properties"]["prompt"],
+                },
+                "required": ["description", "prompt"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_wait",
+            "description": ("Collect a background subagent's report. Waits if still running. "
+                            "Use the job ID from task_start in this turn."),
+            "parameters": {
+                "type": "object",
+                "properties": {"job_id": {"type": "string"}},
+                "required": ["job_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+BACKGROUND_TASK_TOOLS = frozenset(schema["function"]["name"] for schema in BACKGROUND_TASK_SCHEMAS)
+
 
 # Offered only when an image provider is configured (IMAGE_* in .env); never to subagents or in
 # plan mode. Each call sends a prompt to that provider and usually costs money, so it always asks.
@@ -240,7 +288,7 @@ LOAD_SKILL_SCHEMA = {
     },
 }
 
-PLAN_TOOLS = SAFE_TOOLS | {"task", "ask_user", "load_skill"}
+PLAN_TOOLS = SAFE_TOOLS | {"task", "ask_user", "load_skill"} | BACKGROUND_TASK_TOOLS
 PLAN_PROMPT = """
 
 You are in PLAN MODE (read-only). You may explore the codebase with read_file, grep, glob, and explore subagents, but you cannot create, edit, or run anything.
@@ -2060,6 +2108,23 @@ def _canonical_args(raw: str) -> str:
 # permission, and each spends most of its life waiting on the API. More than this at once mostly
 # buys rate-limit errors.
 MAX_PARALLEL_SUBAGENTS = 4
+BACKGROUND_TASK_SECONDS = 120
+BACKGROUND_REQUEST_SECONDS = 30
+
+
+@dataclass
+class BackgroundJob:
+    job_id: str
+    description: str
+    started: float
+    deadline: float
+    cancel: threading.Event = field(default_factory=threading.Event)
+    done: threading.Event = field(default_factory=threading.Event)
+    result: str = ""  # published by the worker before setting done
+    outcome: str = "failed"
+    finished: float = 0.0
+    status: str = "running"  # main thread only
+    collected: bool = False
 # The workspace sketch in the system prompt is frozen for the conversation, because every provider
 # that caches prompts keys the cache on the prefix: rewriting messages[0] after each turn that
 # edited a file made the whole conversation a cache miss, every time. Changes go out as a short
@@ -2095,7 +2160,7 @@ class EventLanes:
                     return
                 if lane == self.front:
                     self.sink(event, depth=depth, **data)
-                elif event != "answer_delta":  # nothing draws a subagent's reply forming
+                elif event not in ("answer_delta", "model_progress"):  # live-only: stale once replayed
                     self.backlog[lane].append((event, depth, data))
         return emit
 
@@ -2179,7 +2244,7 @@ def text_tool_call(content: str, tool_names) -> str:
     return ""
 
 
-def collect_stream(chunks, on_content=None) -> SimpleNamespace:
+def collect_stream(chunks, on_content=None, on_progress=None) -> SimpleNamespace:
     """Reassemble a streamed completion into the object a non-streaming call would have returned.
 
     Streaming is transport, not a new kind of value: only `_complete` sees the difference, because
@@ -2199,6 +2264,11 @@ def collect_stream(chunks, on_content=None) -> SimpleNamespace:
     `on_content`, when given, is called with each piece of assistant content as it arrives, which is
     what lets a UI draw the answer forming. It is deliberately not called for `reasoning_content`:
     that stays captured and unprinted, for the reasons v0.4.0 set out.
+
+    `on_progress`, when given, is called with ("reasoning" | "tool", n) for each piece of reasoning
+    or tool-call arguments, with its length and never its text. Those two can stream for minutes
+    with nothing to show for it -- a long think at max effort, or a tool call with a big JSON
+    argument -- and a count that keeps rising is how a UI tells that wait apart from a dead one.
 
     The stream is closed on the way out whether it ran dry or raised. A stream abandoned mid-reply
     keeps its connection checked out of the pool, and a half-dead pooled socket is the failure this
@@ -2220,6 +2290,8 @@ def collect_stream(chunks, on_content=None) -> SimpleNamespace:
                     on_content(delta.content)
             if getattr(delta, "reasoning_content", None):
                 reasoning.append(delta.reasoning_content)
+                if on_progress:
+                    on_progress("reasoning", len(delta.reasoning_content))
             for fragment in getattr(delta, "tool_calls", None) or ():
                 call = calls.setdefault(getattr(fragment, "index", 0) or 0,
                                         {"id": None, "name": None, "arguments": []})
@@ -2230,6 +2302,8 @@ def collect_stream(chunks, on_content=None) -> SimpleNamespace:
                     call["name"] = function.name
                 if getattr(function, "arguments", None):
                     call["arguments"].append(function.arguments)
+                    if on_progress:
+                        on_progress("tool", len(function.arguments))
     finally:
         close = getattr(chunks, "close", None)
         if close:
@@ -2266,6 +2340,9 @@ def console_observer(event: str, depth: int = 0, **data) -> None:
         print(f"{indent}\033[35m[subagent: {desc} ({data['mode']}{routed})]\033[0m")
     elif event == "subagent_end":
         print(f"{indent}\033[35m[subagent done in {data['steps']} steps]\033[0m")
+    elif event == "background_task":
+        desc = sanitize_terminal_text(data["description"])
+        print(f"{indent}\033[35m[background task: {desc} · {data['status']}]\033[0m")
     elif event == "compact":
         detail = (f"cleared {data['pruned']} old tool results"
                   if data["stage"] == "pruned" else "summarized older turns")
@@ -2297,6 +2374,7 @@ TRACE_FIELDS = {  # event -> the data fields copied into its row, each still che
     "retry": ("attempt", "delay"),
     "subagent_start": ("mode", "routed"),
     "subagent_end": ("mode", "steps", "secs", "routed"),
+    "background_task": ("job_id", "status", "secs"),
     "signal": ("kind", "reason", "left", "repeats", "size", "report", "count"),
     "turn_start": (),
     "turn_end": ("steps", "outcome", "answer_chars", "claims"),
@@ -2468,6 +2546,10 @@ def eval_permission(name: str, args: dict, always_allowed: set) -> tuple[bool, s
     return True, ""
 
 
+def deny_background_permission(_name, _args, _always_allowed) -> tuple[bool, str]:
+    return False, "Error: a background subagent can only use read-only tools that need no approval."
+
+
 class Agent:
     def __init__(self, client, model: str, workspace: Path, permission=ask_permission, ask=ask_user_plain,
                  context_window: int = DEFAULT_CONTEXT_WINDOW, tool_names: set = None,
@@ -2480,9 +2562,11 @@ class Agent:
                  vision: bool | None = None, vision_override: bool | None = None,
                  subagent_vision: bool | None = None, images: "ImageGenerator | None" = None,
                  workspace_snapshots: bool | None = None, inherited_skills: SkillCatalog | None = None,
-                 enable_mcp: bool = True):
+                 enable_mcp: bool = True, background_subagents: bool = False, code_graph: bool = False,
+                 knowledge: KnowledgeOverlay | None = None):
         self.client = client
         self.model = model
+        self.code_graph = code_graph
         # Whether the model takes images: what the provider says (None: it didn't say), and the
         # user's VISION setting, which wins when set. See sees_images().
         self.model_vision = vision
@@ -2496,8 +2580,14 @@ class Agent:
         self.snapshots_off: str | None = None if workspace_snapshots else "KYKLOS_SNAPSHOTS is off"
         self.last_undo: dict = {"left_alone": [], "uncovered": None}
         self._before_write = before_write or self._record_file_snapshot
+        if knowledge is not None:
+            self.knowledge = knowledge
+        elif home is not None and depth == 0:
+            self.knowledge = KnowledgeOverlay(project_dir(home, Path(workspace).resolve()) / "graph.json")
+        else:
+            self.knowledge = KnowledgeOverlay(None)
         self.tools = Tools(workspace, before_write=self._before_write, sees_images=self.sees_images,
-                           image_delegate=self.image_delegate)
+                           image_delegate=self.image_delegate, overlay=self.knowledge)
         self._attachment_note = ""  # set by _attachments for the turn it is building
         set_explain_workspace(self.tools.workspace)
         set_explain_provider(getattr(client, "base_url", None))
@@ -2529,6 +2619,7 @@ class Agent:
         # Chosen at startup, for this session only: a relaxation of the permission rules should
         # never outlive the run it was agreed for, the way folder trust deliberately does.
         self.auto_bash = False
+        self.background_subagents = background_subagents and depth == 0
         all_schemas = self._all_schemas()
         default_tools = tool_names is None
         if tool_names is None:
@@ -2543,6 +2634,13 @@ class Agent:
         self._map_known = ""  # the newest sketch the model has been told about: the prompt's, plus notes
         self._map_dirty = False  # a file was written since _map_known was taken
         self.cancel: threading.Event | None = None  # set by a parent that runs this agent on a thread
+        self._background_deadline: float | None = None  # set only on the background child
+        self._subagent_slots = threading.BoundedSemaphore(MAX_PARALLEL_SUBAGENTS)
+        self._background_job: BackgroundJob | None = None  # job belonging to the active turn
+        self._background_worker: BackgroundJob | None = None  # may still be unwinding after cancellation
+        self._in_turn = False
+        self._background_usage: SimpleQueue = SimpleQueue()
+        self._usage_sink = None  # child submits per-response usage here; the parent updates its own counts
         # Billed tokens for the whole session: prompt + completion over every API call, including
         # compaction summaries and subagents. Set here rather than in reset(), so /reset clears the
         # conversation without forgetting what has already been spent.
@@ -2562,6 +2660,8 @@ class Agent:
             raise
 
     def close(self) -> None:
+        if self._background_worker is not None:
+            self._background_worker.cancel.set()
         self.mcp.close()
 
     def image_delegate(self) -> str | None:
@@ -2597,15 +2697,21 @@ class Agent:
                                   f"images such a model can't use without saying so, so it may answer as if it "
                                   f"saw nothing. Unset VISION to go by Ollama's list.")
 
-    def _emit(self, event: str, **data) -> None:
+    def _check_cancelled(self) -> None:
         if self.cancel is not None and self.cancel.is_set():
             raise Cancelled()
+        if self._background_deadline is not None and time.monotonic() >= self._background_deadline:
+            raise TimeoutError("Background subagent timed out.")
+
+    def _emit(self, event: str, **data) -> None:
+        self._check_cancelled()
         if self.on_event:
             self.on_event(event, depth=self.depth, **data)
 
     def _complete(self, purpose: str = "turn", **kwargs):
         """Call chat.completions.create, retrying transient rate-limit, 5xx, and connection errors.
         Emits model_start / model_end around the wait (purpose: "turn" or "summary"), so a UI can show a spinner."""
+        self._drain_background_usage()
         self._emit("model_start", purpose=purpose)
         started, metrics = time.monotonic(), {}
         try:
@@ -2618,6 +2724,12 @@ class Agent:
                         # Servers that ignore it send none, which _count_usage and context_tokens()
                         # already tolerate -- and which _note_missing_usage says out loud.
                         extra |= {"stream": True, "stream_options": {"include_usage": True}}
+                    self._check_cancelled()
+                    if self._background_deadline is not None:
+                        remaining = self._background_deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError("Background subagent timed out.")
+                        extra["timeout"] = min(BACKGROUND_REQUEST_SECONDS, remaining)
                     response = self.client.chat.completions.create(**kwargs, **extra)
                     if self.stream:
                         # Buffer, then commit. The reassembled reply is what the loop acts on, so a
@@ -2626,7 +2738,8 @@ class Agent:
                         # one thing that escapes early, and they are safe to: a UI shows them in a
                         # transient zone it erases, never in scrollback, so a retry redraws rather
                         # than duplicating.
-                        response = collect_stream(response, on_content=self._answer_delta(purpose))
+                        response = collect_stream(response, on_content=self._answer_delta(purpose),
+                                                  on_progress=self._progress(purpose))
                     self._count_usage(response)  # every API call lands here, so the tally is complete
                     self._note_missing_usage(response)
                     metrics = call_metrics(response)
@@ -2650,11 +2763,24 @@ class Agent:
         usage = getattr(response, "usage", None)
         if not usage:
             return
-        self.session_tokens += ((getattr(usage, "prompt_tokens", 0) or 0)
-                                + (getattr(usage, "completion_tokens", 0) or 0))
+        prompt = getattr(usage, "prompt_tokens", 0) or 0
+        billed = prompt + (getattr(usage, "completion_tokens", 0) or 0)
         cached = cached_prompt_tokens(usage)
-        if cached is not None:
-            self.cache_seen_tokens += getattr(usage, "prompt_tokens", 0) or 0
+        seen = prompt if cached is not None else 0
+        self.session_tokens += billed
+        self.cache_seen_tokens += seen
+        self.cache_read_tokens += cached or 0
+        if self._usage_sink is not None:
+            self._usage_sink((billed, seen, cached or 0))
+
+    def _drain_background_usage(self) -> None:
+        while True:
+            try:
+                billed, seen, cached = self._background_usage.get_nowait()
+            except Empty:
+                return
+            self.session_tokens += billed
+            self.cache_seen_tokens += seen
             self.cache_read_tokens += cached
 
     def _answer_delta(self, purpose: str):
@@ -2664,8 +2790,28 @@ class Agent:
         would put the conversation's own bookkeeping where its answer belongs.
         """
         if purpose == "summary":
-            return None
+            return None if self._background_deadline is None else lambda _: self._check_cancelled()
         return lambda text: self._emit("answer_delta", text=text)
+
+    def _progress(self, purpose: str):
+        """A sink for the reasoning and tool-call characters a call streams, sent on as
+        `model_progress` at most every MODEL_PROGRESS_INTERVAL seconds.
+
+        Counts only, never text: reasoning stays unshown, and a half-streamed tool call is not yet a
+        call. The first piece is reported at once, so a UI learns quickly that the model has begun.
+        The counts are per attempt: a retry starts them again from zero.
+        """
+        counts = {"reasoning_chars": 0, "tool_chars": 0}
+        sent = [None]
+
+        def sink(kind: str, n: int) -> None:
+            self._check_cancelled()
+            counts["reasoning_chars" if kind == "reasoning" else "tool_chars"] += n
+            now = time.monotonic()
+            if sent[0] is None or now - sent[0] >= MODEL_PROGRESS_INTERVAL:
+                sent[0] = now
+                self._emit("model_progress", purpose=purpose, **counts)
+        return sink
 
     def _note_missing_usage(self, response) -> None:
         """Say so, once, if a streamed call came back with no token counts.
@@ -2689,14 +2835,18 @@ class Agent:
             self.active_snapshots[p] = p.read_bytes() if p.is_file() else None
 
     def _all_schemas(self) -> list:
-        return SCHEMAS + [TASK_SCHEMA, ASK_USER_SCHEMA, LOAD_SKILL_SCHEMA] + (
-            [IMAGE_SCHEMA] if self.images is not None else [])
+        return (SCHEMAS + [TASK_SCHEMA, ASK_USER_SCHEMA, LOAD_SKILL_SCHEMA]
+                + ([CODE_GRAPH_SCHEMA] if self.code_graph else [])
+                + ([IMAGE_SCHEMA] if self.images is not None else [])
+                + (BACKGROUND_TASK_SCHEMAS if self.background_subagents else []))
 
     def _update_mode(self) -> None:
         all_schemas = self._all_schemas()
         allowed = (self.base_tool_names & PLAN_TOOLS) if self.plan_mode else self.base_tool_names
         if not self.skill_catalog.prompt:
             allowed = allowed - {"load_skill"}
+        if "task" not in allowed or not BACKGROUND_TASK_TOOLS <= allowed:
+            allowed = allowed - BACKGROUND_TASK_TOOLS
         self.schemas = [s for s in all_schemas if s["function"]["name"] in allowed]
         self.mcp_schemas = [tool.schema for tool in self.mcp.tools.values()
                             if not self.plan_mode or tool.read_only]
@@ -2725,6 +2875,9 @@ class Agent:
                        "steps with the plan tool, then mark each one as you finish it. The user "
                        "follows your progress there, so keep it current: it is the plan, not a "
                        "summary to write at the end.")
+        if "code_graph" in self.tool_names:
+            prompt += ("\n- Use code_graph (summary, impact, neighbors, tests, path, note) to find central "
+                       "modules, check blast radius and linked tests before refactoring, or pin key notes.")
         if "task" in self.tool_names:
             # "Broad searches" was too vague to act on: a real session made 134 exploratory calls,
             # 87% of its tool output, without delegating once. Give a threshold it can apply.
@@ -2734,6 +2887,12 @@ class Agent:
                        "tool (mode 'explore'): only its answer comes back, not every file it read. "
                        "Independent questions can go out as several task calls in one message; "
                        "explore subagents then run at the same time.")
+        if "task_start" in self.tool_names:
+            prompt += ("\n- If an explore task is independent of work you can do now, start it with "
+                       "task_start before your own work, then use task_wait for its report before "
+                       "answering. Start one per turn. Give it a self-contained brief and avoid "
+                       "editing the files it is investigating. If you need the report immediately, "
+                       "use task instead. A background job ID only works in its current turn.")
         if "ask_user" in self.tool_names:
             prompt += ("\n- When you are blocked on a decision that is the user's to make, ask with "
                        "ask_user and carry on with the answer, rather than guessing or ending your turn "
@@ -2899,7 +3058,7 @@ class Agent:
         self.undo_stack: list[tuple[list, tuple | None, list, dict[Path, bytes | None]]] = []
         self.turn_trees: list[list[str | None]] = []  # [start, end] workspace tree per undo_stack entry
         self.last_bash: tuple[str, str] | None = None  # the newest command that ran, and its result
-        self.tools.plan_steps, self.tools.plan_active = [], 0  # a plan belongs to its conversation
+        self.tools.plan_steps, self.tools.plan_dag, self.tools.plan_active = [], [], 0  # a plan belongs to its conversation
 
     def _retain_mcp_grants(self, before: dict[str, MCPTool]) -> None:
         # An alias can end up with a different identity after a server changes its tools.
@@ -2943,6 +3102,14 @@ class Agent:
             tail = "\n".join(lines[:1] + lines[1:][-8:])[:1000]
             parts.append(f"The last command you ran failed, and no command has run since:\n"
                          f"$ {command[:300]}\n{tail}")
+        if touched or self.knowledge.notes or any(
+                m.get("test_status") == "fail" for m in self.knowledge.files.values()):
+            try:
+                brief = self.knowledge.compaction_brief(WorkspaceGraph(self.tools.workspace), touched)
+            except OSError:
+                brief = ""
+            if brief:
+                parts.append(brief)
         return "\n\n".join(parts)
 
     def _workspace_tree(self) -> str | None:
@@ -3011,10 +3178,14 @@ class Agent:
 
     def save_session(self, path: Path) -> None:
         """Write the conversation (excluding the system prompt, which is rebuilt on load) to JSONL."""
+        self._drain_background_usage()
         lines = [json.dumps(m, ensure_ascii=False) for m in self.messages[1:]]
+        plan_meta: dict = {"steps": self.tools.plan_steps, "active": self.tools.plan_active}
+        if self.tools.plan_dag:
+            plan_meta["dag"] = self.tools.plan_dag
         meta = {"_meta": "state", "turn_log": self.turn_log, "usage_mark": self.usage_mark,
                 "plan_mode": self.plan_mode, "session_tokens": self.session_tokens,
-                "plan": {"steps": self.tools.plan_steps, "active": self.tools.plan_active},
+                "plan": plan_meta,
                 "cache": [self.cache_read_tokens, self.cache_seen_tokens]}
         lines.append(json.dumps(meta, ensure_ascii=False))
         write_private_text(path, "\n".join(lines) + "\n")
@@ -3023,6 +3194,8 @@ class Agent:
         """Restore a conversation from a JSONL file. Returns the number of restored messages."""
         if not path.is_file():
             raise FileNotFoundError(f"No session file at {path}")
+        # An unwinding worker keeps the old queue, so its late usage cannot bill the restored session.
+        self._background_usage = SimpleQueue()
         self.reset()
         for line in path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
@@ -3041,6 +3214,13 @@ class Agent:
                 if (isinstance(steps, list) and all(isinstance(s, str) for s in steps)
                         and isinstance(active, int) and 0 <= active <= len(steps)):
                     self.tools.plan_steps, self.tools.plan_active = [plain_line(s) for s in steps], active
+                    dag = plan.get("dag")
+                    if isinstance(dag, list) and len(dag) == len(steps) and all(isinstance(n, dict) for n in dag):
+                        try:
+                            validate_dag(dag)
+                            self.tools.plan_dag = dag
+                        except ValueError:
+                            self.tools.plan_dag = []
             elif "role" in obj and obj["role"] != "system":
                 self.messages.append(obj)
         self.repair_after_interrupt()
@@ -3164,6 +3344,17 @@ class Agent:
                 return self.run_subagent(**args)
             except TypeError as e:
                 return f"Error: bad arguments for task: {e}"
+        if name in BACKGROUND_TASK_TOOLS:
+            if not isinstance(args, dict):
+                return "Error: send the tool arguments as a JSON object."
+            if name == "task_start":
+                if set(args) != {"description", "prompt"} or not all(
+                        isinstance(value, str) and value.strip() for value in args.values()):
+                    return "Error: task_start needs a non-empty description and prompt."
+                return self._start_background(**args)
+            if set(args) != {"job_id"} or not isinstance(args["job_id"], str):
+                return "Error: task_wait needs a job_id string."
+            return self._wait_background(args["job_id"])
         if name == "ask_user":
             return self.ask_user(args)
         if name == "load_skill":
@@ -3193,11 +3384,23 @@ class Agent:
             return f"Error: bad arguments for {name}: {e}"
         except Exception as e:
             return f"Error: {type(e).__name__}: {e}"
+        if name in ("read_file", "write_file", "edit_file") and isinstance(args.get("path"), str):
+            try:
+                rel = self.tools._rel(self.tools._resolve(args["path"]))
+                if name == "read_file":
+                    self.knowledge.record_read(rel)
+                else:
+                    self.knowledge.record_edit(rel)
+            except (ToolError, ValueError, OSError):
+                pass
         if name == "plan":
             # The event carries the resolved plan, not the call's arguments: `plan(active=3)` says
             # nothing about the steps, and a UI that had to remember them would be keeping a second
             # copy of state that could disagree with this one.
-            self._emit("plan", steps=list(self.tools.plan_steps), active=self.tools.plan_active)
+            plan_event = {"steps": list(self.tools.plan_steps), "active": self.tools.plan_active}
+            if self.tools.plan_dag:
+                plan_event["dag"] = list(self.tools.plan_dag)
+            self._emit("plan", **plan_event)
         return result
 
     def _run_mcp_tool(self, name: str, args) -> str:
@@ -3269,7 +3472,8 @@ class Agent:
         """
         if name == "load_skill":
             return " Use your available tools, or ask the user to install a skill if one is needed."
-        known = {s["function"]["name"] for s in SCHEMAS + [TASK_SCHEMA, IMAGE_SCHEMA, ASK_USER_SCHEMA]}
+        extra_schemas = [CODE_GRAPH_SCHEMA] if self.code_graph else []
+        known = {s["function"]["name"] for s in SCHEMAS + [TASK_SCHEMA, IMAGE_SCHEMA, ASK_USER_SCHEMA] + extra_schemas}
         if name not in known:
             return ""
         if self.depth > 0 and name == "ask_user":
@@ -3350,31 +3554,153 @@ class Agent:
                              for tc in calls if tc["id"] not in answered]
         self.messages = repaired
 
-    def run_subagent(self, description: str, prompt: str, mode: str = "explore") -> str:
+    def run_subagent(self, description: str, prompt: str, mode: str = "explore",
+                     id: str | None = None, depends_on: list | None = None) -> str:
         """Run `prompt` in a fresh Agent and return only its final answer."""
         if mode not in SUBAGENT_TOOLS:
             return f"Error: mode must be one of {', '.join(SUBAGENT_TOOLS)}"
         if self.plan_mode and mode != "explore":
             return "Error: in plan mode, subagents must use mode 'explore'."
-        sub, routed = self._spawn(mode)
-        answer = self._run_spawned(sub, routed, description, prompt, mode)
-        self._bill(sub)
+        if depends_on:
+            return ("Error: depends_on on a single task call cannot reference prior tasks; issue "
+                    "dependent explore tasks together in one message or inline the prerequisite output.")
+        with self._subagent_slots:
+            sub, routed = self._spawn(mode)
+            answer = self._run_spawned(sub, routed, description, prompt, mode)
+            self._bill(sub)
         return answer
 
-    def _spawn(self, mode: str, on_event=None, cancel=None) -> tuple["Agent", bool]:
+    def _spawn(self, mode: str, on_event=None, cancel=None, *, background=False) -> tuple["Agent", bool]:
         sub_model, sub_effort, sub_window = self.effective_subagent_config()
         routed = bool(self.subagent_model and (sub_model != self.model or sub_effort != self.effort))
-        sub = Agent(self.client, sub_model, self.tools.workspace, permission=self.permission,
-                    context_window=sub_window, tool_names=SUBAGENT_TOOLS[mode],
-                    depth=self.depth + 1, always_allowed=self.always_allowed,
-                    before_write=self._before_write, on_event=on_event or self.on_event, sleep=self.sleep,
-                    effort=sub_effort, max_steps=self.max_steps, compact_above=self.compact_above,
-                    stream=self.stream, notices_seen=self.notices_seen, vision_override=self.vision_override,
+        client = self.client
+        if background and isinstance(client, OpenAI):
+            # The agent loop already retries, with a cancellation check before each request.
+            client = client.with_options(max_retries=0)
+        sub_tools = set(SUBAGENT_TOOLS[mode])
+        if self.code_graph:
+            sub_tools.add("code_graph")
+        sub = Agent(client, sub_model, self.tools.workspace,
+                    permission=deny_background_permission if background else self.permission,
+                    context_window=sub_window, tool_names=sub_tools,
+                    depth=self.depth + 1, always_allowed=None if background else self.always_allowed,
+                    before_write=None if background else self._before_write,
+                    on_event=None if background else on_event or self.on_event,
+                    sleep=self.sleep, effort=sub_effort, max_steps=self.max_steps, compact_above=self.compact_above,
+                    stream=self.stream, notices_seen=None if background else self.notices_seen,
+                    vision_override=self.vision_override,
                     vision=self.subagent_vision if self.subagent_model else self.model_vision,
-                    inherited_skills=self.skill_catalog if "load_skill" in self.tool_names else None)
-        sub.auto_bash = self.auto_bash
+                    inherited_skills=self.skill_catalog if "load_skill" in self.tool_names else None,
+                    code_graph=self.code_graph,
+                    knowledge=None if background else self.knowledge)
+        sub.auto_bash = self.auto_bash and not background
         sub.cancel = cancel
         return sub, routed
+
+    def _start_background(self, description: str, prompt: str) -> str:
+        if not self._in_turn or self.last_steps >= self.max_steps - 1:
+            return "Error: too late to start a background job and collect its report in this turn."
+        if self._background_job is not None:
+            return f"Error: one background job per turn. Use task_wait with {self._background_job.job_id}."
+        previous = self._background_worker
+        if previous is not None and not previous.done.is_set():
+            return "Error: the previous background worker is still stopping. Use task for this investigation."
+
+        label = plain_line(scrub_secrets(description, workspace=self.tools.workspace)[0])[:160]
+        sub, _ = self._spawn("explore", background=True)
+        started = time.monotonic()
+        job = BackgroundJob(f"job-{uuid4().hex}", label, started, started + BACKGROUND_TASK_SECONDS)
+        sub.cancel = job.cancel
+        sub._background_deadline = job.deadline
+        sub._usage_sink = self._background_usage.put
+        worker = threading.Thread(target=self._run_background, args=(job, sub, prompt),
+                                  name="kyklos-background-task", daemon=True)
+        try:
+            worker.start()
+            self._background_job = self._background_worker = job
+        except KeyboardInterrupt:
+            job.cancel.set()
+            if worker.ident is not None:
+                self._background_worker = job
+            raise
+        except RuntimeError as exc:
+            sub.close()
+            return f"Error: could not start the background subagent: {error_detail(exc)}"
+        self._emit_background(job)
+        return f"Started background exploration. Use task_wait with job_id {job.job_id}."
+
+    def _run_background(self, job: BackgroundJob, sub: "Agent", prompt: str) -> None:
+        try:
+            if not self._subagent_slots.acquire(blocking=False):
+                job.result = "Error: all subagent slots are occupied."
+                return
+            try:
+                job.result = sub.send(prompt) or "(The subagent finished without an answer.)"
+                job.outcome = "ready"
+            finally:
+                self._subagent_slots.release()
+        except Cancelled:
+            job.outcome = "cancelled"
+        except TimeoutError:
+            job.outcome = "timed_out"
+        except Exception as exc:
+            job.result = f"Error: the background subagent failed: {error_detail(exc)}"
+        finally:
+            try:
+                sub.close()
+            finally:
+                job.finished = time.monotonic()
+                job.done.set()
+
+    def _emit_background(self, job: BackgroundJob) -> None:
+        self._emit("background_task", job_id=job.job_id, description=job.description, status=job.status,
+                   secs=max(0.0, (job.finished if job.done.is_set() else time.monotonic()) - job.started))
+
+    def _refresh_background(self) -> None:
+        job = self._background_job
+        if job is None or job.status != "running":
+            return
+        if job.done.is_set():
+            job.status = job.outcome
+        elif time.monotonic() >= job.deadline:
+            job.cancel.set()
+            job.status = "timed_out"
+        else:
+            return
+        self._drain_background_usage()
+        self._emit_background(job)
+
+    def _wait_background(self, job_id: str) -> str:
+        job = self._background_job
+        if job is None or job_id != job.job_id:
+            return "Error: unknown background job ID for this turn."
+        self._refresh_background()
+        while job.status == "running":
+            job.done.wait(0.1)  # poll so Ctrl+C and the job deadline can interrupt the wait
+            self._refresh_background()
+        job.collected = True
+        if job.status == "timed_out":
+            return "Error: the background subagent timed out."
+        return job.result or "Error: the background subagent was cancelled."
+
+    def _finish_background(self) -> None:
+        job = self._background_job
+        if job is None:
+            return
+        try:
+            self._refresh_background()
+            if job.status == "running":
+                job.status = "cancelled"
+            elif job.status == "ready" and not job.collected:
+                job.status = "unused"
+            else:
+                return
+            job.cancel.set()
+            self._emit_background(job)
+        finally:
+            if not job.done.is_set():
+                job.cancel.set()
+            self._background_job = None
 
     def _run_spawned(self, sub: "Agent", routed: bool, description: str, prompt: str, mode: str) -> str:
         shown = dict(description=description, mode=mode, model=sub.model, effort=sub.effort, routed=routed)
@@ -3406,28 +3732,54 @@ class Agent:
             args = json.loads(tc.function.arguments or "{}")
         except ValueError:
             return None
-        if (not isinstance(args, dict) or set(args) - {"description", "prompt", "mode"}
+        if (not isinstance(args, dict) or set(args) - {"description", "prompt", "mode", "id", "depends_on"}
                 or not isinstance(args.get("description"), str) or not isinstance(args.get("prompt"), str)
                 or args.get("mode", "explore") != "explore"):
+            return None
+        if "id" in args and (not isinstance(args["id"], str) or not args["id"].strip()):
+            return None
+        if "depends_on" in args and (
+                not isinstance(args["depends_on"], list)
+                or not all(isinstance(d, str) and d.strip() for d in args["depends_on"])):
             return None
         return args
 
     def _run_explore_batch(self, batch: list[tuple]) -> list[str]:
-        """Run several explore tasks at once and return their results in the order asked for.
+        """Run several explore tasks (concurrently, or in topological waves when depends_on is used)
+        and return their results in the order asked for.
 
         Each lane emits the parent's own tool_call and tool_result around its subagent's events,
         so what reaches the front end, one lane after another, is exactly the stream a serial run
         would have produced.
         """
+        has_dag = any("id" in args or "depends_on" in args for _, args in batch)
+        dag_nodes = []
+        id_to_idx: dict[str, int] = {}
+        waves: list[list[int]] = [list(range(len(batch)))]
+        if has_dag:
+            for i, (_, args) in enumerate(batch):
+                nid = str(args.get("id") or f"task_{i + 1}")
+                deps = list(args.get("depends_on") or [])
+                dag_nodes.append({"id": nid, "depends_on": deps})
+                id_to_idx[nid] = i
+            try:
+                waves = validate_dag(dag_nodes)
+            except ValueError as e:
+                err = f"Error: invalid task DAG: {e}"
+                for tc, _ in batch:
+                    self._emit("tool_call", name="task", arguments=tc.function.arguments, call_id=tc.id)
+                    self._emit("tool_result", name="task", result=err, call_id=tc.id, secs=0.0)
+                return [err] * len(batch)
+
         lanes = EventLanes(self.on_event, len(batch))
-        cancel, slots = threading.Event(), threading.Semaphore(MAX_PARALLEL_SUBAGENTS)
+        cancel = threading.Event()
         results: list[str | None] = [None] * len(batch)
         subs: list[Agent | None] = [None] * len(batch)
 
         def work(i: int, tc, args: dict) -> None:
             emit = lanes.emitter(i)
             try:
-                with slots:
+                with self._subagent_slots:
                     if cancel.is_set():
                         return
                     emit("tool_call", depth=self.depth, name="task", arguments=tc.function.arguments, call_id=tc.id)
@@ -3443,14 +3795,24 @@ class Agent:
             finally:
                 lanes.finish(i)
 
-        threads = [threading.Thread(target=work, args=(i, tc, args), daemon=True)
-                   for i, (tc, args) in enumerate(batch)]
-        for thread in threads:
-            thread.start()
         try:
-            for thread in threads:
-                while thread.is_alive():  # a bare join() can't be interrupted on Windows
-                    thread.join(0.1)
+            for wave in waves:
+                wave_threads = []
+                for i in wave:
+                    tc, args = batch[i]
+                    eff_args = args
+                    if has_dag and dag_nodes[i]["depends_on"]:
+                        dep_blocks = [
+                            f"[Output from prerequisite task {d}]:\n{results[id_to_idx[d]]}"
+                            for d in dag_nodes[i]["depends_on"]
+                        ]
+                        eff_args = {**args, "prompt": "\n\n".join(dep_blocks) + "\n\n" + args["prompt"]}
+                    wave_threads.append(threading.Thread(target=work, args=(i, tc, eff_args), daemon=True))
+                for thread in wave_threads:
+                    thread.start()
+                for thread in wave_threads:
+                    while thread.is_alive():  # a bare join() can't be interrupted on Windows
+                        thread.join(0.1)
         except KeyboardInterrupt:
             # The threads can't be killed, only told: each stops at its next event, and nothing
             # they emit from here on reaches the screen.
@@ -3484,6 +3846,7 @@ class Agent:
             self.turn_trees.append([self._workspace_tree(), None])
             self.questions_asked = 0
         answer, self.last_outcome = None, "error"
+        self._in_turn = True
         try:
             answer = self._send_turn(user_text, preface)
             return answer
@@ -3491,7 +3854,10 @@ class Agent:
             self.last_outcome = "interrupted"
             raise
         finally:
+            self._in_turn = False
             if self.depth == 0:
+                self._finish_background()
+                self._drain_background_usage()
                 self.active_snapshots = None
                 if self.turn_trees and self.turn_trees[-1][0]:
                     self.turn_trees[-1][1] = self._workspace_tree()
@@ -3519,6 +3885,7 @@ class Agent:
         # A fifth of the budget from the end, and never fewer than two steps: enough room to act on it.
         budget_warning = self.max_steps - max(2, self.max_steps // 5)
         nudged = False  # the false-stop nudge, like the delegation hint, is once per turn
+        background_nudged = False
         plan_touched = False  # whether this turn set or advanced the plan
         for step in range(1, self.max_steps + 1):
             self.last_steps = step
@@ -3558,10 +3925,25 @@ class Agent:
             if reasoning:
                 entry["reasoning_content"] = reasoning
             self.messages.append(entry)
+            self._refresh_background()
 
             if not msg.tool_calls:
                 stop = None if nudged or truncated or step >= self.max_steps else \
                     self._false_stop(msg.content or "", plan_touched)
+                job = self._background_job
+                if not stop and not background_nudged and not truncated and step < self.max_steps and (
+                        job is not None and not job.collected):
+                    background_nudged = True
+                    self._emit("signal", kind="nudge", reason="background_task")
+                    if (msg.content or "").strip():
+                        self._emit("thought", text=msg.content)
+                    else:
+                        entry["content"] = EMPTY_REPLY_MARK
+                    self.messages.append({"role": "user", "content": (
+                        f"[Kyklos: background job {job.job_id} has an uncollected result. "
+                        "Use task_wait if you need it, then finish your answer. "
+                        "If it is no longer needed, finish the answer now.]")})
+                    continue
                 if stop:
                     nudged = True
                     to_model, to_user, reason = stop
@@ -3631,6 +4013,8 @@ class Agent:
                     commands_run.append((bash_command, result))
                     if EXIT_CODE_RE.match(result) or "timed out" in result[:60]:  # it ran; a denial didn't
                         self.last_bash = (bash_command, result)
+                        touched = sorted({self.tools._rel(p) for *_, snaps in self.undo_stack for p in snaps})
+                        self.knowledge.record_test_run(bash_command, _succeeded(result), touched)
                 signature = (tc.function.name, _canonical_args(tc.function.arguments), result)
                 repeats = repeats + 1 if signature == last_signature else 1
                 last_signature = signature
@@ -3853,6 +4237,15 @@ def choose_compact_above(env) -> int:
     return tokens
 
 
+def choose_background_subagents(env) -> bool:
+    value = str(env.get("KYKLOS_BACKGROUND_SUBAGENTS", "")).strip().lower()
+    if value in ("", "0", "false", "no", "off"):
+        return False
+    if value in ("1", "true", "yes", "on"):
+        return True
+    raise ValueError(f"KYKLOS_BACKGROUND_SUBAGENTS must be 1 or 0 (got {value!r})")
+
+
 def choose_stream(env) -> bool:
     """Whether to stream the API call.
 
@@ -3897,6 +4290,64 @@ def choose_max_steps(env) -> int:
     if steps < 1:
         raise ValueError(f"MAX_STEPS must be at least 1 (got {steps})")
     return steps
+
+
+RUNTIME_PREFERENCES = {
+    "background_subagents": ("KYKLOS_BACKGROUND_SUBAGENTS", choose_background_subagents),
+    "max_steps": ("MAX_STEPS", choose_max_steps),
+    "stream": ("STREAM", choose_stream),
+}
+
+
+def valid_runtime_preference(name: str, value) -> bool:
+    if name == "max_steps":
+        return type(value) is int and 1 <= value <= 2**53 - 1  # exact in both Python and the JSON-RPC client
+    return type(value) is bool
+
+
+def runtime_preferences(settings: dict, env) -> dict:
+    saved = settings.get("runtime")
+    if not isinstance(saved, dict):
+        saved = {}
+    result = {}
+    for name, (variable, parse) in RUNTIME_PREFERENCES.items():
+        default = parse({})
+        if variable in env:
+            value, source = parse(env), "environment"
+        elif valid_runtime_preference(name, saved.get(name)):
+            value, source = saved[name], "saved"
+        else:
+            value, source = default, "default"
+        result[name] = {"value": value, "source": source, "default": default, "variable": variable}
+    return result
+
+
+def update_runtime_preferences(home: Path, env, changes: dict) -> dict:
+    for name, value in changes.items():
+        if name not in RUNTIME_PREFERENCES:
+            raise ValueError("Only background subagents, max steps, and streaming can be changed here.")
+        variable, _ = RUNTIME_PREFERENCES[name]
+        if variable in env:
+            raise ValueError(f"{variable} is set in the environment. Change it there.")
+        if value is not None and not valid_runtime_preference(name, value):
+            if name == "max_steps":
+                raise ValueError("Max steps must be a whole number from 1 to 9,007,199,254,740,991.")
+            raise ValueError(f"{variable} must be true or false.")
+
+    with edit_settings(home) as settings:
+        saved = settings.get("runtime")
+        if not isinstance(saved, dict):
+            saved = {}
+        for name, value in changes.items():
+            if value is None:
+                saved.pop(name, None)
+            else:
+                saved[name] = value
+        if saved:
+            settings["runtime"] = saved
+        else:
+            settings.pop("runtime", None)
+        return runtime_preferences(settings, env)
 
 
 def choose_context_window(env, detected: int | None) -> tuple[int, str]:
@@ -4122,17 +4573,55 @@ def cached_model_info(home: Path, base_url: str, name: str) -> dict | None:
     return next((m for m in entry.get("models", []) if m["name"] == name), None)
 
 
-# ~/.kyklos/settings.json: {"model": last picked model, "efforts": {model: effort label}}
-def load_settings(home: Path) -> dict:
+# ~/.kyklos/settings.json holds model and persona picks and the supported runtime preferences.
+def load_settings(home: Path, *, strict: bool = False) -> dict:
+    path = home / "settings.json"
     try:
-        settings = json.loads((home / "settings.json").read_text(encoding="utf-8"))
-        return settings if isinstance(settings, dict) else {}
+        if strict and path.is_symlink():
+            raise OSError("settings.json is a symbolic link.")
+        settings = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(settings, dict):
+            raise ValueError("settings.json must contain a JSON object.")
+        return settings
+    except FileNotFoundError:
+        return {}
     except (OSError, ValueError):
+        if strict:
+            raise
         return {}
 
 
 def save_settings(home: Path, settings: dict) -> None:
-    write_private_text(home / "settings.json", json.dumps(settings, indent=2))
+    ensure_private_dir(home)
+    target = home / "settings.json"
+    if target.is_symlink():
+        raise OSError("settings.json is a symbolic link.")
+    fd, temp_name = tempfile.mkstemp(prefix=".settings-", suffix=".tmp", dir=home)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(settings, fh, indent=2)
+            fh.write("\n")
+        os.replace(temp_name, target)
+    finally:
+        Path(temp_name).unlink(missing_ok=True)
+
+
+@contextmanager
+def edit_settings(home: Path):
+    """Serialize read-modify-write across CLI and desktop processes."""
+    ensure_private_dir(home)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(home / ".settings.lock", flags, 0o600)
+    with os.fdopen(fd, "r+b") as lock:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        settings = load_settings(home, strict=True)
+        yield settings
+        save_settings(home, settings)
 
 
 # Profiles. One .env can describe several providers, each as a suffixed block -- BASE_URL_LOCAL,
@@ -4735,9 +5224,8 @@ def _persona_summary(path: Path | None) -> str:
 def _apply_persona(ctx, name: str | None) -> None:
     ctx.agent.set_persona(name)
     if ctx.home:
-        settings = load_settings(ctx.home)
-        remember_pick(settings, ctx.profile, "persona", name or "off")
-        save_settings(ctx.home, settings)
+        with edit_settings(ctx.home) as settings:
+            remember_pick(settings, ctx.profile, "persona", name or "off")
     if name:
         ctx.say("ok", f"Persona: {name}. It is in the system prompt from the next request; "
                       "the conversation carries over.")
@@ -4776,6 +5264,39 @@ def _cmd_map(ctx, arg):
     # the change notes it has been sent since, which add up to the same thing.
     sketch = ctx.agent._map_section(ctx.agent._scan_map()).strip()
     ctx.say("info", sketch or "No source files recognised here; the model starts with no sketch.")
+
+
+@command("graph", "/graph [path]", "Show the workspace dependency graph, centrality, and blast radius")
+def _cmd_graph(ctx, arg):
+    g = WorkspaceGraph(ctx.agent.tools.workspace)
+    data = g.to_dict(ctx.agent.knowledge)
+    if arg:
+        try:
+            p = ctx.agent.tools._resolve(arg)
+        except ToolError as e:
+            ctx.say("error", str(e))
+            return
+        if is_secret_file(p):
+            ctx.say("error", f"Refusing to inspect {arg}: it likely contains secrets.")
+            return
+        rel = ctx.agent.tools._rel(p)
+        fallback = g.query("impact", target=rel, overlay=ctx.agent.knowledge)
+    else:
+        lines = [g.query("summary", overlay=ctx.agent.knowledge)]
+        edited = [n["path"] for n in data["nodes"] if n["state"] == "edited"]
+        if edited:
+            br = g.blast_radius(edited, depth=2)
+            deps = [d["path"] for d in br["dependents"][:10]]
+            lines.append("Edited this session: " + ", ".join(edited))
+            if deps:
+                lines.append("Blast-radius dependents: " + ", ".join(deps))
+            if br["tests"]:
+                lines.append("Linked tests: " + ", ".join(br["tests"]))
+        if ctx.agent.knowledge.notes:
+            lines.append("Pinned notes:")
+            lines.extend(f"  - {n['path']}: {n['note']}" for n in ctx.agent.knowledge.notes[-10:])
+        fallback = "\n".join(lines)
+    ctx.show("graph", data, fallback)
 
 
 @command("tools", "/tools", "List the live tools and what's auto-approved")
@@ -4888,10 +5409,9 @@ def _apply_model(ctx, info: dict, effort: str) -> None:
     if not ctx.context_override:
         ctx.agent.context_source = "detected" if info.get("context") else "default"
     if ctx.home:
-        settings = load_settings(ctx.home)
-        remember_pick(settings, ctx.profile, "model", info["name"])
-        settings.setdefault("efforts", {})[info["name"]] = effort
-        save_settings(ctx.home, settings)
+        with edit_settings(ctx.home) as settings:
+            remember_pick(settings, ctx.profile, "model", info["name"])
+            settings.setdefault("efforts", {})[info["name"]] = effort
     thinking = "no thinking" if not effort_options(info) else f"effort {effort}"
     ctx.say("ok", f"Using {info['name']} · {thinking} · {short_tokens(ctx.agent.context_window)} context.")
 
@@ -4997,8 +5517,8 @@ def _cmd_provider(ctx, arg):
         ctx.agent.set_provider(client, ctx.agent.model)  # client first, so the picker lists the new list
         ctx.agent.vision_override = choose_vision(env)
         set_explain_provider(env["BASE_URL"])
-        remember_pick(settings, None, "profile", _profile_label(profile))
-        save_settings(home, settings)
+        with edit_settings(home) as latest:
+            latest["profile"] = _profile_label(profile)
         ctx.say("ok", f"On {_profile_label(profile)} ({env['BASE_URL']}). Pick a model.")
         _cmd_model(ctx, None)
         return
@@ -5013,8 +5533,8 @@ def _cmd_provider(ctx, arg):
                                  window if sub_model else None,
                                  _model_info(catalog, sub_model).get("vision") if sub_model else None)
     set_explain_provider(env["BASE_URL"])
-    settings["profile"] = _profile_label(profile)
-    save_settings(home, settings)
+    with edit_settings(home) as latest:
+        latest["profile"] = _profile_label(profile)
     ctx.say("ok", f"On {_profile_label(profile)} · {info['name']} · {short_tokens(window)} context"
                   + (f" · subagents {sub_model}" if sub_model else ""))
 
@@ -5046,18 +5566,16 @@ def _apply_subagent_model(ctx, info: dict | None, effort: str = "default") -> No
     if info is None:
         ctx.agent.set_subagent_model(None)
         if ctx.home:
-            settings = load_settings(ctx.home)
-            remember_pick(settings, ctx.profile, "subagent_model", "same")
-            save_settings(ctx.home, settings)
+            with edit_settings(ctx.home) as settings:
+                remember_pick(settings, ctx.profile, "subagent_model", "same")
         ctx.say("ok", f"Subagents will use the main model ({ctx.agent.model}).")
         return
     window = None if ctx.context_override else (info.get("context") or DEFAULT_CONTEXT_WINDOW)
     ctx.agent.set_subagent_model(info["name"], effort, window, info.get("vision"))
     if ctx.home:
-        settings = load_settings(ctx.home)
-        remember_pick(settings, ctx.profile, "subagent_model", info["name"])
-        settings.setdefault("subagent_efforts", {})[info["name"]] = effort
-        save_settings(ctx.home, settings)
+        with edit_settings(ctx.home) as settings:
+            remember_pick(settings, ctx.profile, "subagent_model", info["name"])
+            settings.setdefault("subagent_efforts", {})[info["name"]] = effort
     thinking = "no thinking" if not effort_options(info) else f"effort {effort}"
     sub_window = ctx.agent.subagent_context_window or ctx.agent.context_window
     ctx.say("ok", f"Subagents using {info['name']} · {thinking} · {short_tokens(sub_window)} context.")
@@ -5262,6 +5780,7 @@ def main() -> None:
             sys.exit("--eval runs one task: give it as the argument.")
     home = kyklos_home()
     settings = load_settings(home)
+    runtime = runtime_preferences(settings, os.environ)
     profile = choose_profile(profile_flag, settings, os.environ)
     env = profile_env(os.environ, profile)
     if profile and not env["BASE_URL"]:
@@ -5347,7 +5866,7 @@ def main() -> None:
         if args:
             sys.exit(f"--serve takes requests over the protocol, not as arguments: {' '.join(args)}")
         from serve import UNTRUSTED, ServeUI, server_info
-        ui = ServeUI(workspace, *serve_io)
+        ui = ServeUI(workspace, *serve_io, settings_home=home)
         start = ui.handshake(server_info(workspace, probe_sandbox(), known_profiles(os.environ), profile,
                                          __version__))
         if start is None:  # the client hung up before starting a session
@@ -5383,12 +5902,13 @@ def main() -> None:
     permission = eval_permission if eval_mode else (ui.permission if ui else ask_permission)
     ask = no_one_to_ask if eval_mode else (ui.ask_user if ui else ask_user_plain)
     agent = Agent(client, model, workspace, context_window=window, plan_mode=plan_mode, effort=effort,
-                  max_steps=choose_max_steps(os.environ), compact_above=choose_compact_above(os.environ),
+                  max_steps=runtime["max_steps"]["value"], compact_above=choose_compact_above(os.environ),
                   subagent_model=sub_model, subagent_effort=sub_effort, subagent_context_window=sub_window,
-                  persona=persona, home=home, stream=choose_stream(os.environ),
+                  persona=persona, home=home, stream=runtime["stream"]["value"],
                   permission=permission, ask=ask, on_event=observer, vision=vision_of(model),
                   vision_override=vision_override, subagent_vision=vision_of(sub_model), images=images,
-                  enable_mcp=not eval_mode)
+                  enable_mcp=not eval_mode, background_subagents=runtime["background_subagents"]["value"],
+                  code_graph=True)
     try:
         if persona and not persona_path(persona, home):
             # Named but not there: say so rather than starting a plain agent that looks like the persona.

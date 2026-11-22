@@ -24,7 +24,8 @@ from pathlib import Path
 from kyklos import (BASH_MODE_CAVEAT, BASH_MODE_EXPLANATION, BROAD_WARNING, EXIT, NO_APPROVER_NOTE,
                     TRUST_EXPLANATION, CommandContext, apply_permission_answer, denial_note, edit_preview,
                     command_list, error_detail, has_danger, has_opaque, parse_question_answer, permission_options,
-                    run_command, sandbox_warning, state_snapshot)
+                    load_settings, run_command, runtime_preferences, sandbox_warning, state_snapshot,
+                    update_runtime_preferences)
 
 PROTOCOL_VERSION = 0
 
@@ -89,7 +90,8 @@ def interrupt_main_thread() -> None:
 
 
 class ServeUI:
-    def __init__(self, workspace: Path, inp, out, interrupt=interrupt_main_thread):
+    def __init__(self, workspace: Path, inp, out, interrupt=interrupt_main_thread, *, settings_home=None):
+        self.settings_home = settings_home
         self.workspace = Path(workspace)
         self.inp, self.out = inp, out  # binary streams: lines in, lines out
         self._interrupt = interrupt
@@ -227,7 +229,7 @@ class ServeUI:
         elif method == "shutdown":
             self.cancel()
             self.work.put(msg)
-        elif method in ("session/prompt", "command/run"):
+        elif method in ("session/prompt", "command/run", "settings/read", "settings/update"):
             if self.busy:
                 self.fail(rid, BUSY, "a turn or command is already running; send session/cancel to stop it")
             else:
@@ -270,6 +272,8 @@ class ServeUI:
         """Answer `initialize` and wait for `session/start`, whose params are returned (None on EOF).
         session/start itself is answered by run(), once trust and the bash mode are settled."""
         self.info = {"protocol_version": PROTOCOL_VERSION, **info}
+        if self.settings_home is not None:
+            self.info["capabilities"] = {"runtime_settings": True}
         self.start_reader()
         while not self.started.wait(POLL):
             pass
@@ -438,6 +442,8 @@ class ServeUI:
                 try:
                     if method == "session/prompt":
                         self._prompt(rid, msg["params"], default_session)
+                    elif method in ("settings/read", "settings/update"):
+                        self._settings(rid, method, msg["params"])
                     elif self._command(rid, msg["params"]):
                         break
                 except BaseException:
@@ -503,6 +509,36 @@ class ServeUI:
         self._settle()
         self._done(rid, {"then_send": result if isinstance(result, str) else None, "exit": result is EXIT})
         return result is EXIT
+
+    def _settings(self, rid, method: str, params: dict) -> None:
+        if self.settings_home is None:
+            self._done(rid, error=(METHOD_NOT_FOUND, "Runtime settings are unavailable for this session."))
+            return
+
+        updating = method == "settings/update"
+        changes = params.get("changes")
+        if (updating and (set(params) != {"changes"} or not isinstance(changes, dict) or not changes)
+                or not updating and params):
+            self._done(rid, error=(INVALID_PARAMS, "Expected a non-empty changes object." if updating
+                                  else "settings/read takes no parameters."))
+            return
+
+        try:
+            if updating:
+                resolved = update_runtime_preferences(self.settings_home, os.environ, changes)
+            else:
+                resolved = runtime_preferences(load_settings(self.settings_home, strict=True), os.environ)
+        except ValueError as e:
+            self._done(rid, error=(INVALID_PARAMS if updating else COMMAND_FAILED, str(e)))
+            return
+        except OSError:
+            self._done(rid, error=(COMMAND_FAILED, "Could not access Kyklos settings.json."))
+            return
+
+        for name, setting in resolved.items():
+            setting["active"] = getattr(self.agent, name)
+        self._done(rid, {"fields": resolved, "restart_required": any(
+            item["active"] != item["value"] for item in resolved.values())})
 
     def _done(self, rid, result=None, error: tuple | None = None) -> None:
         """Reply to a turn or command, marking the server idle first. In the other order, a client

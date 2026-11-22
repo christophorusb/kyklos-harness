@@ -89,11 +89,16 @@ Kyklos works in the folder you launch it from. Set `WORKSPACE` in `.env` to pin 
 | `KYKLOS_SNAPSHOTS` | `0` limits `/undo` to the file tools' edits, without snapshotting the workspace (see [Undo](#how-it-works)) |
 | `KYKLOS_TRACE` | `0` turns off the session trace; a path writes it there instead (see [Evals](#evals)) |
 | `STREAM` | Stream the API call (default on). Transport only — nothing on screen changes. `0` to disable |
+| `KYKLOS_BACKGROUND_SUBAGENTS` | `1` lets the main model run one read-only background task per turn (default off) |
 | `SUBAGENT_MODEL`, `SUBAGENT_EFFORT` | Route subagents to a faster or cheaper model |
 | `KYKLOS_PERSONA` | A persona to start in, from `~/.kyklos/personas/<name>.md` |
 | `KYKLOS_PASS_ENV` | Secret-named variables to let through to commands anyway |
 | `IMAGE_BASE_URL`, `IMAGE_API_KEY`, `IMAGE_MODEL` | An image provider for `generate_image`, set up on its own (see below) |
 | `IMAGE_API`, `IMAGE_SIZE` | `images` (the OpenAI Images API, default) or `chat` (OpenRouter-style); a default size like `1024x1024` |
+
+Kyklos Desktop can save preferences for background subagents, max steps, and streaming in
+`~/.kyklos/settings.json` (or under `KYKLOS_HOME`). They apply the next time Kyklos starts,
+in the desktop and terminal. An explicit environment or `.env` setting takes precedence.
 
 ### Profiles
 
@@ -233,6 +238,12 @@ An edit answers with the lines as they now read, and a miss with the closest tex
 **Questions.** `ask_user` puts one question to you without ending the turn: a panel with the question and up to six numbered options, answered on one line. A number picks an option (several, comma-separated, when the model allows more than one), anything else is your own answer, and Enter alone skips; the answer goes back to the model as the tool result. Asking needs no approval, since answering is already your call. The model is told to ask only about decisions that are yours to make — not for permission, not to confirm a plan it can carry out, not for anything its tools can find out — and a turn may ask at most three. It's offered in plan mode, where ambiguities get settled, and never to subagents, which answer to another agent: one that tries is told to make the most reasonable assumption and name it in its report. With nobody to answer (a piped run, `--eval`), the model is told so and to go on and state what it assumed.
 
 **Subagents.** `task` hands a self-contained job to a fresh `Agent` with an empty context; only its answer comes back. `explore` mode is read-only and never asks permission; `general` can also edit and run commands. Subagents can't nest. Explore tasks sent in one message run at the same time, up to four at once, since they only read and never ask; anything else runs one at a time. The interface still draws one subagent after another: the others' steps are held back and replayed when their turn comes, each with its real duration. A subagent whose API call fails comes back as a failed tool call the parent can act on, rather than ending the turn. One that is stopped — by the step cap, or for repeating itself — is asked for a report of what it found, so its work reaches the parent as a partial answer rather than being lost. Route them elsewhere with `/submodel`, `SUBAGENT_MODEL`, or `--submodel`; the `task` line names the model when it differs. In a live test a subagent took 12 steps and read five files while the main context stayed at 6%.
+
+**Background subagents.** Opt in with `KYKLOS_BACKGROUND_SUBAGENTS=1` in the harness's `.env`,
+then restart Kyklos. The main agent can start one read-only job with `task_start`, continue
+independent work, and collect the report with `task_wait` using the returned job ID. It has up to
+two minutes to finish. The worker reads the live workspace, so use it for files the main agent
+can leave alone while it works. Stop cancels the job with the turn. Job IDs expire when the turn ends.
 
 **Workspace sketch.** The system prompt carries a generated list of source files and what each defines — names only, no signatures or line numbers, since a regex reading code gets names right and parameter lists wrong. Python names come from the real `ast`. Capped per file and overall (~340 tokens here). `/map` shows it.
 
