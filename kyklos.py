@@ -327,7 +327,7 @@ def describe_commands() -> str:
         listen, connect, _ = sandbox_port_settings()
         if listen:
             lines.append(f"bash has no network except localhost ports {', '.join(map(str, listen))}: run dev "
-                         "servers and browser tests on those, listening on 127.0.0.1.")
+                         "servers on those, listening on 127.0.0.1.")
         if connect and listen:
             lines.append(f"It may also connect to localhost ports {', '.join(map(str, connect))}, where the user "
                          "runs a server outside Kyklos.")

@@ -911,11 +911,17 @@ SANDBOX_NETWORK_SIGNATURES = ("listen", "bind", "connect", "socket", "err_access
 # APIs and SecurityAgent, which draws the dialog, starting 0.04s later. The Chrome runs that hung
 # beside it are consistent with a dialog nobody answered, which was not confirmed with the flags in
 # place. Playwright passes both flags by default (read in its source), so it does not hit this.
+# Kyklos does not drive browsers (GUARDRAILS.md rule 7), so a browser that got here is first a
+# guardrail matter: the model is told to stop and hand the check off. The flags are named only for
+# the case the user explicitly asked for a browser run.
 SANDBOX_KEYCHAIN_ADVICE = (
     "this sandbox hides ~/Library/Keychains on purpose, so a tool that needs the Keychain cannot find it, "
     "and macOS may put a 'Keychain Not Found' dialog on the user's screen. Do not retry it unchanged: a "
-    "repeat can raise another. Have the tool avoid the Keychain (Chrome and Chromium: --use-mock-keychain "
-    "--password-store=basic, which Playwright already passes) or tell the user to run it outside Kyklos. "
+    "repeat can raise another. If it was a browser (Chrome, Chromium, Playwright, Puppeteer): Kyklos does "
+    "not drive browsers (GUARDRAILS.md rule 7), so stop and hand the check to the user with the start "
+    "command, URL, pages to check and expected results; only if the user explicitly asked for a browser "
+    "run does Chrome need --use-mock-keychain --password-store=basic (Playwright passes both). Any other "
+    "tool: have it avoid the Keychain or tell the user to run it outside Kyklos. "
     "If a dialog appeared, the user should click Cancel, never 'Reset To Defaults': nothing is missing.")
 # Flags that mean Chrome was started by hand rather than by a test framework, which sets its own.
 CHROME_DIRECT_FLAGS = ("--headless", "--dump-dom", "--screenshot", "--print-to-pdf", "--remote-debugging",
@@ -931,9 +937,10 @@ def _chrome_without_mock_keychain(command: str) -> bool:
             and "--use-mock-keychain" not in low)
 
 # Localhost ports a command may bind and use while the rest of the network stays off (macOS). Off by
-# default and chosen by the user for the run: KYKLOS_SANDBOX_PORTS=5173,4173. A dev server, or a
-# browser test run against one, needs it -- the profile otherwise denies all networking, loopback
-# included, so even `bind` on 127.0.0.1 fails with EPERM.
+# default and chosen by the user for the run: KYKLOS_SANDBOX_PORTS=5173,4173. A dev server needs
+# it -- the profile otherwise denies all networking, loopback included, so even `bind` on 127.0.0.1
+# fails with EPERM. Browser tests are not a reason to open one: Kyklos hands those off (GUARDRAILS.md
+# rule 7).
 #
 # A list of single ports rather than "all of loopback", because loopback is shared with everything
 # else on the machine. Tested against the real sandbox: opening it wholesale lets a command reach a
@@ -944,7 +951,7 @@ def _chrome_without_mock_keychain(command: str) -> bool:
 #
 # The second setting, KYKLOS_SANDBOX_CONNECT=5173, is the same list with the listening taken out: a
 # command may connect to a localhost port, and nothing in the sandbox may bind or accept on any. For
-# a server the user runs in their own terminal, and a browser test or `curl` that talks to it, that
+# a server the user runs in their own terminal, and a `curl` or API check that talks to it, that
 # is all that is needed, and it exposes nothing -- there is no listener in the sandbox to reach.
 # One rule per port, `network-outbound` to localhost:PORT. Tested on the real sandbox: it carries a
 # whole request and reply (a second rule for the reply direction added nothing), covers a server
@@ -1891,7 +1898,7 @@ class Tools:
             opened.append(f"Connect-only localhost ports: {', '.join(map(str, connect))}; the user runs a server "
                           "there outside Kyklos, and nothing in here can listen.")
         return (" If it was listening on or connecting to a port: the network is off here, loopback included, "
-                "so a dev server (or a browser test against one) cannot start. "
+                "so a dev server cannot start. "
                 f"{' '.join(opened) or 'No ports are open.'} The user can open specific ones by restarting "
                 f"Kyklos with {SANDBOX_PORTS_ENV}=<port> (the sandbox may run the server) or "
                 f"{SANDBOX_CONNECT_ENV}=<port> (it may only connect to a server the user runs outside "
@@ -1912,7 +1919,7 @@ class Tools:
         note = (f"Command timed out after {timeout}s. If it waits for input, pass the answer as "
                 "a flag instead (e.g. -Force, --yes); if it's just slow, use a larger timeout.")
         if command and probe_sandbox()[0] == "seatbelt" and _chrome_without_mock_keychain(command):
-            note += f" This command starts Chrome without --use-mock-keychain, and {SANDBOX_KEYCHAIN_ADVICE}"
+            note += f" This command starts Chrome by hand, and {SANDBOX_KEYCHAIN_ADVICE}"
         out = ((stdout or "") + (stderr or "")).rstrip()
         if not out:
             return f"{note}\nIt printed nothing before it was stopped."

@@ -3391,6 +3391,8 @@ class NoKeyboardTests(unittest.TestCase):
                 "security: SecKeychainSearchCopyNext: The specified keychain could not be found.")
             self.assertIn("[harness]", note)
             self.assertIn("--use-mock-keychain", note)
+            self.assertIn("Kyklos does not drive browsers (GUARDRAILS.md rule 7)", note)
+            self.assertIn("hand the check to the user", note)
             self.assertIn("click Cancel, never 'Reset To Defaults'", note)
             self.assertIn("Escalating will not change it", note)
             self.assertNotIn("write outside the workspace", note)  # nothing was denied, so none is claimed
@@ -3413,7 +3415,8 @@ class NoKeyboardTests(unittest.TestCase):
             for command in (by_hand, mac_app):
                 with self.subTest(command=command):
                     text = self.tools._timed_out(30, "", "", command)
-                    self.assertIn("starts Chrome without --use-mock-keychain", text)
+                    self.assertIn("starts Chrome by hand", text)
+                    self.assertIn("GUARDRAILS.md rule 7", text)
                     self.assertIn("click Cancel", text)
                     self.assertIn("printed nothing", text)  # the original message is all still there
                     self.assertIn("pass the answer as a flag", text)
@@ -4493,8 +4496,7 @@ class SecurityReinforcementTests(unittest.TestCase):
         return ports
 
     def test_a_listed_port_lets_a_server_run_in_the_real_sandbox_and_nothing_else_opens(self):
-        """`bind` on 127.0.0.1 failed with EPERM, so no dev server -- and no browser test against
-        one -- could start. Through the real run_bash, with the real kernel as the judge."""
+        """`bind` on 127.0.0.1 failed with EPERM, so no dev server could start. Through the real run_bash, with the real kernel as the judge."""
         import os
         import socket
         from unittest import mock
@@ -4617,7 +4619,7 @@ class SecurityReinforcementTests(unittest.TestCase):
         return server.getsockname()[1]
 
     def test_connect_only_reaches_a_server_outside_and_nothing_in_the_sandbox_can_listen(self):
-        """The safe variant: a browser test or `curl` talks to a server the user runs themselves,
+        """The safe variant: a `curl` or API check talks to a server the user runs themselves,
         and because nothing in the sandbox can bind or accept there is nothing to expose. Through
         the real run_bash, with the real kernel as the judge."""
         import os
