@@ -513,3 +513,7 @@ Each run gets a fresh copy under the system temp folder and runs `kyklos.py --ev
 A replayed session sees only the file tools' edits, since command edits need the workspace, so live counts can be higher. Its first run found two gaps that are now fixed: `can't` never read as a reason, and a bare `not` read descriptions like "the migration does not run twice" as one.
 
 **The trace.** Every session writes one, not only evals: a JSONL row per event to `~/.kyklos/projects/<folder>/traces/` (the newest 50 kept, owner-only permissions). It records numbers and fixed labels only — tokens and cache reads per API call, each tool call's outcome, size and duration, and each time the harness stepped in (a nudge, a budget warning, a repeat, a parallel batch) — and never a path, a command, a prompt or an answer, so it can be read or shared without exposing the work. `KYKLOS_TRACE=0` turns it off.
+
+## License
+
+Kyklos is released under the [MIT License](LICENSE). Kyklos Desktop, the separate window app, is not part of this repository or this license.
