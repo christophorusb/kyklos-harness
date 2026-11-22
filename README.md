@@ -88,6 +88,7 @@ Kyklos works in the folder you launch it from. Set `WORKSPACE` in `.env` to pin 
 | `COMPACT_ABOVE` | Compact once the conversation passes this many tokens (default 100000) |
 | `MAX_STEPS` | Model turns one request may take (default 50) |
 | `KYKLOS_SNAPSHOTS` | `0` limits `/undo` to the file tools' edits, without snapshotting the workspace (see [Undo](#how-it-works)) |
+| `KYKLOS_REVIEW` | `1` has a read-only reviewer subagent look at each turn's code changes before the answer stands; also `/reviewer on` (see [Reviewer](#safety)) |
 | `KYKLOS_SELF_CHECK` | `0` stops asking the model to back up its claims and check changed code before answering (see [Self-checking](#safety)) |
 | `KYKLOS_TRACE` | `0` turns off the session trace; a path writes it there instead (see [Evals](#evals)) |
 | `STREAM` | Stream the API call (default on). Transport only — nothing on screen changes. `0` to disable |
@@ -389,7 +390,7 @@ Claims to have run the tests, committed, pushed or installed are compared agains
 **Self-checking.** Before a turn's answer stands, Kyklos looks at two things and, if either is off, sends the model one message and lets it carry on instead of ending the turn:
 
 - **The answer's story.** The claims above ("I ran the tests", "committed", …) that nothing this turn backs up. The model runs what it claimed or corrects the answer; a claim about an earlier turn is fine once it says so.
-- **Unchecked code.** Code changed this turn and no check passed after the last change. A check is a test run, a type check, a lint or a build (`pytest`, `unittest`, `npm test`, `tsc`, `mypy`, `ruff`, `eslint`, `cargo check`, `go vet`, `npm run build`, `py_compile` and the like) that exited 0. The message names the changed files and the tests the code graph links to them, and asks for the narrowest check that covers the change, or, when none fits (nothing set up, or it needs a browser, credentials or the network), for the answer to say so instead. A check that ran after the change and failed is put to the model the same way, unless the answer already reports the failure.
+- **Unchecked code.** Code changed this turn and no check passed after the last change. A check is a test run, a type check, a lint or a build (`pytest`, `unittest`, `npm test`, `tsc`, `mypy`, `ruff`, `eslint`, `cargo check`, `go vet`, `npm run build`, `py_compile` and the like) that exited 0. It counts only when it is the program a command runs, so `pip install pytest` or `grep pytest` is no check, while `uv run pytest` or `.venv/bin/pytest` is. A check piped into something else (`npm run build | tail`) exits with the last program's status, since `bash` runs without `pipefail`, so its output decides instead: any failure marker (`failed`, `error`, `FAIL`, an exception) and it failed. The message names the changed files and the tests the code graph links to them, and asks for the narrowest check that covers the change, or, when none fits (nothing set up, or it needs a browser, credentials or the network), for the answer to say so instead. A check that ran after the change and failed is put to the model the same way, unless the answer already reports the failure.
 
 **Kyklos never runs a check itself.** The model runs it through `bash`, under the same approvals and sandbox as any other command, so self-checking adds no new way for anything to run, and a repository can't choose a command that runs unasked. Each kind of message goes at most once per turn, both together share one message, and none is sent in plan mode, to subagents, after a cut-off reply, with fewer than two steps left, when the answer asks you a question, or when it already says why it couldn't check. Code means source files by extension: docs, data, config and `.kyklos/scratch/` don't count.
 
@@ -403,6 +404,8 @@ With snapshots on, "changed" is read off the workspace itself (from the turn's s
 
 Nothing is shown for a turn that changed no code. The state is `checked` on `turn_end` and in the `session/prompt` result, and the trace keeps it as a label. `KYKLOS_SELF_CHECK=0` turns the messages and the line off.
 
+**Reviewer (opt-in).** Tests catch what they test; they don't catch a change that does the wrong thing well. With `KYKLOS_REVIEW=1` in `.env`, or `/reviewer on` for the session, an answer that changed code gets a second look before it stands: once the self-check has nothing more to ask, a read-only `explore` subagent receives your request and the turn's diff (from snapshots, so command edits are in it, or else from the file tools' record) and reports bugs, missed requirements, broken callers and untested behaviour, ignoring style. `NO ISSUES` lets the answer stand; anything else goes to the model once as a second opinion to check, not as instructions, and the model fixes what holds up or says in its answer why a finding doesn't apply. It runs at most once per turn, only for changes of five or more lines, never in plan mode, for subagents, with fewer than three steps left, or when the answer asks you a question. It uses the subagent model (`/submodel`), so a cheaper model can review, and each review is billed like any subagent. A reviewer that fails leaves the answer standing and says so. The trace records each review as `review` with `clean`, `issues` or `failed`. `eval.py --review` measures it on the eval tasks.
+
 ## What Kyklos hands off
 
 Some work stays outside Kyklos, mostly because of how the sandbox and guardrails are built rather than for lack of time. For these, the model does what it can in the workspace (writes the code, the tests, the plan) and hands the rest to you with the `handoff` tool: one self-contained prompt, shown as a card, to do yourself or give to a larger agent such as Claude Code, Antigravity or Codex. Each of those has its own security model: a handoff moves the work into that model and does not make it safe, so look at what you hand over when it is sensitive.
@@ -411,7 +414,7 @@ Some work stays outside Kyklos, mostly because of how the sandbox and guardrails
 
 | Limit | Why | Hand off |
 |---|---|---|
-| **Browsers** | `GUARDRAILS.md` rule 7: a rendered page is untrusted input that can carry instructions | Visual checks, end-to-end and Playwright runs, screenshots of a running site, filling in forms. Kyklos writes the tests and ends its turn with the start command, URL, pages to check and expected results |
+| **Browsers** | `GUARDRAILS.md` rule 7: a rendered page is untrusted input that can carry instructions | Visual checks, end-to-end and Playwright runs, screenshots of a running site, filling in forms. Kyklos writes the tests and hands you the start command, URL, pages to check and expected results as a `handoff` |
 | **Web research** | No web fetch or search tool; the sandbox cuts off the network, and any network command is red and needs approval | Reading docs, comparing libraries, checking API changes, looking up error messages online |
 | **GitHub and remotes** | `git init`, `git config`, `git remote add` and `git push -u` fail in the sandbox; `~/.ssh` and the `gh` token store are unreadable | Pushing, opening PRs, replying to review comments, watching and fixing CI, creating repos. Local commits and branches work |
 | **Your credentials** | Secret files are blocked, secrets are stripped from command environments, and `~/.aws`, `~/.kube`, `~/.docker` and Keychains are hidden | Deploys, cloud CLIs (`aws`, `gcloud`, `kubectl`, `docker push`), migrations on real databases, logged-in API calls, publishing packages |
@@ -435,11 +438,11 @@ Some things look like handoffs and aren't: edits to CI configuration, hooks, `AG
 ## Tests
 
 ```bash
-./.venv/bin/python -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_handoff test_self_check test_commands test_skills test_mcp test_graph
+./.venv/bin/python -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_handoff test_self_check test_review test_commands test_skills test_mcp test_graph
 ```
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_handoff test_self_check test_commands test_skills test_mcp test_graph
+.\.venv\Scripts\python.exe -m unittest test_kyklos test_ui test_audit test_eval test_serve test_imagegen test_snapshots test_question test_handoff test_self_check test_review test_commands test_skills test_mcp test_graph
 ```
 
 ## Evals
@@ -467,6 +470,7 @@ Each run gets a fresh copy under the system temp folder and runs `kyklos.py --ev
 ```bash
 ./.venv/bin/python eval.py shared-helper --repeat 5
 ./.venv/bin/python eval.py shared-helper --repeat 5 --no-self-check
+./.venv/bin/python eval.py shared-helper --repeat 5 --review   # with the reviewer on too
 ```
 
 `audit.py` measures the other side without spending tokens: whether self-checking recognises a check command when it sees one (and nothing else), whether it recognises an answer that already says why nothing was checked (without taking a plain description of the code for one), and, given saved sessions, how often it would hold an answer back:

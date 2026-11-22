@@ -16,8 +16,8 @@ from pathlib import Path
 from test_kyklos import FakeClient, allow_all, reply, tool_call
 from test_ui import make_ui, output
 
-from kyklos import (CHECK_COMMAND_RE, CHECKED, FAILING, UNCHECKED, Agent, Trace, choose_self_check,
-                    is_code_path)
+from kyklos import (CHECKED, FAILING, UNCHECKED, Agent, Trace, check_kind, check_passed, choose_self_check,
+                    is_code_path, self_check_reasons)
 
 # From PATH, not sys.executable: the venv sits under ~/Desktop here, which the sandbox hides.
 PY = shutil.which("python3") or "python3"
@@ -141,6 +141,17 @@ class SelfCheckTests(unittest.TestCase):
         self.assertEqual(events.signals(), [])
         self.assertEqual(agent.last_check, FAILING)
 
+    def test_a_failing_build_piped_to_tail_is_not_checked(self):
+        piped = f"{PY} -m py_compile app.py 2>&1 | tail -5"
+        _, agent, _, events = self.run_turn([
+            reply(tool_calls=[write("w", content="def f(:\n")]),
+            reply(tool_calls=[bash("b", piped)]),
+            reply(content="Done."),
+            reply(content="Done."),
+        ])
+        self.assertEqual(events.signals(), ["failing"])
+        self.assertEqual(agent.last_check, FAILING)
+
     def test_claims_and_unchecked_code_share_one_note(self):
         _, agent, _, events = self.run_turn([
             reply(tool_calls=[write("w")]),
@@ -260,11 +271,46 @@ class PatternTests(unittest.TestCase):
                         "python3 -m py_compile app.py", "make check", "./gradlew test", "yarn test:unit",
                         "uv run pytest tests/test_x.py", "npm test"]:
             with self.subTest(command):
-                self.assertTrue(CHECK_COMMAND_RE.search(command))
+                self.assertTrue(check_kind(command))
         for command in ["ls", "git status", "cat test_app.py", "echo build", "npm install", "go run .",
                         "python app.py", "grep -r test ."]:
             with self.subTest(command):
-                self.assertFalse(CHECK_COMMAND_RE.search(command))
+                self.assertFalse(check_kind(command))
+
+    def test_a_checker_named_but_not_run_is_no_check(self):
+        """The session audit's first finding: the pattern matched anywhere in the line."""
+        for command in ["pip install pytest", "grep -rn pytest .", "which tsc", "npm i -D eslint",
+                        "echo 'run pytest next'", "cat pyproject.toml | grep mypy"]:
+            with self.subTest(command):
+                self.assertIsNone(check_kind(command))
+        for command in [".venv/bin/pytest -q", "uv run pytest", "python3 -m unittest", "CI=1 npm test",
+                        "npx --yes tsc --noEmit", "cd web && npm test"]:
+            with self.subTest(command):
+                self.assertEqual(check_kind(command), "plain")
+
+    def test_a_piped_check_is_read_from_its_output(self):
+        """Without pipefail, `build | tail` exits 0 whatever the build did."""
+        self.assertEqual(check_kind("npm run build 2>&1 | tail -20"), "piped")
+        self.assertEqual(check_kind("pytest -q | tail -5; pytest -q tests/x.py"), "plain")
+        self.assertFalse(check_passed("piped", "exit code 0\nsrc/a.ts(3,1): error TS2322: nope"))
+        self.assertFalse(check_passed("piped", "exit code 0\n1 failed, 4 passed"))
+        self.assertTrue(check_passed("piped", "exit code 0\n5 passed, 0 failed"))
+        self.assertTrue(check_passed("plain", "exit code 0\n1 failed"))  # its own exit code is the truth
+        self.assertFalse(check_passed("plain", "exit code 1"))
+
+    def test_failure_is_acknowledged_only_when_the_answer_says_a_check_fails(self):
+        for answer in ["Fixed the TypeError in the parser.", "Fixed the failing test.", "Handled the error case."]:
+            with self.subTest(answer):
+                self.assertEqual(self_check_reasons(answer, [], FAILING), ["failing"])
+        for answer in ["The tests still fail on test_parse.", "The build is still broken: a type error remains.",
+                       "Two errors remain in legacy code I didn't touch.", "The type check fails on main too."]:
+            with self.subTest(answer):
+                self.assertEqual(self_check_reasons(answer, [], FAILING), [])
+
+    def test_only_an_answer_ending_on_a_question_counts_as_asking(self):
+        self.assertEqual(self_check_reasons("Done. Should I add tests too?", [], UNCHECKED), [])
+        self.assertEqual(self_check_reasons("Done; the URL is /search?q=1 now.", [], UNCHECKED), ["unchecked"])
+        self.assertEqual(self_check_reasons("Done: `x = a ? b : c` reads better.", [], UNCHECKED), ["unchecked"])
 
     def test_code_paths(self):
         for path in ["app.py", "src/main.ts", "lib/x.rs", "scripts/run.sh", "a/b/C.java"]:

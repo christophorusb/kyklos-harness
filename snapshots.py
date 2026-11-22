@@ -151,6 +151,17 @@ class WorkspaceSnapshots:
             result[path] = (old_mode, old_blob)
         return result
 
+    def diff(self, old: str, new: str, paths: list[str]) -> str:
+        """A unified diff of these paths between two trees. External diff drivers and textconv are
+        off, so nothing the workspace configures runs. `--text` because the store marks every file
+        `-text` to keep bytes exact, which git's diff would otherwise read as binary: callers pass
+        source files only."""
+        if not paths:
+            return ""
+        out = self._git("diff-tree", "-p", "-r", "--text", "--no-renames", "--no-ext-diff", "--no-textconv",
+                        "--no-color", old, new, "--", *paths)
+        return out.decode("utf-8", "replace")
+
     def ignored(self, paths: list[str]) -> set[str]:
         """Which of these workspace-relative paths snapshots can't see."""
         if not paths:

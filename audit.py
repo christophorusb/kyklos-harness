@@ -38,9 +38,14 @@ from dataclasses import dataclass, field
 from itertools import product
 from pathlib import Path
 
-from kyklos import (CHECK_COMMAND_RE, CHECK_DECLINED_RE, CHECKED, FAILING, UNCHECKED, _succeeded,
+from types import SimpleNamespace
+
+from kyklos import (CHECK_DECLINED_RE, CHECKED, FAILING, UNCHECKED, check_kind, check_passed,
                     check_state_by_order, explain_command, is_code_path, self_check_reasons,
                     unsupported_claims)
+
+# check_kind as a pattern, so audit_pattern can hold it to the corpora like the regexes.
+CHECK_COMMANDS = SimpleNamespace(search=check_kind)
 
 
 # ---- cases and results --------------------------------------------------------------------------
@@ -225,12 +230,18 @@ CHECKS = {
                "python3 -m py_compile app.py", "python -m compileall src", "swift build"),
     "chained": ("cd web && npm test", "source .venv/bin/activate && pytest -q",
                 "npm run build 2>&1 | tail -20", "pytest -q; echo done"),
+    "launched": (".venv/bin/pytest -q", "./node_modules/.bin/tsc --noEmit", "poetry run pytest",
+                 "python -m pytest -x", "py -3 -m unittest", "CI=1 npm test", "time cargo test",
+                 "npx --yes eslint .", "env PYTHONPATH=src pytest"),
 }
 NOT_CHECKS = ("ls -la", "git status", "git diff", "cat test_api.py", "grep -rn test src",
               "npm install", "pip install -r requirements.txt", "python app.py", "node server.js",
               "go run .", "npm start", "echo build", "mkdir build", "rm -rf build",
               "sed -i 's/a/b/' src/app.py", "git commit -m 'fix the tests'", "find . -name '*_test.go'",
-              "head -n 30 Makefile", "open coverage/index.html", "python -m http.server 8000")
+              "head -n 30 Makefile", "open coverage/index.html", "python -m http.server 8000",
+              # A checker's name that doesn't run it: the first audit missed these.
+              "pip install pytest", "grep -rn pytest .", "which tsc", "cat pyproject.toml | grep mypy",
+              "npm install --save-dev eslint", "echo 'run pytest next'")
 
 DECLINES = {
     "no runner": ("I couldn't run the tests: there's no test runner set up here.",
@@ -373,8 +384,9 @@ def replay_attempts(path: Path) -> list[Attempt]:
                     continue
                 commands.append((command, result))
                 ran = result.startswith("exit code ") or "timed out" in result[:60]
-                if ran and CHECK_COMMAND_RE.search(command):
-                    last_check = (calls_run, _succeeded(result), command, None)
+                kind = check_kind(command) if ran else None
+                if kind:
+                    last_check = (calls_run, check_passed(kind, result), command, None)
             elif name:
                 edited = _edited_code(arguments, result)
                 if edited:
@@ -536,9 +548,9 @@ def main(argv: list[str]) -> int:
 
     checks, not_checks = check_command_corpora()
     declines, plain = decline_corpora()
-    report(audit_pattern("check commands self-checking wouldn't recognise", checks, CHECK_COMMAND_RE, True))
+    report(audit_pattern("check commands self-checking wouldn't recognise", checks, CHECK_COMMANDS, True))
     report(audit_pattern("other commands self-checking would take for a check", not_checks,
-                         CHECK_COMMAND_RE, False))
+                         CHECK_COMMANDS, False))
     report(audit_pattern("answers saying why nothing was checked, not recognised (asked again)", declines,
                          CHECK_DECLINED_RE, True))
     report(audit_pattern("plain answers taken as saying why nothing was checked (check skipped)", plain,

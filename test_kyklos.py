@@ -20,6 +20,7 @@ os.environ.setdefault("KYKLOS_SNAPSHOTS", "0")
 # Self-checking adds a model call to turns that edit code, which these scripts don't expect;
 # test_self_check covers it.
 os.environ.setdefault("KYKLOS_SELF_CHECK", "0")
+os.environ.setdefault("KYKLOS_REVIEW", "0")
 
 from kyklos import (PRUNED_MARK, SUBAGENT_TOOLS, Agent, available_personas, choose_persona,
                     choose_stream, collect_stream, error_detail, persona_path, preview)

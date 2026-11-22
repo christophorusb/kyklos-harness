@@ -8,10 +8,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from audit import (Case, answer_corpus, audit_answers, audit_commands, audit_pattern, audit_self_check,
+from audit import (CHECK_COMMANDS, Case, answer_corpus, audit_answers, audit_commands, audit_pattern, audit_self_check,
                    check_command_corpora, command_corpus, decline_corpora, replay_attempts, replay_session,
                    session_corpora)
-from kyklos import CHECK_COMMAND_RE, CHECK_DECLINED_RE, CHECKED, FAILING, UNCHECKED, check_state_by_order
+from kyklos import CHECK_DECLINED_RE, CHECKED, FAILING, UNCHECKED, check_state_by_order
 
 
 def assistant(content="", bash=()):
@@ -284,8 +284,8 @@ class SelfCheckPatternTests(unittest.TestCase):
     def test_every_check_is_recognised_and_nothing_else(self):
         checks, others = check_command_corpora()
         self.assertGreater(len(checks), 40)
-        self.assertEqual(audit_pattern("", checks, CHECK_COMMAND_RE, True).fired, [])
-        self.assertEqual(audit_pattern("", others, CHECK_COMMAND_RE, False).fired, [])
+        self.assertEqual(audit_pattern("", checks, CHECK_COMMANDS, True).fired, [])
+        self.assertEqual(audit_pattern("", others, CHECK_COMMANDS, False).fired, [])
 
     def test_reasons_are_recognised_and_plain_answers_are_not(self):
         declines, plain = decline_corpora()

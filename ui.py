@@ -1386,8 +1386,8 @@ class AeroUI:
         self.reset_transient()
         self.answer(answer, footer=self.footer_text(agent, time.monotonic() - start))
         for label, missing in getattr(agent, "last_claims", []):
-            # Reported to you, not to the model, and as a mismatch rather than a verdict: the claim
-            # may be about an earlier turn.
+            # Reported as a mismatch rather than a verdict: the claim may be about an earlier turn.
+            # With self-checking on, the model was told too and kept the claim anyway.
             self.print(Text(f"! this answer says it {label}, but {missing}", style="sun"), indent=2)
         check = getattr(agent, "last_check", None)
         if check in CHECK_NOTES:

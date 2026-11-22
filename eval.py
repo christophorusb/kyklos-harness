@@ -125,7 +125,7 @@ def run_check(task: dict, root: Path, ws: Path) -> tuple[bool, str]:
     return proc.returncode == 0, verdict or f"FAIL: the check exited {proc.returncode} without a verdict"
 
 
-def run_one(task: dict, forward: list[str], keep: bool, self_check: bool = True) -> dict:
+def run_one(task: dict, forward: list[str], keep: bool, self_check: bool = True, review: bool = False) -> dict:
     root = Path(tempfile.mkdtemp(prefix=f"kyklos-eval-{task['name']}-")).resolve()
     (root / EVAL_MARKER).write_text("made by eval.py\n", encoding="utf-8")
     ws, home, trace = root / "ws", root / "home", root / "trace.jsonl"
@@ -140,6 +140,7 @@ def run_one(task: dict, forward: list[str], keep: bool, self_check: bool = True)
                KYKLOS_TRACE=str(trace))
     env.pop("KYKLOS_UI", None)
     env["KYKLOS_SELF_CHECK"] = "1" if self_check else "0"  # explicit, so a shell setting can't skew a comparison
+    env["KYKLOS_REVIEW"] = "1" if review else "0"
     cmd = [sys.executable, str(HERE / "kyklos.py"), "--eval", *forward, task["prompt"]]
     started, timed_out = time.monotonic(), False
     proc = subprocess.Popen(cmd, cwd=ws, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -161,7 +162,7 @@ def run_one(task: dict, forward: list[str], keep: bool, self_check: bool = True)
     else:
         passed, verdict = run_check(task, root, ws)
     row = {"task": task["name"], "passed": passed, "verdict": verdict, "secs": round(secs, 1),
-           "self_check": self_check, **summarize_trace(trace)}
+           "self_check": self_check, "review": review, **summarize_trace(trace)}
     if keep:
         row["kept"] = str(root)
     else:
@@ -194,6 +195,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--out", type=Path, help="results file (default evals/results/<time>.jsonl)")
     parser.add_argument("--no-self-check", action="store_true",
                         help="run with KYKLOS_SELF_CHECK=0, to compare against the default")
+    parser.add_argument("--review", action="store_true",
+                        help="run with KYKLOS_REVIEW=1: a reviewer subagent checks code changes (more tokens)")
     args = parser.parse_args(argv)
     tasks = load_tasks(args.tasks)
     if args.list:
@@ -216,7 +219,8 @@ def main(argv: list[str]) -> int:
     rows = []
     for task in tasks:
         for n in range(1, args.repeat + 1):
-            row = {"run": n, **run_one(task, forward, args.keep, self_check=not args.no_self_check)}
+            row = {"run": n, **run_one(task, forward, args.keep, self_check=not args.no_self_check,
+                                       review=args.review)}
             rows.append(row)
             with out.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(row) + "\n")

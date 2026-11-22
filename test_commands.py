@@ -200,7 +200,9 @@ class CommandTests(unittest.TestCase):
         with mock.patch("prompt_toolkit.PromptSession") as session:
             ui._session(self.home / "history")
         completer = session.call_args.kwargs["completer"]
-        completion, = completer.get_completions(Document("/rev"), CompleteEvent())
+        completions = list(completer.get_completions(Document("/rev"), CompleteEvent()))
+        self.assertEqual(sorted(c.text for c in completions), ["/review", "/reviewer"])  # built-in /reviewer too
+        completion = next(c for c in completions if c.text == "/review")
         self.assertEqual(completion.text, "/review")
         self.assertEqual(completion.display_text, "/review <file>")
         self.assertEqual(completion.display_meta_text, "Review a file")
