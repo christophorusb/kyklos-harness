@@ -2,13 +2,43 @@
 
 *κύκλος: "circle, cycle." At its core, a harness is one loop: ask the model, run its tools, feed back the results, repeat.*
 
-A small coding-agent harness (~4,200 lines of Python, plus ~2,900 lines of tests) for any OpenAI-compatible API — Ollama cloud, DeepSeek, OpenRouter, OpenAI, Gemini, local Ollama, LM Studio — with an inline terminal UI, **Kyklos Aero**, in a Frutiger Aero style ([DESIGN.md](DESIGN.md)).
+**Run open-weight models as coding agents without trusting them.** Kyklos enforces the safety and checks the work in the harness, not in the model, and every run leaves a trace you can compare across models.
+
+Harnesses built around one vendor's frontier model can lean on that model: it usually calls tools cleanly, rarely claims work it didn't do, and resists most text planted to steer it. Open-weight models, local or hosted, vary far more from one model to the next, and you choose which one runs. So Kyklos assumes none of that, puts the guarantees in the harness, and measures how each model does under them.
+
+## What the harness does, whatever the model
+
+| A strong model usually gets this right | Kyklos does it anyway |
+|---|---|
+| Not running something dangerous | The harness's own rules, never the model, judge every command, so text planted in a file can't talk one down. Commands run in an OS sandbox, with secrets kept out of their environment and output ([Safety](#safety)) |
+| Telling the truth about its turn | Claims like "I ran the tests" are checked against what ran, and a turn that changed code is asked for a passing check before it ends ([Self-checking](#safety)) |
+| Not stalling or looping | Empty replies, tool calls written as text, repeated calls and a nearly spent step budget are caught and named ([How it works](#how-it-works)) |
+| Knowing its limits | `handoff` gives you a ready prompt for what Kyklos can't do (browsers, pushing, credentials…), and `ask_user` asks rather than guesses ([What Kyklos hands off](#what-kyklos-hands-off)) |
+| Reviewing its own work | An opt-in reviewer subagent, on a cheaper model if you like, reads the diff before the answer stands |
+
+## Measured, not assumed
+
+- **A trace for every session**: tokens, cache reads, each tool call's outcome and each time the harness stepped in, as numbers and fixed labels only. No path, command, prompt or answer is in it, so it can be shared as it is.
+- **Evals that can't flatter a model**: fixture tasks aimed at the harness's own mechanisms, each with a check that must fail the untouched repository and pass a reference solution. Pass or fail comes from that check running the code, and what the run did from the trace, never from what the model says about itself.
+- **Comparisons**: the same tasks across models, or with a harness feature off, to see what each one is worth.
+- **Checkers that are checked**: `audit.py` measures how often Kyklos's own checkers fire wrongly, on generated input and on your saved sessions.
+
+```bash
+./.venv/bin/python eval.py --model kimi-k3 --repeat 3                   # one model
+./.venv/bin/python eval.py --model gemma4 --repeat 3                    # another, on the same tasks
+./.venv/bin/python eval.py shared-helper --repeat 5 --no-self-check     # what self-checking is worth
+```
+
+See [Evals](#evals) for the tasks, the trace and the audit.
+
+Kyklos speaks any OpenAI-compatible API (local Ollama, LM Studio, Ollama cloud, DeepSeek, OpenRouter, OpenAI, Gemini) in ~13,800 lines of Python with ~11,500 lines of tests. It has an inline terminal UI, **Kyklos Aero**, in a Frutiger Aero style ([DESIGN.md](DESIGN.md)), and a JSON-RPC mode for desktop front ends ([PROTOCOL.md](PROTOCOL.md)).
 
 ## Features
 
 **The loop**
 - Six workspace tools (`read_file`, `grep`, `glob`, `write_file`, `edit_file`, `bash`) — plus `code_graph` for codebase dependency and blast-radius queries, and `task` for subagents.
 - **Questions mid-turn** (`ask_user`): when the model is blocked on a decision that's yours, it asks and carries on with the answer, instead of guessing or ending the turn.
+- **Handoffs** (`handoff`): work Kyklos can't do (a browser, pushing, your credentials, …) comes to you as one self-contained prompt, to do yourself or give to a larger agent. Nothing is sent anywhere.
 - **Subagents** with their own empty context, so a long search costs the main conversation one result instead of every file read. `explore` tasks can chain via `id` and `depends_on` in topological waves, or route to a cheaper model with `/submodel`.
 - **Plan mode** (`/plan`) — read-only, for working out an approach before touching anything; `plan` accepts linear steps or a validated task DAG (`id` / `depends_on`).
 - **Undo** (`/undo`) reverts a turn's conversation *and* its file changes — including the ones its commands made, from a snapshot of the workspace.
@@ -28,6 +58,7 @@ A small coding-agent harness (~4,200 lines of Python, plus ~2,900 lines of tests
 - **Every `bash` prompt explains the command** in plain language before you answer `y` or `n`.
 - **Answer claims are checked** against what the turn actually ran.
 - **Self-checking:** before a turn ends, the model is asked once to back up its claims and to check code it changed, and each answer says whether its code was checked.
+- **Reviewer** (opt-in, `/reviewer on`): a read-only subagent reads the turn's diff before an answer that changed code stands.
 - `/tokens`, `/tools`, `/diff` — what fills the window, what can run, what changed on disk.
 - **A scratch directory** for throwaway scripts, inside the workspace so imports resolve.
 
